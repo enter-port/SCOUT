@@ -1,4 +1,4 @@
-# SCOUT
+# SCOUT — Robot Policy Self-Improvement via Classifier-Guided Exploration
 
 **S**elf-improving via **C**lassifier-guided **O**ptimization of **U**nsupervised **T**rajectories
 
