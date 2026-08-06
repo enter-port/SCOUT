@@ -1,0 +1,40 @@
+# ===== 本地 / 非本项目内容（按项目要求忽略）=====
+# 学长 SOE 基线代码（独立工作，不随本仓库发布）
+SOE/
+# 参考论文 PDF
+papers/
+# Claude Code 本地配置与项目指令
+CLAUDE.md
+.claude/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ===== 数据 / 模型权重 / 大文件（不进 git）=====
+*.hdf5
+*.h5
+*.ckpt
+*.pth
+*.pt
+*.npz
+*.npy
+out/
+results/
+wandb/
+runs/
+
+# ===== 编辑器 / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
