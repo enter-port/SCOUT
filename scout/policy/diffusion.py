@@ -211,6 +211,100 @@ class DiffusionUNetPolicy(nn.Module):
 
         return trajectory
 
+    def guided_conditional_sample(self,
+            condition_data, condition_mask,
+            local_cond=None, global_cond=None,
+            generator=None,
+            classifier_guidance=False,
+            s_bar_t=None, z=None, vib_enc=None, bridge=None,
+            guidance_scale=1.0, guidance_start_timestep=0,
+            return_cost_curve=False,
+            # keyword arguments to scheduler.step
+            **kwargs
+        ):
+        """LPB-style classifier-guided denoising with SCOUT cost
+        (scout_design.md §4, mirroring LPB
+        ``diffusion_unet_hybrid_image_policy.py:212-271`` verbatim).
+
+        Differences from :meth:`conditional_sample`:
+          * opens grad on ``trajectory`` (``x_t``) each step and backprops the
+            SCOUT cost on the one-step clean-action estimate ``x̂_0`` to steer
+            ``x_t`` -- ``x̂_0`` is *not* modified, only ``x_t`` (LPB invariant).
+          * **no SIME / CFG / debug branches** -- guidance is orthogonal to
+            SIME; if you need both, wire them as a future wrapper.
+
+        Differences from LPB:
+          * **drops the OOD gate (b)** ``current_cost > threshold`` (SCOUT is
+            exploration -- every chunk-step is guided; design §4 门控).
+          * cost = SCOUT VIB re-encoding gap ``mean_t ‖z − μ(s̄_t, a_t)‖²``
+            (``scout.guidance.cost.scout_cost``), not LPB's NN-to-demo distance.
+
+        Args for guidance (only used when ``classifier_guidance`` is True):
+          s_bar_t  : ``(B, s_latent_dim)`` encoded current obs (fixed across chunk).
+          z        : ``(B, style_dim)`` sampled skill latent (fixed across chunk).
+          vib_enc  : a :class:`scout.model.vib.VIBIBEncoder`-like callable.
+          bridge   : :class:`scout.normalizer.ActionNormalizerBridge` (identity
+                     in stage-1 -- DP and VIB both raw).
+          guidance_scale          : η in ``η·√(1−ᾱ_t)``.
+          guidance_start_timestep : gate (a) -- guide only when ``t < this`` (the
+                     last K denoising steps; standard CG practice).
+
+        When ``classifier_guidance=False`` (or ``guidance_scale=0`` with the
+        identity bridge) the output *values* are identical to
+        :meth:`conditional_sample` run on the same model + seed: the only
+        per-step change is ``trajectory.detach().requires_grad_()``, which
+        preserves values.
+        """
+        # local imports keep the ported DP importable without the guidance stack
+        from scout.guidance.cost import scout_cost
+
+        model = self.model
+        scheduler = self.noise_scheduler
+
+        trajectory = torch.randn(
+            size=condition_data.shape,
+            dtype=condition_data.dtype,
+            device=condition_data.device,
+            generator=generator)
+
+        scheduler.set_timesteps(self.num_inference_steps)
+
+        cost_curve = [] if return_cost_curve else None
+
+        for t in scheduler.timesteps:
+            # 1. apply conditioning
+            trajectory[condition_mask] = condition_data[condition_mask]
+
+            # 2. open grad on x_t, then predict ε_θ(x_t, t)
+            trajectory = trajectory.detach().requires_grad_()
+            model_output = model(trajectory, t,
+                local_cond=local_cond, global_cond=global_cond)
+
+            # 3. SCOUT classifier guidance -- gate (a) ONLY (OOD gate dropped).
+            if classifier_guidance and t < guidance_start_timestep:
+                x0_hat = scheduler.step(model_output, t, trajectory).pred_original_sample
+                loss = scout_cost(x0_hat, s_bar_t, z, vib_enc, bridge)
+                if cost_curve is not None:
+                    cost_curve.append(float(loss.detach()))
+                cond_grad = -torch.autograd.grad(loss, trajectory)[0]
+                scale = guidance_scale * (1 - scheduler.alphas_cumprod[t]).sqrt()
+                trajectory = trajectory.detach() + scale * cond_grad
+
+            # 4. DDPM/DDIM reverse step (model_output from step 2; possibly
+            #    steered trajectory from step 3).
+            trajectory = scheduler.step(
+                model_output, t, trajectory,
+                generator=generator,
+                **kwargs
+                ).prev_sample
+
+        # finally make sure conditioning is enforced
+        trajectory[condition_mask] = condition_data[condition_mask]
+
+        if return_cost_curve:
+            return trajectory, cost_curve
+        return trajectory
+
     def predict_action(self, readout) -> Dict[str, torch.Tensor]:
         if readout is None:
             # unconditional diffusion
