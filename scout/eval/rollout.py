@@ -115,7 +115,7 @@ class GuidedAdapter(BaseDPAdapter):
 
     Extra args:
         scout_vib           : :class:`scout.model.scout_vib.ScoutVIB` (already on
-                              ``device``, state loaded). ``ae.encode`` provides
+                              ``device``, state loaded). ``E_s`` provides
                               ``s_bar_t = E_s(S_t)``; ``vib_enc`` provides ``μ``.
         state_to_vec        : ``obs_dict -> (1, state_dim)`` torch tensor on any
                               device; the adapter moves it to ``device``. Required
@@ -172,7 +172,7 @@ class GuidedAdapter(BaseDPAdapter):
             s_vec = self.state_to_vec(obs_dict).float().to(self.device)
             if s_vec.dim() == 1:
                 s_vec = s_vec.unsqueeze(0)
-            s_bar_t = self.scout_vib.ae.encode(s_vec)             # (B, s_latent)
+            s_bar_t = self.scout_vib.E_s(s_vec)                   # (B, s_bar_dim)
         # 3. z ~ N(0,I), fixed across chunk
         z = torch.randn(B, self.style_dim, device=self.device, generator=self._gen)
         # 4. guided denoise (grad on inside; outer scope keeps default grad state)
@@ -513,8 +513,7 @@ def _smoke():
                         "low_dim_b": dict(shape=[action_dim], type="low_dim")},
     ).to(device)
     svib = ScoutVIB(state_dim=state_dim, action_dim=action_dim,
-                    s_latent_dim=16, style_dim=8, hidden_dim=32,
-                    beta=1e-3).to(device)
+                    style_dim=8, hidden_dim=32, beta=1e-3).to(device)
 
     def state_to_vec(obs_dict):
         # concat sorted low-dim keys (a, b) -> (1, 2*action_dim) == (1, state_dim) if state_dim==8

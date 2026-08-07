@@ -240,7 +240,7 @@ class DiffusionUNetPolicy(nn.Module):
             (``scout.guidance.cost.scout_cost``), not LPB's NN-to-demo distance.
 
         Args for guidance (only used when ``classifier_guidance`` is True):
-          s_bar_t  : ``(B, s_latent_dim)`` encoded current obs (fixed across chunk).
+          s_bar_t  : ``(B, s_bar_dim)`` encoded current obs (fixed across chunk).
           z        : ``(B, style_dim)`` sampled skill latent (fixed across chunk).
           vib_enc  : a :class:`scout.model.vib.VIBIBEncoder`-like callable.
           bridge   : :class:`scout.normalizer.ActionNormalizerBridge` (identity

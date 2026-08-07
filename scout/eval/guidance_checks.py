@@ -54,7 +54,7 @@ def eval_e2_guidance(
                          and re-used for the consistency metric).
         bridge         : :class:`scout.normalizer.ActionNormalizerBridge`.
         cond_data/mask/global_cond : as for ``conditional_sample``.
-        s_bar_t        : ``(B, s_latent_dim)`` encoded current obs (fixed).
+        s_bar_t        : ``(B, s_bar_dim)`` encoded current obs (fixed).
         z_set          : ``(Z, B, style_dim)`` or ``(Z, style_dim)`` -- a stack of
                          fixed skill latents to sweep (diversity is across Z).
         scales         : guidance_scale values to sweep.

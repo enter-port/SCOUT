@@ -13,7 +13,7 @@ actions that re-encode to the sampled ``z``.
 
 Shapes:
     x0_hat : (B, T_chunk, action_dim)  -- DP-predicted clean action chunk
-    s_bar_t: (B, s_latent_dim)         -- one encoded obs per batch element
+    s_bar_t: (B, s_bar_dim)            -- one encoded obs per batch element
     z      : (B, style_dim)            -- one sampled skill latent per batch element
 
 The VIB encoder is applied *per chunk step* after broadcasting ``s̄_t`` across
@@ -43,7 +43,7 @@ def scout_cost(
                   carry gradient to ``trajectory`` (caller sets
                   ``trajectory.requires_grad_()`` before the scheduler step that
                   produces this).
-        s_bar_t : ``(B, s_latent_dim)`` -- encoded current obs (fixed across
+        s_bar_t : ``(B, s_bar_dim)`` -- encoded current obs (fixed across
                   chunk).
         z       : ``(B, style_dim)`` -- sampled skill latent (fixed across chunk).
         vib_enc : a :class:`scout.model.vib.VIBEncoder` (or compatible) callable

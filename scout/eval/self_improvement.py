@@ -423,8 +423,7 @@ def _dry_run():
 
     def scout_vib_factory() -> torch.nn.Module:
         return ScoutVIB(state_dim=state_dim, action_dim=action_dim,
-                        s_latent_dim=16, style_dim=8, hidden_dim=32,
-                        beta=1e-3).to(torch.device("cpu"))
+                        style_dim=8, hidden_dim=32, beta=1e-3).to(torch.device("cpu"))
 
     # Mock env: scripted success threshold (same as rollout smoke).
     class MockEnv:
@@ -603,8 +602,7 @@ def _dry_run_two_rounds():
 
     def vib_factory():
         return ScoutVIB(state_dim=state_dim, action_dim=action_dim,
-                        s_latent_dim=16, style_dim=8, hidden_dim=32,
-                        beta=1e-3).to(torch.device("cpu"))
+                        style_dim=8, hidden_dim=32, beta=1e-3).to(torch.device("cpu"))
 
     class MockEnv:
         def __init__(self, seed=0):
