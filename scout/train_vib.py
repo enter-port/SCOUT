@@ -1,12 +1,15 @@
 """E1: VIB joint training + β scan + life/death sensitivity
-(scout_impl_plan.md Task 3.4, scout_design.md §3/§5).
+(scout_design.md §3/§5, stage1_plan.md §三).
 
 For each β in ``cfg.betas`` train a fresh :class:`ScoutVIB` on transitions from
 a :class:`TransitionSource` (default :class:`RobomimicLowdimSource`), logging
-AE / dyn / KL and μ mean/std. After training, compute
+next-state MSE / KL and μ mean/std. After training, compute
 :func:`sensitivity_ratio` and save ckpt + loss PNG. Finally plot sensitivity
 vs β to pick the largest β whose sensitivity ≥ ~0.3 (design §5; the
 make-or-break knob per §7 risk #1).
+
+Loss = next-state MSE + β·KL (no AE / no reconstruction / no latent-level
+term; E_s is identity for low_dim).
 
 Usage:
     python -m scout.train_vib --config configs/vib_lift_lowdim.yaml
@@ -68,7 +71,7 @@ def mu_stats(model, source, batch_size, device):
     b = source.sample(min(batch_size, len(source)))
     S_t = b["S_t"].to(device); A_t = b["A_t"].to(device)
     with torch.no_grad():
-        mu, _ = model.vib_enc(model.ae.encode(S_t), A_t)
+        mu, _ = model.vib_enc(model.E_s(S_t), A_t)
     mu_mean = float(mu.mean())                  # grand mean (≈0 if KL working)
     sigma_mu = float(mu.std(dim=0).mean())      # mean per-dim std -> μ scale
     mu_abs_mean = float(mu.abs().mean())
@@ -79,7 +82,6 @@ def train_one_beta(cfg, source, state_dim, action_dim, beta, sigma_a, device, be
     model = ScoutVIB(
         state_dim, action_dim,
         modality=cfg.model.modality,
-        s_latent_dim=cfg.model.s_latent_dim,
         style_dim=cfg.model.style_dim,
         hidden_dim=cfg.model.hidden_dim,
         beta=beta,
@@ -89,11 +91,11 @@ def train_one_beta(cfg, source, state_dim, action_dim, beta, sigma_a, device, be
     steps_per_epoch = int(cfg.steps_per_epoch)
     num_epochs = int(cfg.num_epochs)
     log_every_batch = max(1, steps_per_epoch // 5)
-    history = {"ae": [], "dyn": [], "kl": [], "mu_abs": []}
+    history = {"next_state_mse": [], "kl": [], "mu_abs": []}
 
     model.train()
     for epoch in range(num_epochs):
-        ep = {"ae": 0.0, "dyn": 0.0, "kl": 0.0, "mu_abs": 0.0, "n": 0}
+        ep = {"next_state_mse": 0.0, "kl": 0.0, "mu_abs": 0.0, "n": 0}
         for it in range(steps_per_epoch):
             b = source.sample(cfg.batch_size)
             S_t = b["S_t"].to(device); A_t = b["A_t"].to(device); S_tp1 = b["S_tp1"].to(device)
@@ -101,16 +103,16 @@ def train_one_beta(cfg, source, state_dim, action_dim, beta, sigma_a, device, be
             opt.zero_grad(); out["loss"].backward(); opt.step()
 
             if (it + 1) % log_every_batch == 0 or it == steps_per_epoch - 1:
-                ep["ae"] += out["ae"].item(); ep["dyn"] += out["dyn"].item()
+                ep["next_state_mse"] += out["next_state_mse"].item()
                 ep["kl"] += out["kl"].item()
                 ep["mu_abs"] += out["mu"].detach().abs().mean().item()
                 ep["n"] += 1
         n = max(1, ep["n"])
-        history["ae"].append(ep["ae"] / n); history["dyn"].append(ep["dyn"] / n)
-        history["kl"].append(ep["kl"] / n); history["mu_abs"].append(ep["mu_abs"] / n)
-        print(f"  [β={beta:g}] epoch {epoch:4d} | ae {history['ae'][-1]:.4f} "
-              f"dyn {history['dyn'][-1]:.4f} kl {history['kl'][-1]:.4f} "
-              f"|μ| {history['mu_abs'][-1]:.4f}")
+        history["next_state_mse"].append(ep["next_state_mse"] / n)
+        history["kl"].append(ep["kl"] / n)
+        history["mu_abs"].append(ep["mu_abs"] / n)
+        print(f"  [β={beta:g}] epoch {epoch:4d} | next_state_mse {history['next_state_mse'][-1]:.4f} "
+              f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}")
 
     # post-train diagnostics
     S_t, A_t, mu_mean, mu_abs_mean, sigma_mu = mu_stats(model, source, cfg.batch_size, device)
@@ -119,13 +121,14 @@ def train_one_beta(cfg, source, state_dim, action_dim, beta, sigma_a, device, be
     torch.save({"state_dict": model.state_dict(), "beta": beta,
                 "sensitivity": sr, "sigma_mu": sigma_mu, "sigma_a": sigma_a},
                os.path.join(beta_dir, "scout_vib.ckpt"))
-    plot_curves(history, ["ae", "dyn", "kl"], f"VIB losses (β={beta:g})",
+    plot_curves(history, ["next_state_mse", "kl"], f"VIB losses (β={beta:g})",
                 os.path.join(beta_dir, "losses.png"))
     plot_curves(history, ["mu_abs"], f"|μ| (β={beta:g})",
                 os.path.join(beta_dir, "mu.png"))
 
     return {"beta": beta,
-            "ae": history["ae"][-1], "dyn": history["dyn"][-1], "kl": history["kl"][-1],
+            "next_state_mse": history["next_state_mse"][-1],
+            "kl": history["kl"][-1],
             "mu_abs": mu_abs_mean, "sigma_mu": sigma_mu, "sensitivity": sr}
 
 

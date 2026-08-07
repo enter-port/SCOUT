@@ -1,10 +1,11 @@
 # E1: VIB joint training + β scan on robomimic `lift` low_dim (raw delta actions).
 # Run: python -m scout.train_vib --config configs/vib_lift_lowdim.yaml
 #
-# NOTE: data path points at SOE's robomimic dataset. As of Phase 3 the datasets/
-# dir is empty (not downloaded) -- the actual E1 β-scan is pending data + the
-# SOE conda env (py3.8 / torch 1.13). The training loop itself is verified on
-# dummy transitions (see idea/scout_impl_plan.md Task 3.4 verification).
+# Loss = next-state MSE + β·KL (no AE / no reconstruction; E_s = identity for
+# low_dim). NOTE: data path points at SOE's robomimic dataset. As of Phase 3
+# the datasets/ dir is empty (not downloaded) -- the actual E1 β-scan is
+# pending data + the SOE conda env (py3.8 / torch 1.13). The training loop
+# itself is verified on dummy transitions (see verification script).
 
 seed: 233
 
@@ -21,9 +22,8 @@ state_dim: null
 action_dim: null
 
 model:
-  modality: low_dim            # 【image 接口点】 set 'image' for stage-2
-  s_latent_dim: 32             # E_s/D_s latent (s̄_t)
-  style_dim: 16                # VIB skill latent (z)
+  modality: low_dim            # 【image 接口点】 set 'image' for stage-2 (NotImplementedError for now)
+  style_dim: 16                # VIB skill latent (z); E_s identity -> s_bar_dim = state_dim
   hidden_dim: 128
 
 # β is the make-or-break knob (scout_design.md §7 risk #1). Sweep, then pick

@@ -1,33 +1,34 @@
-"""``ScoutVIB``: state AE + VIB enc/dec with the joint loss (scout_design.md §3).
+"""``ScoutVIB``: E_s + VIB encoder + dynamics decoder + state decoder with the
+joint next-state loss (scout_design.md §3).
 
 Single-chain, single-``backward()``, NO base-DP involvement and NO gradient
 isolation (contrast SOE ``DPExt.backward``). The base Diffusion Policy is
 absent during VIB training -- this module never imports ``scout.policy``.
 
-Joint loss (one ``backward`` updates E_s/D_s/VIB_enc/VIB_dec together):
+Joint loss (one ``backward`` updates vib_enc / D_s / state_dec together;
+E_s is identity for low_dim → no params → no grads):
 
-  s̄_t   = E_s(S_t)                         (used twice: AE + as VIB input)
-  s̄_t1  = E_s(S_{t+1})                     NOT detached
+  s̄_t        = E_s(S_t)                              (identity for low_dim)
   (μ,logvar) = VIB_enc(s̄_t, A_t);  z = reparam
-  ŝ̄_{t+1} = VIB_dec(z, s̄_t)
+  ŝ̄_{t+1}    = D_s(z, s̄_t)
+  Ŝ_{t+1}    = state_dec(ŝ̄_{t+1})
 
-  ae_loss  = MSE(D_s(s̄_t), S_t) + MSE(D_s(s̄_{t+1}), S_{t+1})    # anti-collapse anchor
-  dyn_loss = MSE(ŝ̄_{t+1}, s̄_{t+1})                              # next-latent, not detached
-  kl       = 0.5*(μ² + exp(logvar) - 1 - logvar).sum(-1).mean()  # KL(N(μ,σ²)||N(0,I))
-  loss     = ae_loss + dyn_loss + beta*kl
+  next_state_mse = MSE(Ŝ_{t+1}, S_{t+1})               (next-state target)
+  kl             = 0.5*(μ² + exp(logvar) - 1 - logvar).sum(-1).mean()
+  loss           = next_state_mse + beta*kl
 
-The AE term is the make-or-break anti-collapse anchor: because the dynamics
-target ``s̄_{t+1}`` is *not* detached, the dynamics pull would otherwise drift
-``E_s`` toward a trivial constant; anchoring ``D_s(E_s(S))`` back to ``S`` on
-both timesteps pins "reconstructible" (scout_design.md §3).
+No AE, no reconstruction, no latent-level loss (scout_design.md §3, §7 risk
+#3). Anti-collapse is structural: low_dim E_s=identity (cannot collapse),
+image E_s ResNet frozen; D_s/state_dec are pinned by the next-state MSE itself
+(a dynamics that ignores z and predicts a constant has high loss).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from scout.model.state_ae import StateAE
-from scout.model.vib import VIBDecoder, VIBEncoder, reparam
+from scout.model.encoder import StateEncoder
+from scout.model.vib import DynamicsDecoder, StateDecoder, VIBEncoder, reparam
 
 
 class ScoutVIB(nn.Module):
@@ -36,7 +37,6 @@ class ScoutVIB(nn.Module):
         state_dim,
         action_dim,
         modality="low_dim",
-        s_latent_dim=32,
         style_dim=16,
         hidden_dim=128,
         beta=1.0e-3,
@@ -45,23 +45,31 @@ class ScoutVIB(nn.Module):
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
         self.modality = modality
-        self.s_latent_dim = int(s_latent_dim)
         self.style_dim = int(style_dim)
         self.hidden_dim = int(hidden_dim)
         self.beta = float(beta)
 
-        self.ae = StateAE.from_config(
-            modality, state_dim, latent_dim=s_latent_dim, hidden_dim=hidden_dim
+        # E_s: LPB-style encoder, NO autoencoder. Identity for low_dim (no params).
+        # Exposes s_bar_dim so the downstream heads size themselves off E_s.
+        self.E_s = StateEncoder.from_config(
+            modality, state_dim, hidden_dim=hidden_dim
         )
+        s_bar_dim = self.E_s.s_bar_dim
+
         self.vib_enc = VIBEncoder(
             action_dim=action_dim,
-            s_latent_dim=s_latent_dim,
+            s_bar_dim=s_bar_dim,
             style_dim=style_dim,
             hidden_dim=hidden_dim,
         )
-        self.vib_dec = VIBDecoder(
-            s_latent_dim=s_latent_dim,
+        self.D_s = DynamicsDecoder(
+            s_bar_dim=s_bar_dim,
             style_dim=style_dim,
+            hidden_dim=hidden_dim,
+        )
+        self.state_dec = StateDecoder(
+            s_bar_dim=s_bar_dim,
+            state_dim=state_dim,
             hidden_dim=hidden_dim,
         )
 
@@ -69,21 +77,19 @@ class ScoutVIB(nn.Module):
         """One transition batch -> joint loss dict.
 
         Inputs are ``(B, state_dim)`` / ``(B, action_dim)`` / ``(B, state_dim)``.
-        Returns ``{"loss","ae","dyn","kl","mu","logvar"}``; all losses are
-        scalars (mean-reduced), ``mu``/``logvar`` are ``(B, style_dim)``.
+        Returns ``{"loss","next_state_mse","kl","mu","logvar"}``; all losses
+        are scalars (mean-reduced), ``mu``/``logvar`` are ``(B, style_dim)``.
         """
-        s_bar_t = self.ae.encode(S_t)
-        s_bar_tp1 = self.ae.encode(S_tp1)                 # NOT detached (anchor rationale above)
+        s_bar_t = self.E_s(S_t)
 
         mu, logvar = self.vib_enc(s_bar_t, A_t)
         z = reparam(mu, logvar)
-        s_bar_pred = self.vib_dec(z, s_bar_t)
+        s_bar_pred = self.D_s(z, s_bar_t)          # ŝ̄_{t+1}
+        S_pred = self.state_dec(s_bar_pred)         # Ŝ_{t+1}
 
-        ae_loss = F.mse_loss(self.ae.decode(s_bar_t), S_t) \
-                  + F.mse_loss(self.ae.decode(s_bar_tp1), S_tp1)
-        dyn_loss = F.mse_loss(s_bar_pred, s_bar_tp1)      # target not detached
+        next_state_mse = F.mse_loss(S_pred, S_tp1)
         kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1).mean()
 
-        loss = ae_loss + dyn_loss + self.beta * kl
-        return {"loss": loss, "ae": ae_loss, "dyn": dyn_loss, "kl": kl,
+        loss = next_state_mse + self.beta * kl
+        return {"loss": loss, "next_state_mse": next_state_mse, "kl": kl,
                 "mu": mu, "logvar": logvar}

@@ -24,11 +24,12 @@
 | 组件 | 训法 | 说明 |
 |---|---|---|
 | **base DP**(SOE `DP`) | 用 core demos 单独训(E0),训完**冻结** | `MultiImageObsEncoder` + `bottleneck` + `DiffusionUNetPolicy`;之后全程冻结,VIB 训练时不在场 |
-| **E_s / D_s**(MLP 自编码器) | 与 VIB **联合**训(E1) | state(≈19)↔ s̄_t(32);`D_s` 仅训练期给 `E_s` 重建信号,**推理下线** |
-| **VIB encoder**(E1) | 联合训(E1) | `concat(s̄_t, a_t) → (μ, logvar)`;`style_dim = 16` |
-| **VIB decoder**(D1) | 联合训(E1) | `concat(z, s̄_t) → ŝ̄_{t+1}`;**推理下线**(测试只用 μ) |
+| **E_s**(编码器,LPB 式,无 AE) | low_dim:**identity,不训**;image(stage-2):冻结 ResNet + proprio embed | low_dim: `s̄_t = S_t` |
+| **VIB encoder** | 联合训(E1) | `concat(s̄_t, a_t) → (μ, logvar)`;`style_dim = 16` |
+| **D_s**(dynamics decoder) | 联合训(E1) | `concat(z, s̄_t) → ŝ̄_{t+1}` |
+| **state decoder** | 联合训(E1) | `ŝ̄_{t+1} → Ŝ_{t+1}`(低维 env state);**推理下线** |
 
-> 测试期在线的只有 **base DP(冻结)+ VIB encoder 的 μ**;`D_s`、VIB decoder 全部下线。所有 MLP block 用 SOE `EncoderMLP`(hidden 128)。
+> 测试期在线的只有 **base DP(冻结)+ VIB encoder 的 μ**;D_s、state decoder 下线。MLP block 用 SOE `EncoderMLP`(hidden 128)。
 
 ---
 
@@ -39,12 +40,12 @@
 - 产物 `policy_last.ckpt`,后续**冻结**复用(= self-improvement loop 的 DP₀)。
 
 ### E1 · VIB 联合训练 + β 扫描 + 生死诊断(前置)
-- 对 β ∈ {1e-4, 1e-3, 1e-2, 1e-1} 各**联合训**一个 (`E_s`/`D_s`/VIB_enc/VIB_dec):单链、单次 backward,base DP 不在场。
-- loss = AE 重建(`S_t` 与 `S_{t+1}`)+ next-latent MSE(不 detach)+ β·KL(见 `scout_design.md §3`)。
+- 对 β ∈ {1e-4, 1e-3, 1e-2, 1e-1} 各**联合训**一个 (VIB_enc / D_s / state_dec;`E_s` low_dim=identity 无参):单链、单次 backward,base DP 不在场。
+- loss = next-state MSE(`Ŝ_{t+1}`, `S_{t+1}`)+ β·KL(见 `scout_design.md §3`);**无 AE / 无重建 / 无 latent 级**。
 - 数据:transitions 经 `TransitionSource` 采样。
-- 逐 β 记录(画 vs β):AE 重建、next-latent MSE、KL、μ 的 mean/std(≈ N(0,I)?)。
+- 逐 β 记录(画 vs β):next-state MSE、KL、μ 的 mean/std(≈ N(0,I)?)。
 - **生死诊断** `‖∂μ/∂a‖`:`A_t.requires_grad_(True)` → `autograd.grad(μ.sum(), A_t)` → **敏感比 = `‖∂μ/∂a‖·σ_a / σ_μ`**("a 抖一个 std 时 μ 的相对移动")。
-- **β 选择**:敏感比仍 ≥ ~0.3(先定后校准)的**最大** β,且重建未显著升高、μ ≈ N(0,I)。
+- **β 选择**:敏感比仍 ≥ ~0.3(先定后校准)的**最大** β,且 next-state MSE 未显著升高、μ ≈ N(0,I)。
 
 ---
 

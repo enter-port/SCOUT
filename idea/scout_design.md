@@ -31,16 +31,17 @@
   S_t ─[E_s]→ s̄_t ─┐
                     ├─[VIB enc]→ (μ,logvar) →reparam z ─┐
           a_t ─────┘                                     │
-                                                          ├─[VIB dec]→ ŝ̄_{t+1} ─[D_s]→ Ŝ_{t+1}
+                                                          ├─[D_s: dynamics dec]→ ŝ̄_{t+1} ─[state dec]→ Ŝ_{t+1}
                                          s̄_t ────────────┘
-  loss = AE重建 + next-latent MSE + β·KL    (联合训练,详见 §3)
+  loss = next-state MSE( Ŝ_{t+1}, S_{t+1} ) + β·KL   (无 AE / 无重建 / 无 latent 级;E_s 见下)
 
-测试(q_φ / D_s 下线;只用 μ + 冻结 base DP):
+  E_s:low_dim = identity(s̄_t = S_t);image = 冻结 base-DP ResNet + proprio embed(LPB 式)
+测试(D_s / state dec 下线;只用 μ + 冻结 base DP):
   z ~ N(0,I)  整段 chunk 定住
   → 在 base DP 去噪循环注入 ∇_{x_t}[ −‖z − μ(s̄_t, a)‖ ]   (LPB 范式,详见 §4)
 ```
 
-双观测路径:**low_dim(stage 1)** $E_s/D_s$=MLP;**image(stage 2)** $E_s/D_s$=CNN,其余结构不变(§6)。
+双观测路径:**low_dim(stage 1)** $E_s$=identity($s̄_t = S_t$);**image(stage 2)** $E_s$=冻结 base-DP ResNet + 训练的 proprio embed(LPB 式),其余结构不变(§6)。**state decoder 始终输出低维 env state → 图像路径不解码像素、#1 风险结构性避免。**
 
 ---
 
@@ -51,9 +52,10 @@
 
 | 网络 | 结构 | 维度(stage-1 low_dim lift) |
 |---|---|---|
-| `E_s / D_s` | MLP 自编码器(`EncoderMLP`) | state(≈19,从 hdf5 读)↔ s̄_t(**32**) |
-| VIB encoder | `concat(s̄_t, a_t) → EncoderMLP → (μ,logvar)` | in = 32 + action_dim;out = 2·style_dim = **32** |
-| VIB decoder | `concat(z, s̄_t) → EncoderMLP → ŝ̄_{t+1}` | in = 16 + 32;out = 32 |
+| **E_s**(编码器,LPB 式,**无 AE**) | low_dim:**identity**(`s̄_t = S_t`,不训);image:冻结 base-DP ResNet + 训练的 proprio embed | low_dim:s̄_t = state_dim(≈19) |
+| VIB encoder | `concat(s̄_t, a_t) → EncoderMLP → (μ,logvar)` | in = state_dim + action_dim;out = 2·style_dim = **32** |
+| **D_s**(dynamics decoder) | `concat(z, s̄_t) → EncoderMLP → ŝ̄_{t+1}` | in = style_dim + state_dim;out = s̄_t 维 |
+| **state decoder**(新) | `ŝ̄_{t+1} → EncoderMLP → Ŝ_{t+1}`(低维 **env state**) | in = s̄_t 维;out = state_dim |
 | skill latent `z` | reparam:`z = μ + σ·ε`,`σ = exp(0.5·logvar)` | style_dim = **16** |
 | **base DP** | **SOE `DP`**:`MultiImageObsEncoder`(low_dim: sorted keys identity 拼接;image: per-key ResNet-18)+ 可选 `bottleneck`(`EncoderMLP`)+ `DiffusionUNetPolicy`(ε-DDPM) | obs_feature_dim = Σ低维 key 维(≈19);动作 chunk `(B, 20, action_dim)`;测试期冻结 |
 
@@ -68,16 +70,16 @@
 
 ## 3. 训练(联合 + 数据解耦)
 
-**联合训练**(单阶段,$E_s/D_s/$VIB enc/dec 一起训):
-- 前向(一个 transition batch):$s̄_t = E_s(S_t)$ → $(μ,\logvar) = \text{VIB\_enc}(s̄_t, A_t)$ → $z = \text{reparam}$ → $\hat{s̄}_{t+1} = \text{VIB\_dec}(z, s̄_t)$。
-- loss(一次 backward 更新全部):
-$$\mathcal L = \underbrace{\|D_s(E_s(S_t)) - S_t\|^2 + \|D_s(E_s(S_{t+1})) - S_{t+1}\|^2}_{\text{AE 重建(锚,$S_t$ 与 $S_{t+1}$ 都重建)}} + \underbrace{\|\hat{s̄}_{t+1} - E_s(S_{t+1})\|^2}_{\text{next-latent 动力学(不 detach)}} + \underbrace{\beta\,\mathrm{KL}[\mathcal N(\mu,\sigma^2)\,\|\,\mathcal N(0,I)]}_{\text{KL}}$$
-- **AE 重建是防坍缩锚**:动力学不 detach 让 $E_s$ 朝"好预测"漂;AE 重建在 $S_t$ **和** $S_{t+1}$ 上都施加(否则非 detach 的 $E_s(S_{t+1})$ 只被动力学拉向预测、即坍缩方向)→ 钉死"可还原 $S$"→ 不塌成平凡解。(可选:AE-only warmup 几个 epoch 再开动力学,当稳定旋钮。)
+**联合训练**(单阶段,VIB enc / D_s / state dec 一起训;$E_s$ low_dim=identity 无参,image 下 ResNet 冻结、只 proprio embed 训):
+- 前向(一个 transition batch):$s̄_t = E_s(S_t)$ → $(μ,\logvar) = \text{VIB\_enc}(s̄_t, A_t)$ → $z = \text{reparam}$ → $\hat{s̄}_{t+1} = D_s(z, s̄_t)$ → $\hat{S}_{t+1} = \text{state\_dec}(\hat{s̄}_{t+1})$。
+- loss(一次 backward 更新 VIB enc / D_s / state dec):
+$$\mathcal L = \underbrace{\|\hat{S}_{t+1} - S_{t+1}\|^2}_{\text{next-state MSE(经 state decoder)}} + \underbrace{\beta\,\mathrm{KL}[\mathcal N(\mu,\sigma^2)\,\|\,\mathcal N(0,I)]}_{\text{KL}}$$
+- **无 AE、无重建、无 latent 级 loss**。防坍:① low_dim 下 $E_s$=identity 不学、不会塌;② image 下 $E_s$ 的 ResNet 冻结;proprio embed / D_s / state dec 靠 **next-state 预测本身**携信息(预测不出 $S_{t+1}$ → loss 高)→ 不会塌成平凡解。
 - base DP **不在场**;单链、单次 backward、**无梯度隔离**。
 - **β = make-or-break 旋钮**:E1 扫 $\beta \in \{10^{-4}, 10^{-3}, 10^{-2}, 10^{-1}\}$ + 生死诊断(§5)定。
 
 **数据 loader 解耦**(`data/` 模块):
-- 核心单元 = transition $(S_t, A_t, S_{t+1})$;`S_t` 为拼好的状态向量(AE 重建直接用 $S_t/S_{t+1}$,不另开 state 流)。
+- 核心单元 = transition $(S_t, A_t, S_{t+1})$;`S_t` 为拼好的状态向量(next-state MSE 用 $S_{t+1}$ 作 target,无需额外 state 流)。
 - 抽象 `TransitionSource` 接口(= `ReplayBuffer`):`sample(batch) → {S_t, A_t, S_{t+1}}`、`add(transitions)`、`__len__`、`stats()`。
 - **可插拔后端**:robomimic low_dim(现)/ 真机(后)/ 其他仿真(后);每个后端只管"怎么把自家数据拼成 $(S_t, A_t, S_{t+1})$",训练代码只认接口。
 - **online training**:`add()` 边录边加(真机 teleop / rollout 产出 transition 直接进 buffer);训练从**不断增长**的 buffer 采样;归一化用 **running 统计(Welford 增量)**;add / sample 并发用共享内存或周期 rebuild。
@@ -151,13 +153,9 @@ Round 1:  DP₁ vs DP₀ 性能对比;多轮滚,success rate / round 应单调�
 
 ## 6. 图像路径(stage 2)+ self-improvement 接口
 
-**图像路径**:4 阶段管线**观测无关**,stage-1 → stage-2 只换 $E_s/D_s$(MLP → CNN;$E_s$ 参照 LPB `ResNetEncoder` 的 per-view ResNet)。VIB enc/dec(E1/D1,MLP)、guidance、base DP 不变——核心机制在 low_dim 证通后,图像是平滑扩展。
+**图像路径**:4 阶段管线**观测无关**,stage-1 → stage-2 只换 $E_s$:low_dim 的 **identity** → image 的「**冻结 base-DP ResNet + 训练的 proprio embed**」(LPB 式,参 LPB `ResNetEncoder` + `ProprioceptiveEmbedding`)。VIB enc、D_s、state decoder、guidance、base DP 全不变——核心机制在 low_dim 证通后,图像是平滑扩展。
 
-**stage-2 #1 风险(留 stage-2 定方案)**:图像路径若要 $D_s$ 解码回**像素**(latent → image),撞 next-state prediction 这个 world-model 级难题。两条回避路线届时二选一:
-- (i) 学 LPB——只预测 next-**latent**、不解码像素;图像阶段 $E_s$ 复用 base DP 冻结 ResNet,或单独预训练一个 image AE;
-- (ii) 在轻量离散 latent(VQ-AE)上做动力学,绕开像素重建。
-
-→ stage-1 low_dim 不受影响,先证机制。
+**#1 风险已结构性规避**:state decoder 始终输出**低维 env state**(robomimic 的 `states`),**从不解码像素**。图像只作为 $E_s$ 的输入(冻结 ResNet 特征),不是预测目标 → 没有 next-image prediction 这个 world-model 难题。stage-2 只需:确认 env state 作为 target 可用、冻结 ResNet 接得上、proprio embed 训得动。
 
 **self-improvement 接口**:已含在 §3 `ReplayBuffer` + §5 loop,无新组件。online 训练 = teleop / rollout 产出 transition → `buffer.add()` → 训练从增长 buffer 采样 + running 归一化增量更新。
 
@@ -166,15 +164,15 @@ Round 1:  DP₁ vs DP₀ 性能对比;多轮滚,success rate / round 应单调�
 ## 7. 关键风险
 
 1. **β 是 make-or-break**:太大 → $\mu$ 与动作脱钩 → guidance no-op → 探索死。靠 §5 生死诊断 + β 扫描把控。
-2. **next-state / latent prediction**(stage-2 图像)= #1 工程风险;stage-1 low_dim 先绕开。
-3. **联合训练坍缩**:靠 AE 重建锚 + 可选 warmup。
+2. **next-state prediction 的 #1 风险已结构性规避**:state decoder 输出低维 env state、不解码像素(§6)。残余:stage-2 图像 $E_s$ 的 proprio embed + 冻结 ResNet 接入是否顺利。
+3. **坍缩**:**已无 AE**(原 AE 锚取消)。low_dim 下 $E_s$=identity 不学、不会塌;image 下 ResNet 冻结、proprio embed 靠 next-state 预测携信息。残余:z 被动力学忽略 → 由 β 把控(见 #1)。
 4. **归一化桥错位**:DP 动作空间与 VIB 动作空间不一致会让 cost 失真(§4 桥)。
 
 ---
 
 ## 8. 待定(stage-2 / 实现期再决)
 
-- 图像路径像素解码方案(§6 的 (i) / (ii))。
-- 具体超参(s̄_t = 32、style_dim = 16、hidden = 128、guidance_scale、guidance_start_timestep)。
+- 图像 $E_s$ 的 proprio embed 结构(Conv1d vs MLP)+ 冻结 ResNet 接入细节。
+- 具体超参(style_dim = 16、hidden = 128、D_s / state decoder 维度、guidance_scale、guidance_start_timestep)。
 - online buffer 并发实现(共享内存 vs 周期 rebuild)。
 - 真机后端数据格式(teleop → transition)。

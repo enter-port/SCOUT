@@ -16,7 +16,7 @@ Stage 1 targets the robomimic `lift` low_dim task.
 ```
 scout/
   data/    # TransitionSource interface + ReplayBuffer + robomimic low_dim backend
-  model/   # EncoderMLP (ported from SOE); StateAE / VIB / ScoutVIB in later phases
+  model/   # EncoderMLP (SOE port); StateEncoder (E_s, LPB-style) / VIB / ScoutVIB
 configs/   # YAML configs (Phase 2+)
 ```
 

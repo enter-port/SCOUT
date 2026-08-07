@@ -14,7 +14,7 @@ def sensitivity_ratio(model, S_t, A_t, sigma_a, sigma_mu):
     ``‖∂μ/∂a‖_F · σ_a / σ_μ``.
 
     Inputs:
-      model     : a :class:`scout.model.scout_vib.ScoutVIB` (uses ``.ae`` +
+      model     : a :class:`scout.model.scout_vib.ScoutVIB` (uses ``.E_s`` +
                    ``.vib_enc``).
       S_t       : ``(B, state_dim)`` tensor (CPU or GPU).
       A_t       : ``(B, action_dim)`` tensor; will be turned into a leaf that
@@ -25,18 +25,20 @@ def sensitivity_ratio(model, S_t, A_t, sigma_a, sigma_mu):
 
     Returns a Python float.
 
-    .. note:: Exact formula: with ``g = ∂(Σ_k μ_k)/∂A_t`` (a single backward
-       pass on ``mu.sum()``), ``g[b]`` is the *row-sum* of the per-sample
-       Jacobian ``(style_dim, action_dim)``. We report
-       ``mean_b ‖g_b‖₂ · σ_a/σ_μ``. The row-sum can hide sign cancellations
-       across style dims; if a β looks borderline, upgrade to a Hutchinson
-       estimator of the squared Frobenius norm
-       (``E_v ‖Jᵀ v‖² ≈ ‖J‖²_F``, one backward pass with random v). The
+    .. note:: E_s is identity for low_dim (no params); we still call it so the
+       path matches the trained forward and stays correct on the stage-2 image
+       modality (frozen ResNet, no grad through E_s either way). Exact formula:
+       with ``g = ∂(Σ_k μ_k)/∂A_t`` (one backward pass on ``mu.sum()``),
+       ``g[b]`` is the *row-sum* of the per-sample Jacobian
+       ``(style_dim, action_dim)``. We report ``mean_b ‖g_b‖₂ · σ_a/σ_μ``. The
+       row-sum can hide sign cancellations across style dims; if a β looks
+       borderline, upgrade to a Hutchinson estimator of the squared Frobenius
+       norm (``E_v ‖Jᵀ v‖² ≈ ‖J‖²_F``, one backward pass with random v). The
        threshold (~0.3) is approximate; the point is "is μ sensitive to a at
        all".
     """
     A = A_t.detach().clone().requires_grad_(True)
-    s_bar = model.ae.encode(S_t)
+    s_bar = model.E_s(S_t)
     mu, _ = model.vib_enc(s_bar, A)
     g = torch.autograd.grad(mu.sum(), A, create_graph=False)[0]   # (B, action_dim)
     jac_norm = g.flatten(1).norm(dim=-1).mean()                   # mean over batch
