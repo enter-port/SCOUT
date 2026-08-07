@@ -1,0 +1,75 @@
+# SCOUT stage-1 self-improvement eval config (Phase 5.3).
+#
+# Real E4 run is DEFERRED -- paths marked `<TBD>` must be filled from the
+# Phase-2 base-DP training output (logs/<ts>/ckpt/policy_epoch_*.ckpt and
+# configs/base_dp_lift_lowdim.yaml) and the Phase-3 chosen-β ScoutVIB ckpt
+# (train_vib.py run_root/beta_<best>/scout_vib.ckpt). Schema mirrors what
+# scout/eval/self_improvement.py:SelfImprovementLoop reads.
+
+seed: 42
+
+# ---- models -------------------------------------------------------------
+base_dp:
+  initial_ckpt_path: <TBD-phase2>      # logs/<ts>/ckpt/policy_epoch_<final>.ckpt
+  # The Phase-2 base DP train cfg, used by retrain_fn to clone + override
+  # dataset.path / num_epochs / resume_ckpt per round.
+  train_cfg:
+    seed: 42
+    batch_size: 256
+    num_epochs: 3000
+    save_epochs: 200
+    log_dir: logs/eval_lift_round       # retrain sub-dirs created per round
+    dataset:
+      path: <TBD-core-hdf5>             # e.g. .../lift/low_dim_v141.hdf5
+      train_filter_key: core_20         # core_20 demos per design §5
+      num_workers: 4
+    policy:
+      name: DP
+      params:
+        num_action: 20
+        action_dim: 10                  # abs_6drot (3 trans + 6 rot + 1 gripper)
+        obs_shape_meta:
+          object: {shape: [10], type: low_dim}
+          robot0_eef_pos: {shape: [3], type: low_dim}
+          robot0_eef_quat: {shape: [4], type: low_dim}
+          robot0_gripper_qpos: {shape: [2], type: low_dim}
+        # remaining DP kwargs (diffusion inference steps, down_dims, etc.) must
+        # match the Phase-2 base_dp_lift_lowdim.yaml exactly.
+    optimizer:
+      params: {lr: 1.0e-4, weight_decay: 1.0e-5}
+    lr_scheduler:
+      num_warmup_steps: 2000
+
+vib:
+  ckpt_path: <TBD-phase3>              # train_vib.py run_root/beta_<best>/scout_vib.ckpt
+  # Chosen β is baked into the ckpt (saved as ckpt["beta"] by train_vib.py).
+
+dataset:
+  path: <TBD-core-hdf5>                # same core hdf5 as base_dp.train_cfg
+
+action_dim: 10
+
+# ---- eval ---------------------------------------------------------------
+eval:
+  n_init_states: 100                   # SOE default (design §5)
+  try_times: 5                         # Pass@5
+  horizon: 400                         # robomimic lift default
+  # obs_keys used for the write-back S_t concat (must match RobomimicLowdimSource
+  # convention -- the encoder was trained on this ordering).
+  obs_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos, object]
+
+# ---- exploration (Phase-4 guided path) ---------------------------------
+exploration:
+  guidance_scale: 5.0                  # picked from E2 sweep; tunable per round
+  guidance_start_timestep: 50          # gate (a): guide only the last K steps
+
+# ---- self-improvement loop ---------------------------------------------
+self_improvement:
+  num_rounds: 6                        # SOE default (design §5)
+  core_filter_key: core_20             # init-state + write-back core mask
+  # retrain epochs per round (overrides base_dp.train_cfg.num_epochs):
+  num_epochs: 1500
+
+# ---- runtime ------------------------------------------------------------
+device: auto                           # auto -> cuda if available, else cpu
+log_dir: logs/scout_eval_lift

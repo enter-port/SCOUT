@@ -545,16 +545,18 @@ def _smoke():
         assert a.shape == (traj["horizon"], action_dim), "action shape"
         assert traj["horizon"] > 0, "guided rollout produced no steps"
 
-    # write-back smoke
+    # write-back smoke -- run a full-horizon trajectory (no early success) so
+    # the conversion produces a non-trivial transition count.
     succ, traj = rollout_episode(guided_g, MockEnv(action_dim=action_dim,
                                                     horizon=10), horizon=10,
-                                 initial_state_dict={"s": 0.0}, record_obs=True)
+                                 initial_state_dict={"s": 100.0}, record_obs=True)
     trans = rollout_to_transitions(traj, obs_keys=["low_dim_a", "low_dim_b"],
                                    action_dim=action_dim)
     print(f"[3] rollout_to_transitions: keys={list(trans.keys())} "
           f"S_t.shape={trans['S_t'].shape} A_t.shape={trans['A_t'].shape}")
     assert trans["S_t"].shape == (traj["horizon"], 2 * action_dim)
     assert trans["A_t"].shape == (traj["horizon"], action_dim)
+    assert traj["horizon"] == 10, "write-back smoke should use a full-horizon traj"
     print("[smoke] rollout.py OK")
 
 
