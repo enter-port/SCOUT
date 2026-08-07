@@ -257,13 +257,20 @@ def default_retrain_fn_factory(log_root: str) -> RetrainFn:
         round_dir = os.path.join(log_root, f"round_{round_idx + 1}")
         os.makedirs(round_dir, exist_ok=True)
         new_path = os.path.join(round_dir, "augmented.hdf5")
+        aug_mask_key = cfg.self_improvement.get("scout_aug_mask", "scout_aug")
         _write_augmented_hdf5(core_path, new_path, successful_rollouts,
-                              core_filter_key=cfg.self_improvement.core_filter_key)
+                              core_filter_key=cfg.self_improvement.core_filter_key,
+                              aug_mask_key=aug_mask_key)
 
         # 2. retrain cfg -- clone, override dataset path + ckpt resume
         import copy
         base_dp_cfg = EasyDict(copy.deepcopy(dict(cfg.base_dp.train_cfg)))
         base_dp_cfg.dataset.path = new_path
+        # The augmented HDF5 contains core demos + appended successful rollouts.
+        # `train_filter_key` MUST point at a mask that includes BOTH, else the
+        # retrain would ignore the new rollouts (the bug we avoid). The augmented
+        # file writes such a mask (`mask/<scout_aug_mask>`); point at it here.
+        base_dp_cfg.dataset.train_filter_key = cfg.self_improvement.scout_aug_mask
         base_dp_cfg.resume_ckpt = prev_dp_ckpt
         base_dp_cfg.log_dir = round_dir
         if "num_epochs" in cfg.self_improvement:
@@ -278,11 +285,16 @@ def default_retrain_fn_factory(log_root: str) -> RetrainFn:
 
 def _write_augmented_hdf5(core_path: str, out_path: str,
                           rollouts: List[dict],
-                          core_filter_key: str = "train"):
+                          core_filter_key: str = "train",
+                          aug_mask_key: str = "scout_aug"):
     """Write ``core_path``'s filtered demos + ``rollouts`` as a new HDF5.
 
     Mirrors robomimic's ``data/demo_N`` schema: per-demo ``obs/<key>`` (T, dim),
     ``actions`` (T, action_dim), ``done``/``success`` (T,) bool, ``states`` (T, D).
+    Also writes ``mask/<aug_mask_key>`` = boolean over ALL ``data/`` demos that
+    selects ``core_filter_key`` demos + the appended rollout demos, so the
+    retrain step can pick up both via a single mask (otherwise it would
+    re-train on core-only and silently ignore the new rollouts).
 
     .. warning:: UNTESTED against the real robomimic loader (env deferred). The
        schema is faithful to SOE's `run_full_multi_round.py` write path; if a
@@ -303,11 +315,16 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
             raise RuntimeError(f"no core demos under mask='{core_filter_key}' in {core_path}")
         obs_keys = _discover_obs_keys(f["data"], core_demos[0])
 
+        # all demos present BEFORE we append (used for the augmented mask)
+        all_demos_before = sorted([k for k in f["data"].keys() if k.startswith("demo")])
+        core_set = set(core_demos)
+
         # find next free demo id
         existing_ids = [int(d.split("_")[-1]) for d in f["data"].keys()
                         if d.startswith("demo_") and d.split("_")[-1].isdigit()]
         next_id = (max(existing_ids) + 1) if existing_ids else 0
 
+        new_demo_names: List[str] = []
         for rollout in rollouts:
             demo_name = f"demo_{next_id}"
             next_id += 1
@@ -337,7 +354,20 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
                                             dtype=bool))
             # num_samples attr (robomimic convention)
             grp.attrs["num_samples"] = ep_len
-        f.attrs["num_demos_added"] = next_id - (max(existing_ids) + 1 if existing_ids else 0)
+            new_demo_names.append(demo_name)
+
+        # write the augmented mask: True for core_<filter> demos + new rollouts.
+        # `data/demo_list` order is the canonical mask index order (sorted).
+        all_demos_after = sorted([k for k in f["data"].keys() if k.startswith("demo")])
+        new_set = set(new_demo_names)
+        mask = np.array([d in core_set or d in new_set for d in all_demos_after],
+                        dtype=bool)
+        if f"mask/{aug_mask_key}" in f:
+            del f[f"mask/{aug_mask_key}"]
+        aug_grp = f.create_group(f"mask/{aug_mask_key}")
+        aug_grp.create_dataset("mask", data=mask)
+        aug_grp.attrs["num"] = int(mask.sum())
+        f.attrs["num_demos_added"] = len(new_demo_names)
 
 
 # --------------------------------------------------------------------------- #

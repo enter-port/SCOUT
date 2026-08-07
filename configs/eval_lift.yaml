@@ -67,6 +67,10 @@ exploration:
 self_improvement:
   num_rounds: 6                        # SOE default (design §5)
   core_filter_key: core_20             # init-state + write-back core mask
+  # Mask name written by _write_augmented_hdf5 that selects core_<core_filter_key>
+  # demos + the round's appended successful rollouts. The retrain step MUST point
+  # at this (NOT core_20) or the new rollouts are silently ignored.
+  scout_aug_mask: scout_aug
   # retrain epochs per round (overrides base_dp.train_cfg.num_epochs):
   num_epochs: 1500
 
