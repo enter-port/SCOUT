@@ -1,0 +1,46 @@
+# E0: train base Diffusion Policy on robomimic `lift` low_dim (raw delta actions).
+# Single-GPU, no DDP. Run: python -m scout.train_base_dp --config configs/base_dp_lift_lowdim.yaml
+#
+# NOTE: data path points at SOE's robomimic dataset. As of Phase 2 the datasets/
+# dir is empty (not downloaded) -- the actual E0 run is pending data + the SOE
+# conda env (py3.8 / torch 1.13). See idea/scout_impl_plan.md Task 2.2.
+
+seed: 233
+
+dataset:
+  # Path is relative to the repo root (where scout/ lives). Override per machine.
+  path: SOE/simulation/datasets/lift/ph/low_dim_v141.hdf5
+  train_filter_key: train      # mask/<key> group in hdf5; set to "core_20" for core subset
+  num_workers: 4
+
+policy:
+  name: DP
+  params:
+    num_action: 20             # action chunk horizon
+    action_dim: 7              # lift raw delta: 3 trans + 3 rot + 1 gripper
+    obs_shape_meta:
+      robot0_eef_pos:      {shape: [3],  type: low_dim}
+      robot0_eef_quat:     {shape: [4],  type: low_dim}
+      robot0_gripper_qpos: {shape: [2],  type: low_dim}
+      object:              {shape: [10], type: low_dim}
+    use_group_norm: false      # no rgb -> BN path unused; stay safe
+    resnet_out_features: 64
+    noise_scheduler_type: ddim
+    num_inference_steps: 20
+
+optimizer:
+  name: AdamW
+  params:
+    lr: 1.0e-4
+    betas: [0.95, 0.999]
+    weight_decay: 1.0e-6
+
+lr_scheduler:
+  name: cosine_with_warmup
+  num_warmup_steps: 2000
+
+batch_size: 256
+num_epochs: 3000
+save_epochs: 300               # save ckpt + loss PNG every save_epochs
+
+log_dir: out/base_dp_lift_lowdim
