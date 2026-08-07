@@ -12,14 +12,15 @@
 ## 五阶段路线
 
 ### 阶段 0｜文献与方法夯实（纯查阅 + 推导）
-- [ ] 精读 SOE：论文 + 代码（核心 `SOE/src/policy/dp_ext.py`，双路径与梯度隔离；笔记见 `SOE/SOE_LIB_training_notes.md`、`SOE/SOE_Feishu_notes.md`）
-- [ ] Classifier / Classifier-Free Guidance：Dhariwal & Nichol (2021)；把 score 分解公式吃透
-- [ ] **DIAYN**（Eysenbach et al.）：目标函数与本 idea 一脉相承（`papers/DIAYN.pdf` 在手，必读）
-- [ ] DeepVIB（`papers/DeepVIB.pdf`）：变分上界与 KL 解析形式
-- [ ] World model 系列（Dreamer / PlaNet）：搞清图像观测下 next-state prediction 为何难、别人怎么绕
+- [x] 精读 SOE：论文 + 代码（核心 `SOE/src/policy/dp_ext.py`，双路径与梯度隔离；笔记见 `SOE/SOE_LIB_training_notes.md`、`SOE/SOE_Feishu_notes.md`）
+- [x] Classifier / Classifier-Free Guidance：Dhariwal & Nichol (2021)；把 score 分解公式吃透
+- [x] **DIAYN**（Eysenbach et al.）：目标函数与本 idea 一脉相承（`papers/DIAYN.pdf` 在手，必读）
+- [x] DeepVIB（`papers/DeepVIB.pdf`）：变分上界与 KL 解析形式
+- [x] World model 系列（Dreamer / PlaNet）：搞清图像观测下 next-state prediction 为何难、别人怎么绕
 - [ ] baseline 生态：SIME、RISE、VQ-BeT、Diffusion Policy
 
 ### 阶段 1｜方案细化与可行性验证（推导 + 小代码）
+> 详细实验计划见 [`stage1_plan.md`](stage1_plan.md)（数据 / 解码器形式 / E0–E4 实验 + metric + 过线）。
 - [ ] 定状态空间：先用 robomimic **low_dim**
 - [ ] 定解码器形式：确定性回归 vs 扩散式 next-state 去噪
 - [ ] 推 guidance 可实现性：$Cost=\|z-\mu(s,a)\|$ 对**带噪** $a$ 求梯度是否稳定、每步反传开销预估

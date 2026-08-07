@@ -1,6 +1,4 @@
-# SCOUT
-
-**S**elf-improving via **C**lassifier-guided **O**ptimization of **U**nsupervised **T**rajectories
+# SCOUT — Robot Policy Self-Improvement via Classifier-Guided Optimization of Unsupervised Trajectories
 
 > 一个机器人模仿学习的探索方法：在**冻结的**扩散策略（Diffusion Policy）之上，训练一个轻量的 VIB 动力学模型学习 skill 潜空间，并在测试时用 **classifier guidance** 引导冻结策略探索多样的 skill，最终实现 multi-round self-improvement。
 
