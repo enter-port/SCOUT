@@ -1,17 +1,18 @@
-"""VIB encoder + dynamics decoder + state decoder + reparam (scout_design.md §2, §3).
+"""VIB encoder + dynamics decoder + reparam (scout_design.md §2, §3).
 
-Information-bottleneck skill latent + the dynamics/state heads. Mirrors the
-SOE ``dp_ext.py:72-81`` block pattern (EncoderMLP for the down/up modules)
-but with I/O shaped for the next-state dynamics:
+Information-bottleneck skill latent + the dynamics head. Mirrors the SOE
+``dp_ext.py:72-81`` EncoderMLP block pattern but with I/O shaped for SCOUT's
+next-latent dynamics (latent-level target = ``E_s(S_{t+1}).detach()``, no state
+decoder -- scout_design.md §3):
 
   (s̄_t, a_t) --[VIBEncoder]--> (μ, logvar) --reparam--> z
                                                        │
-                    s̄_t ────────────────────────────── ├─[DynamicsDecoder: D_s]--> ŝ̄_{t+1} --[StateDecoder]--> Ŝ_{t+1}
+                    s̄_t ────────────────────────────── ├─[DynamicsDecoder: D_s]--> ŝ̄_{t+1}
 
-Dims (stage-1 low_dim lift): ``style_dim``=16, ``s_bar_dim``=state_dim (≈19,
-since E_s is identity), hidden=128. The encoder predicts ``2*style_dim``
-(μ||logvar); D_s predicts the next s̄ (dim = ``s_bar_dim``); state_dec maps
-s̄ → env state (``state_dim``). No base-DP involvement here.
+Dims: ``style_dim``=16; ``s_bar_dim`` follows E_s (= 512*n_views + proprio_emb_dim
+on the LPB-style image path). The encoder predicts ``2*style_dim`` (μ||logvar,
+chunked in half along the last dim); D_s predicts the next s̄ (dim = ``s_bar_dim``).
+No base-DP involvement here.
 """
 
 import torch
@@ -36,8 +37,8 @@ class VIBEncoder(nn.Module):
     """``concat(s̄_t, a_t) -> (μ, logvar)`` via a single EncoderMLP.
 
     Output dim = ``2*style_dim``; chunked in half along the last dim into
-    ``(μ, logvar)``. ``s_bar_dim`` is the E_s output dim (= state_dim for the
-    low_dim identity path).
+    ``(μ, logvar)``. ``s_bar_dim`` is the E_s output dim (= 512*n_views +
+    proprio_emb_dim on the LPB-style image path).
     """
 
     def __init__(self, action_dim, s_bar_dim, style_dim=16, hidden_dim=128):
@@ -61,9 +62,8 @@ class DynamicsDecoder(nn.Module):
     """D_s: ``concat(z, s̄_t) -> ŝ̄_{t+1}`` via a single EncoderMLP.
 
     Predicts the next encoded observation (s̄-space); output dim = ``s_bar_dim``.
-    For low_dim (E_s identity) ``s_bar_dim`` = ``state_dim``; for the stage-2
-    image path ``s_bar_dim`` = the frozen-ResNet feature dim. ``s_bar_dim`` here
-    must match the ``s_bar_dim`` passed to :class:`VIBEncoder`.
+    Target is ``E_s(S_{t+1}).detach()`` (latent-level, scout_design.md §3) --
+    no state decoder, no pixel decode.
     """
 
     def __init__(self, s_bar_dim, style_dim=16, hidden_dim=128):
@@ -79,26 +79,3 @@ class DynamicsDecoder(nn.Module):
     def forward(self, z, s_bar):
         x = torch.cat([z, s_bar], dim=-1)
         return self.net(x)
-
-
-class StateDecoder(nn.Module):
-    """``ŝ̄_{t+1} -> Ŝ_{t+1}`` (low-dim **env state**, NOT image) via one EncoderMLP.
-
-    Maps the predicted next s̄ to the env state used for the next-state MSE
-    target (scout_design.md §3). Output dim = ``state_dim``. Always outputs
-    low-dim env state even on the stage-2 image path -- this structurally
-    avoids next-image prediction (scout_design.md §6, §7 risk #2).
-    """
-
-    def __init__(self, s_bar_dim, state_dim, hidden_dim=128):
-        super().__init__()
-        self.s_bar_dim = int(s_bar_dim)
-        self.state_dim = int(state_dim)
-        self.net = EncoderMLP(
-            input_dim=self.s_bar_dim,
-            output_dim=self.state_dim,
-            hidden_dim=hidden_dim,
-        )
-
-    def forward(self, s_bar_pred):
-        return self.net(s_bar_pred)

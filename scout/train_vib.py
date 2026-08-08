@@ -1,22 +1,24 @@
 """E1: VIB joint training + β scan + life/death sensitivity
 (scout_design.md §3/§5, stage1_plan.md §三).
 
-For each β in ``cfg.betas`` train a fresh :class:`ScoutVIB` on transitions from
-a :class:`TransitionSource` (default :class:`RobomimicLowdimSource`), logging
-next-state MSE / KL and μ mean/std. After training, compute
+For each β in ``cfg.betas`` train a fresh :class:`ScoutVIB` on transitions drawn
+from LPB's :class:`RobomimicImageDynamicsModelDataset` (image + proprio), logging
+latent MSE / KL and μ mean/std. After training, compute
 :func:`sensitivity_ratio` and save ckpt + loss PNG. Finally plot sensitivity
 vs β to pick the largest β whose sensitivity ≥ ~0.3 (design §5; the
 make-or-break knob per §7 risk #1).
 
-Loss = next-state MSE + β·KL (no AE / no reconstruction / no latent-level
-term; E_s is identity for low_dim).
+Loss = latent MSE + β·KL (latent-level target = ``E_s(S_{t+1}).detach()``;
+no AE / no reconstruction / no state decoder; scout_design.md §3). The frozen
+base-DP ResNet inside E_s has ``requires_grad=False`` -- single-chain, single
+``backward``, no gradient isolation. Only ``vib_enc`` / ``D_s`` /
+``proprio_embed`` update.
 
-Usage:
-    python -m scout.train_vib --config configs/vib_lift_lowdim.yaml
+Usage (real run, needs pytorch3d/robomimic + a base-DP ckpt -- training env):
+    python -m scout.train_vib --config configs/vib_lift_image.yaml
 
-Sampling is ``source.sample(batch)`` (no DataLoader): each "epoch" is
-``steps_per_epoch`` random batches -- this matches the online-buffer contract
-of :class:`TransitionSource` (the self-improvement loop reuses the same path).
+For an environment-agnostic forward/backward smoke test (no dataset, no ckpt):
+    python -m scout.train_vib --dummy
 """
 
 import argparse
@@ -28,11 +30,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 from easydict import EasyDict
 
-from scout.data.transition_source import TransitionSource
 from scout.diagnose import sensitivity_ratio
+from scout.model.encoder import StateEncoder
 from scout.model.scout_vib import ScoutVIB
 
 
@@ -64,87 +67,190 @@ def plot_curves(history, keys, title, path):
 
 
 # --------------------------------------------------------------------------- #
+# E_s construction
+# --------------------------------------------------------------------------- #
+def build_E_s(cfg) -> StateEncoder:
+    """Build the LPB-style E_s (frozen base-DP ResNet + trained proprio Conv1d).
+
+    Uses :meth:`StateEncoder.from_base_dp_ckpt` -- lazy-imports
+    ``dyn_model.models.resnet_encoder`` so this trainer imports cleanly in
+    environments without the LPB stack.
+    """
+    d = cfg.model.E_s
+    return StateEncoder.from_base_dp_ckpt(
+        base_dp_ckpt=d.base_dp_ckpt,
+        view_names=list(d.view_names),
+        proprio_dim=int(d.proprio_dim),
+        proprio_emb_dim=int(getattr(d, "proprio_emb_dim", 64)),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LPB dataset -> (obs_t, a_t, obs_tp1) windows
+# --------------------------------------------------------------------------- #
+def make_dataloader(cfg):
+    """Build a DataLoader over LPB ``RobomimicImageDynamicsModelDataset``.
+
+    Lazy-imported (pytorch3d/robomimic not available on Windows). Returns
+    ``(loader, dataset)``. Uses ``num_hist=num_pred=1, frameskip=1`` so each item
+    is a clean 2-frame window ``(obs, act, state)`` we slice into a transition.
+    """
+    from torch.utils.data import DataLoader
+
+    from dyn_model.datasets.robomimic_dset import RobomimicImageDynamicsModelDataset
+
+    d = cfg.dataset
+    ds = RobomimicImageDynamicsModelDataset(
+        zarr_path=d.zarr_path,
+        num_hist=1,
+        num_pred=1,
+        frameskip=1,
+        view_names=list(d.view_names),
+        abs_action=bool(getattr(d, "abs_action", False)),
+        use_crop=bool(getattr(d, "use_crop", False)),
+        train=True,
+        shape_obs=dict(d.shape_obs),
+        original_img_size=int(getattr(d, "original_img_size", 140)),
+        cropped_img_size=int(getattr(d, "cropped_img_size", 128)),
+        action_dim=int(d.action_dim),
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=int(cfg.batch_size),
+        shuffle=True,
+        num_workers=int(getattr(d, "num_workers", 4)),
+        drop_last=True,
+    )
+    return loader, ds
+
+
+def _slice_transition(batch, device, img_transform=None):
+    """LPD batch ``(obs, act, state)`` -> ``(obs_t, a_t, obs_tp1)`` on `device`.
+
+    Batch shapes (num_hist=num_pred=1, frameskip=1):
+      obs['visual'][v]: (B, 2, 3, H, W)  obs['proprio']: (B, 2, P)
+      act:              (B, 2, action_dim)                (both rows identical)
+    Slices frame 0 -> t, frame 1 -> t+1, keeps the T=1 dim E_s expects.
+    """
+    obs, act, _state = batch
+    visual = obs["visual"]
+    proprio = obs["proprio"]
+    if img_transform is not None:
+        # apply per-view torchvision transform on (B,2,3,H,W) then back
+        visual = {v: img_transform(img) for v, img in visual.items()}
+    obs_t = {
+        "visual": {v: img[:, 0:1].to(device) for v, img in visual.items()},
+        "proprio": proprio[:, 0:1].to(device),
+    }
+    obs_tp1 = {
+        "visual": {v: img[:, 1:2].to(device) for v, img in visual.items()},
+        "proprio": proprio[:, 1:2].to(device),
+    }
+    a_t = act[:, 0].to(device)
+    return obs_t, a_t, obs_tp1
+
+
+def _sigma_a_from_dataset(ds):
+    """Mean per-dim std of raw actions -- the σ_a scale for sensitivity_ratio."""
+    return float(np.std(np.asarray(ds.actions), axis=0).mean())
+
+
+# --------------------------------------------------------------------------- #
 # per-β training
 # --------------------------------------------------------------------------- #
-def mu_stats(model, source, batch_size, device):
-    """Sample a batch, return (mu.mean over dims, mu.std over batch mean, sigma_mu)."""
-    b = source.sample(min(batch_size, len(source)))
-    S_t = b["S_t"].to(device); A_t = b["A_t"].to(device)
-    with torch.no_grad():
-        mu, _ = model.vib_enc(model.E_s(S_t), A_t)
-    mu_mean = float(mu.mean())                  # grand mean (≈0 if KL working)
-    sigma_mu = float(mu.std(dim=0).mean())      # mean per-dim std -> μ scale
+def mu_stats(model, loader, device, img_transform, max_batches=4):
+    """Sample a few batches, return ``(obs_t, A_t, mu_mean, mu_abs_mean, sigma_mu)``."""
+    mus = []
+    obs_t_acc, a_t_acc = None, None
+    n = 0
+    for batch in loader:
+        obs_t, A_t, _ = _slice_transition(batch, device, img_transform)
+        with torch.no_grad():
+            s_bar = model.encode(obs_t)
+            mu, _ = model.vib_enc(s_bar, A_t)
+        mus.append(mu.detach())
+        if obs_t_acc is None:
+            obs_t_acc, a_t_acc = obs_t, A_t
+        n += 1
+        if n >= max_batches:
+            break
+    mu = torch.cat(mus, dim=0)
+    mu_mean = float(mu.mean())
+    sigma_mu = float(mu.std(dim=0).mean())
     mu_abs_mean = float(mu.abs().mean())
-    return S_t, A_t, mu_mean, mu_abs_mean, sigma_mu
+    return obs_t_acc, a_t_acc, mu_mean, mu_abs_mean, sigma_mu
 
 
-def train_one_beta(cfg, source, state_dim, action_dim, beta, sigma_a, device, beta_dir):
+def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta, sigma_a,
+                   device, beta_dir, img_transform=None):
+    E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
-        state_dim, action_dim,
-        modality=cfg.model.modality,
+        action_dim=action_dim,
+        E_s=E_s,
         style_dim=cfg.model.style_dim,
         hidden_dim=cfg.model.hidden_dim,
         beta=beta,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), **cfg.optimizer.params)
+    # only trainable params: vib_enc / D_s / proprio_embed (ResNet frozen).
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, **cfg.optimizer.params)
 
     steps_per_epoch = int(cfg.steps_per_epoch)
     num_epochs = int(cfg.num_epochs)
     log_every_batch = max(1, steps_per_epoch // 5)
-    history = {"next_state_mse": [], "kl": [], "mu_abs": []}
+    history = {"latent_mse": [], "kl": [], "mu_abs": []}
 
     model.train()
     for epoch in range(num_epochs):
-        ep = {"next_state_mse": 0.0, "kl": 0.0, "mu_abs": 0.0, "n": 0}
-        for it in range(steps_per_epoch):
-            b = source.sample(cfg.batch_size)
-            S_t = b["S_t"].to(device); A_t = b["A_t"].to(device); S_tp1 = b["S_tp1"].to(device)
-            out = model(S_t, A_t, S_tp1)
+        ep = {"latent_mse": 0.0, "kl": 0.0, "mu_abs": 0.0, "n": 0}
+        for it, batch in enumerate(loader):
+            obs_t, A_t, obs_tp1 = _slice_transition(batch, device, img_transform)
+            out = model(obs_t, A_t, obs_tp1)
             opt.zero_grad(); out["loss"].backward(); opt.step()
 
             if (it + 1) % log_every_batch == 0 or it == steps_per_epoch - 1:
-                ep["next_state_mse"] += out["next_state_mse"].item()
+                ep["latent_mse"] += out["latent_mse"].item()
                 ep["kl"] += out["kl"].item()
                 ep["mu_abs"] += out["mu"].detach().abs().mean().item()
                 ep["n"] += 1
+            if it + 1 >= steps_per_epoch:
+                break
         n = max(1, ep["n"])
-        history["next_state_mse"].append(ep["next_state_mse"] / n)
+        history["latent_mse"].append(ep["latent_mse"] / n)
         history["kl"].append(ep["kl"] / n)
         history["mu_abs"].append(ep["mu_abs"] / n)
-        print(f"  [β={beta:g}] epoch {epoch:4d} | next_state_mse {history['next_state_mse'][-1]:.4f} "
+        print(f"  [β={beta:g}] epoch {epoch:4d} | latent_mse {history['latent_mse'][-1]:.4f} "
               f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}")
 
     # post-train diagnostics
-    S_t, A_t, mu_mean, mu_abs_mean, sigma_mu = mu_stats(model, source, cfg.batch_size, device)
-    sr = sensitivity_ratio(model, S_t, A_t, sigma_a, sigma_mu)
+    obs_t, A_t, mu_mean, mu_abs_mean, sigma_mu = mu_stats(
+        model, loader, device, img_transform)
+    sr = sensitivity_ratio(model, obs_t, A_t, sigma_a, sigma_mu)
 
     torch.save({"state_dict": model.state_dict(), "beta": beta,
                 "sensitivity": sr, "sigma_mu": sigma_mu, "sigma_a": sigma_a},
                os.path.join(beta_dir, "scout_vib.ckpt"))
-    plot_curves(history, ["next_state_mse", "kl"], f"VIB losses (β={beta:g})",
+    plot_curves(history, ["latent_mse", "kl"], f"VIB losses (β={beta:g})",
                 os.path.join(beta_dir, "losses.png"))
     plot_curves(history, ["mu_abs"], f"|μ| (β={beta:g})",
                 os.path.join(beta_dir, "mu.png"))
 
     return {"beta": beta,
-            "next_state_mse": history["next_state_mse"][-1],
+            "latent_mse": history["latent_mse"][-1],
             "kl": history["kl"][-1],
             "mu_abs": mu_abs_mean, "sigma_mu": sigma_mu, "sensitivity": sr}
 
 
-def run(cfg, source=None):
+def run(cfg):
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    if source is None:
-        from scout.data.robomimic_lowdim import RobomimicLowdimSource   # lazy: keeps dummy path hermetic
-        source = RobomimicLowdimSource(cfg.dataset.path, mask_key=cfg.dataset.train_filter_key)
-    state_dim = source.state_dim
-    action_dim = source.action_dim
-    print(f"source: len={len(source)} state_dim={state_dim} action_dim={action_dim}")
-
-    sigma_a = float(source.stats()["A_t"].std.mean())
+    loader, ds = make_dataloader(cfg)
+    action_dim = ds.action_dim
+    print(f"dataset: len={len(ds)} action_dim={action_dim} proprio_dim={ds.proprio_dim} "
+          f"views={ds.view_names}")
+    sigma_a = _sigma_a_from_dataset(ds)
     print(f"sigma_a (mean per-dim action std) = {sigma_a:.4f}")
 
     run_root = os.path.join(cfg.save_dir, time.strftime("%Y%m%d-%H%M%S", time.localtime()))
@@ -157,12 +263,11 @@ def run(cfg, source=None):
         beta_dir = os.path.join(run_root, f"beta_{beta:g}")
         os.makedirs(beta_dir, exist_ok=True)
         print(f"\n=== training β={beta:g} ===")
-        s = train_one_beta(cfg, source, state_dim, action_dim, beta, sigma_a, device, beta_dir)
+        s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, sigma_a, device, beta_dir)
         summaries.append(s)
         print(f"=== β={beta:g} done | sensitivity={s['sensitivity']:.4f} "
               f"sigma_mu={s['sigma_mu']:.4f} (sigma_a/sigma_mu={sigma_a/s['sigma_mu']:.4f}) ===")
 
-    # sensitivity vs beta
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot([s["beta"] for s in summaries],
             [s["sensitivity"] for s in summaries], "o-", linewidth=1.2)
@@ -179,11 +284,128 @@ def run(cfg, source=None):
     return run_root
 
 
+# --------------------------------------------------------------------------- #
+# dummy verification path (no dataset, no ckpt; hermetic)
+# --------------------------------------------------------------------------- #
+class _MockResNetEncoder(nn.Module):
+    """Tiny stand-in for LPB :class:`ResNetEncoder` -- same duck-typed interface
+    (``emb_dim=512``, ``forward({view: (B,T,3,H,W)}) -> {view: (B,T,1,512)}``)
+    so :class:`StateEncoder` can be exercised without a base-DP ckpt. Parameters
+    exist so the freeze check is meaningful.
+    """
+
+    def __init__(self, view_names):
+        super().__init__()
+        self.view_names = list(view_names)
+        self.emb_dim = 512
+        self.proj = nn.Conv2d(3, 512, kernel_size=1)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x):
+        from einops import rearrange
+        out = {}
+        for v in self.view_names:
+            imgs = x[v]
+            b = imgs.shape[0]
+            imgs = rearrange(imgs, "b t ... -> (b t) ...")
+            feat = self.avgpool(self.proj(imgs))     # (B*T, 512, 1, 1)
+            feat = feat.flatten(1).unsqueeze(1)      # (B*T, 1, 512)
+            out[v] = rearrange(feat, "(b t) p d -> b t p d", b=b)
+        return out
+
+
+def dummy_run(view_names=("agentview", "robot0_eye_in_hand"),
+              proprio_dim=10, action_dim=10, batch_size=8, seed=233,
+              beta=1.0e-3):
+    """Forward + backward smoke test with random {image, proprio} windows.
+
+    Verifies:
+      - StateEncoder fuses ResNet (frozen) + proprio -> s̄ of expected dim;
+      - ScoutVIB.forward returns a loss dict (latent_mse + β·KL);
+      - backward only touches vib_enc / D_s / proprio_embed (ResNet grads None);
+      - sensitivity_ratio is computable.
+    """
+    set_seed(seed)
+    device = torch.device("cpu")
+    torch.manual_seed(seed)
+
+    E_s = StateEncoder(
+        resnet_encoder=_MockResNetEncoder(view_names),
+        view_names=list(view_names),
+        proprio_dim=proprio_dim,
+        proprio_emb_dim=64,
+    )
+    model = ScoutVIB(action_dim=action_dim, E_s=E_s, beta=beta).to(device)
+
+    def rand_obs(B):
+        return {
+            "visual": {v: torch.randn(B, 1, 3, 128, 128) for v in view_names},
+            "proprio": torch.randn(B, 1, proprio_dim),
+        }
+
+    obs_t = rand_obs(batch_size); obs_tp1 = rand_obs(batch_size)
+    A_t = torch.randn(batch_size, action_dim)
+
+    # s_bar dim check
+    s_bar = model.encode(obs_t)
+    expected_s_bar = 512 * len(view_names) + 64
+    assert s_bar.shape == (batch_size, expected_s_bar), \
+        f"s_bar shape {s_bar.shape} != ({batch_size}, {expected_s_bar})"
+
+    out = model(obs_t, A_t, obs_tp1)
+    assert set(out) == {"loss", "latent_mse", "kl", "mu", "logvar"}
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    opt.zero_grad(); out["loss"].backward(); opt.step()
+
+    # gradient isolation: ResNet must have NO grad; proprio_embed / vib_enc / D_s must.
+    resnet_grads = [p.grad for p in model.E_s.resnet.parameters()]
+    assert all(g is None for g in resnet_grads), \
+        "ResNet should be frozen but got a gradient (anchor broken)"
+    proprio_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.E_s.proprio_embed.parameters())
+    vib_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.vib_enc.parameters())
+    ds_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.D_s.parameters())
+    assert proprio_has_grad and vib_has_grad and ds_has_grad, \
+        "expected grads on proprio_embed / vib_enc / D_s"
+
+    # sensitivity_ratio (sigma_a / sigma_mu from the dummy batch).
+    sigma_a = float(A_t.std(dim=0).mean())
+    with torch.no_grad():
+        s_bar_t = model.encode(obs_t)
+        mu_, _ = model.vib_enc(s_bar_t, A_t)
+        sigma_mu = float(mu_.std(dim=0).mean())
+    sr = sensitivity_ratio(model, obs_t, A_t, sigma_a, sigma_mu)
+
+    print(f"[dummy] s_bar_dim = {expected_s_bar} (={512}*{len(view_names)} + 64)")
+    print(f"[dummy] loss={out['loss'].item():.4f} "
+          f"latent_mse={out['latent_mse'].item():.4f} kl={out['kl'].item():.4f}")
+    print(f"[dummy] ResNet frozen (no grad): OK")
+    print(f"[dummy] grads on proprio/vib_enc/D_s: OK")
+    print(f"[dummy] sensitivity_ratio = {sr:.4f}  "
+          f"(sigma_a={sigma_a:.4f}, sigma_mu={sigma_mu:.4f})")
+    return {"s_bar_dim": expected_s_bar, "loss": float(out["loss"].item()),
+            "latent_mse": float(out["latent_mse"].item()),
+            "kl": float(out["kl"].item()), "sensitivity": sr}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, help="YAML config path")
+    parser.add_argument("--config", help="YAML config path (real run)")
+    parser.add_argument("--dummy", action="store_true",
+                        help="hermetic forward/backward smoke test (no dataset/ckpt)")
     args = parser.parse_args()
-    with open(args.config, "r") as f:
-        cfg = EasyDict(yaml.safe_load(f))
-    print(dict(cfg))
-    run(cfg)
+    if args.dummy:
+        dummy_run()
+    elif args.config:
+        with open(args.config, "r") as f:
+            cfg = EasyDict(yaml.safe_load(f))
+        print(dict(cfg))
+        run(cfg)
+    else:
+        parser.error("provide --config <yaml> or --dummy")

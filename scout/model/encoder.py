@@ -1,61 +1,132 @@
-"""E_s state encoder (scout_design.md §2, §3) -- LPB-style, NO autoencoder.
+"""E_s state encoder (scout_design.md §0, §2, §3) -- LPB-style dual input, NO AE.
 
-Stage-1 low_dim: **identity** (s̄_t = S_t; no parameters, nothing learned).
-Stage-2 image: frozen base-DP ResNet + trained proprio embed (LPB-style) -- a
-drop-in via :meth:`StateEncoder.from_config('image', ...)`, which currently
-raises ``NotImplementedError`` (see **【image 接口点】** below).
+Always image + proprio (LPB-style; scout_design.md §0 "永远 image + proprio 同时输入",
+no low_dim/image stage split). The encoder fuses two **non-dynamics** components
+borrowed from LPB (scout_design.md §0 reuse boundary):
 
-Why no AE (scout_design.md §3, §7 risk #3): the previous design used a state
-AE both to produce ``s̄`` and as an anti-collapse anchor (``D_s(E_s(S)) → S``).
-The redesign drops the AE entirely:
+  - image : ``dyn_model.models.resnet_encoder.ResNetEncoder`` -- per-view frozen
+            base-DP ResNet-18 + AdaptiveAvgPool2d -> 512 / view (NOT trained;
+            ``requires_grad=False`` so the stable-anchor argument of §3/§7 #3 holds).
+  - proprio: ``dyn_model.models.proprio.ProprioceptiveEmbedding`` -- Conv1d, trained.
 
-  - low_dim: E_s is identity → cannot collapse (nothing to learn);
-  - image:   ResNet is frozen → cannot drift;
-  - D_s / state_dec are pinned by the **next-state MSE** itself (a dynamics
-    that predicts a constant has high loss). No reconstruction anchor needed.
+These are **front-end only**; they emit ``s̄_t``. The SCOUT-self-developed dynamics
+(``VIB_enc -> z -> D_s``) lives in :mod:`scout.model.scout_vib` and is NOT forked
+from LPB (LPB's z is a deterministic embedding with no μ/logvar/KL).
+
+Forward signature mirrors the LPB ``VisualDynamicsModel.encode_obs`` visual+proprio
+fusion -- **but with no action** (SCOUT's action enters VIB_enc, not E_s; the
+design's reuse boundary is explicit on this point). Output time dim is kept (T=1
+for SCOUT's per-transition forward; callers squeeze it).
+
+  forward({"visual": {view: (B,T,3,H,W)}, "proprio": (B,T,proprio_dim)})
+    -> (B, T, s_bar_dim),  s_bar_dim = 512 * n_views + proprio_emb_dim
 """
 
+from __future__ import annotations
+
+import torch
 import torch.nn as nn
+from einops import rearrange
+
+from dyn_model.models.proprio import ProprioceptiveEmbedding
 
 
 class StateEncoder(nn.Module):
-    """E_s: state observation -> s̄ (LPB-style encoder, NO autoencoder).
+    """E_s: LPB-style dual-input encoder (image + proprio), no autoencoder.
 
-    - low_dim: identity passthrough (s̄ = S); **zero parameters**.
-    - image:   NotImplementedError (stage-2; frozen ResNet + proprio embed).
-
-    Callers (VIB encoder, D_s, cost, guidance) only consume the ``s̄`` vector,
-    so they are modality-agnostic -- swapping modality here is the only change
-    needed for the image path (scout_design.md §6). ``s_bar_dim`` exposes the
-    encoded dim so downstream modules can size themselves off E_s.
+    The ResNet is **frozen** (``requires_grad=False`` on construction; it is also
+    kept in ``eval()`` mode via :meth:`train` so BN/dropout do not update even if
+    a future caller flips the parent to ``.train()``). The proprio Conv1d is
+    **trained**. ``s_bar_dim`` is exposed so VIB_enc / D_s size themselves off
+    E_s (scout_design.md §2).
     """
 
-    def __init__(self, state_dim, modality="low_dim", hidden_dim=128):
+    def __init__(
+        self,
+        resnet_encoder: nn.Module,
+        view_names: list[str],
+        proprio_dim: int,
+        proprio_emb_dim: int = 64,
+    ):
         super().__init__()
-        self.state_dim = int(state_dim)
-        self.modality = modality
-        if modality == "low_dim":
-            # s̄_t = S_t. nn.Identity has no params → no grads flow to E_s
-            # (correct: E_s must not train in low_dim, scout_design.md §3).
-            self._impl = nn.Identity()
-            self.s_bar_dim = self.state_dim
-        elif modality == "image":
-            # **【image 接口点】** stage-2: frozen base-DP ResNet + trained
-            # proprio embed (LPB ResNetEncoder + ProprioceptiveEmbedding).
-            # Keep forward() signature identical so the rest of the pipeline
-            # is untouched; set self.s_bar_dim to the fused feature dim.
-            raise NotImplementedError(
-                "StateEncoder(image) is stage-2 work -- see scout_design.md §6. "
-                "Stage-1 is low_dim only; use from_config('low_dim', ...)."
-            )
-        else:
-            raise ValueError(f"unknown StateEncoder modality: {modality!r}")
+        self.view_names = list(view_names)
+        self.proprio_dim = int(proprio_dim)
+        self.proprio_emb_dim = int(proprio_emb_dim)
 
-    def forward(self, S):
-        """S (B, state_dim) -> s̄ (B, s_bar_dim). Identity for low_dim."""
-        return self._impl(S)
+        # image branch: per-view frozen base-DP ResNet (LPB ResNetEncoder).
+        # emb_dim per view is 512 (ResNetEncoder.emb_dim); fall back if absent.
+        self.resnet = resnet_encoder
+        self.emb_dim_per_view = int(getattr(self.resnet, "emb_dim", 512))
+        self._freeze_resnet()
 
-    @staticmethod
-    def from_config(modality, state_dim, hidden_dim=128):
-        """Factory by modality string ('low_dim' stage-1, 'image' stage-2)."""
-        return StateEncoder(state_dim, modality=modality, hidden_dim=hidden_dim)
+        # proprio branch: trained Conv1d (LPB ProprioceptiveEmbedding).
+        # num_frames/tubelet keep LPB defaults; in_chans=proprio_dim, emb_dim set.
+        self.proprio_embed = ProprioceptiveEmbedding(
+            num_frames=1,
+            tubelet_size=1,
+            in_chans=self.proprio_dim,
+            emb_dim=self.proprio_emb_dim,
+        )
+
+        # fused dim = visual (per-view 512) + proprio embed.
+        self.visual_dim = self.emb_dim_per_view * len(self.view_names)
+        self.s_bar_dim = self.visual_dim + self.proprio_emb_dim
+
+    # ------------------------------------------------------------------ #
+    # factories
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_base_dp_ckpt(
+        cls,
+        base_dp_ckpt: str,
+        view_names: list[str],
+        proprio_dim: int,
+        proprio_emb_dim: int = 64,
+    ) -> "StateEncoder":
+        """Canonical construction: rip the frozen ResNet out of a base DP ckpt.
+
+        Lazy-imports :mod:`dyn_model.models.resnet_encoder` so this module (and
+        its trainers) import cleanly in environments without the LPB
+        diffusion_policy/hydra stack -- only the actual ckpt load pulls those in.
+        """
+        from dyn_model.models.resnet_encoder import ResNetEncoder
+
+        resnet = ResNetEncoder(base_dp_ckpt, view_names)
+        return cls(resnet, view_names, proprio_dim, proprio_emb_dim)
+
+    # ------------------------------------------------------------------ #
+    # freeze bookkeeping
+    # ------------------------------------------------------------------ #
+    def _freeze_resnet(self):
+        for p in self.resnet.parameters():
+            p.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        """Parent .train(); **force ResNet to eval + frozen** so BN stats and any
+        buffers (running_mean etc.) never update -- the frozen-anchor contract
+        (scout_design.md §3, §7 risk #3).
+        """
+        super().train(mode)
+        self.resnet.eval()
+        return self
+
+    # ------------------------------------------------------------------ #
+    # forward
+    # ------------------------------------------------------------------ #
+    def forward(
+        self, obs: dict[str, dict[str, torch.Tensor] | torch.Tensor]
+    ) -> torch.Tensor:
+        """``obs = {"visual": {view: (B,T,3,H,W)}, "proprio": (B,T,proprio_dim)}``
+        -> ``s̄`` of shape ``(B, T, s_bar_dim)``.
+
+        Mirrors LPB ``VisualDynamicsModel.encode_obs`` visual+proprio fusion but
+        with **no action** term (SCOUT's action goes into VIB_enc, not E_s).
+        """
+        view_embs = self.resnet(obs["visual"])              # {view: (B,T,1,512)}
+        visual_parts = [view_embs[v].squeeze(-2) for v in self.view_names]  # (B,T,512) each
+        visual = torch.cat(visual_parts, dim=-1)            # (B,T, 512*n_views)
+
+        proprio_emb = self.proprio_embed(obs["proprio"])    # (B,T,proprio_emb_dim)
+
+        s_bar = torch.cat([visual, proprio_emb], dim=-1)    # (B,T,s_bar_dim)
+        return s_bar
