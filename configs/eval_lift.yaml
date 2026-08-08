@@ -1,79 +1,69 @@
-# SCOUT stage-1 self-improvement eval config (Phase 5.3).
+# SCOUT stage-1 self-improvement eval config (image pipeline; Phase 5.3 /
+# scout_design.md §5).  Drives `scout/eval/self_improvement.py:SelfImprovementLoop`.
 #
-# Real E4 run is DEFERRED -- paths marked `<TBD>` must be filled from the
-# Phase-2 base-DP training output (logs/<ts>/ckpt/policy_epoch_*.ckpt and
-# configs/base_dp_lift_lowdim.yaml) and the Phase-3 chosen-β ScoutVIB ckpt
-# (train_vib.py run_root/beta_<best>/scout_vib.ckpt). Schema mirrors what
-# scout/eval/self_improvement.py:SelfImprovementLoop reads.
+# Real E4 run is DEFERRED -- `<TBD>` paths must be filled from the E0 base-DP
+# training output (`logs/<ts>/checkpoints/latest.ckpt` produced by
+# `configs/base_dp_lift_image.yaml`) and the E1 chosen-β ScoutVIB ckpt
+# (`train_vib.py` run_root/beta_<best>/scout_vib.ckpt). Run:
+#
+#   python -m scout.eval.self_improvement --config configs/eval_lift.yaml
 
 seed: 42
 
 # ---- models -------------------------------------------------------------
 base_dp:
-  initial_ckpt_path: <TBD-phase2>      # logs/<ts>/ckpt/policy_epoch_<final>.ckpt
-  # The Phase-2 base DP train cfg, used by retrain_fn to clone + override
-  # dataset.path / num_epochs / resume_ckpt per round.
-  train_cfg:
-    seed: 42
-    batch_size: 256
-    num_epochs: 3000
-    save_epochs: 200
-    log_dir: logs/eval_lift_round       # retrain sub-dirs created per round
-    dataset:
-      path: <TBD-core-hdf5>             # e.g. .../lift/low_dim_v141.hdf5
-      train_filter_key: core_20         # core_20 demos per design §5
-      num_workers: 4
-    policy:
-      name: DP
-      params:
-        num_action: 20
-        action_dim: 10                  # abs_6drot (3 trans + 6 rot + 1 gripper)
-        obs_shape_meta:
-          object: {shape: [10], type: low_dim}
-          robot0_eef_pos: {shape: [3], type: low_dim}
-          robot0_eef_quat: {shape: [4], type: low_dim}
-          robot0_gripper_qpos: {shape: [2], type: low_dim}
-        # remaining DP kwargs (diffusion inference steps, down_dims, etc.) must
-        # match the Phase-2 base_dp_lift_lowdim.yaml exactly.
-    optimizer:
-      params: {lr: 1.0e-4, weight_decay: 1.0e-5}
-    lr_scheduler:
-      num_warmup_steps: 2000
+  initial_ckpt_path: <TBD-e0>          # E0 output: logs/<ts>/checkpoints/latest.ckpt
+  # LPB training entry used by `default_retrain_fn` each round (round overrides
+  # dataset_path / num_epochs / log_dir on top of this base config).
+  config_name: base_dp_lift_image
+  config_dir: configs
 
 vib:
-  ckpt_path: <TBD-phase3>              # train_vib.py run_root/beta_<best>/scout_vib.ckpt
-  # Chosen β is baked into the ckpt (saved as ckpt["beta"] by train_vib.py).
+  ckpt_path: <TBD-e1>                  # train_vib.py run_root/beta_<best>/scout_vib.ckpt
+  # E_s reconstruction params (MUST match the E1 VIB training config). The loop
+  # rebuilds E_s (frozen base-DP ResNet + trained proprio Conv1d) from the base
+  # DP ckpt, then loads the chosen-β VIB state_dict.
+  base_dp_ckpt: <TBD-e0>               # same as base_dp.initial_ckpt_path
+  view_names: [agentview_image, robot0_eye_in_hand_image]
+  proprio_dim: 9                       # 3 (eef_pos) + 4 (eef_quat) + 2 (gripper_qpos)
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
 
 dataset:
-  path: <TBD-core-hdf5>                # same core hdf5 as base_dp.train_cfg
+  # Core hdf5 (core_20 demos) -- the augmented-hdf5 write-back starts from a
+  # copy of this file + appends successful rollouts (SOE run_full_multi_round
+  # pattern). MUST carry `mask/core_20` for the core-filter step.
+  path: <TBD-core-hdf5>
+  core_filter_key: core_20             # mask selecting the core demos
 
-action_dim: 10
+action_dim: 10                         # abs_6drot: 3 trans + 6 rot + 1 gripper
 
 # ---- eval ---------------------------------------------------------------
 eval:
   n_init_states: 100                   # SOE default (design §5)
   try_times: 5                         # Pass@5
   horizon: 400                         # robomimic lift default
-  # obs_keys used for the write-back S_t concat (must match RobomimicLowdimSource
-  # convention -- the encoder was trained on this ordering).
-  obs_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos, object]
+  # LPB obs layout (must match configs/base_dp_lift_image.yaml shape_meta).
+  # Used to build (a) the obs-adapter (seam ①: keyed obs -> E_s {"visual","proprio"})
+  # and (b) the augmented-hdf5 per-frame obs writer.
+  view_names: [agentview_image, robot0_eye_in_hand_image]
+  proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
 
-# ---- exploration (Phase-4 guided path) ---------------------------------
+# ---- exploration (Phase-4 guided path) ----------------------------------
 exploration:
   guidance_scale: 5.0                  # picked from E2 sweep; tunable per round
   guidance_start_timestep: 50          # gate (a): guide only the last K steps
 
-# ---- self-improvement loop ---------------------------------------------
+# ---- self-improvement loop ----------------------------------------------
 self_improvement:
   num_rounds: 6                        # SOE default (design §5)
-  core_filter_key: core_20             # init-state + write-back core mask
-  # Mask name written by _write_augmented_hdf5 that selects core_<core_filter_key>
-  # demos + the round's appended successful rollouts. The retrain step MUST point
-  # at this (NOT core_20) or the new rollouts are silently ignored.
+  # Mask name written by _write_augmented_hdf5 that selects core demos + the
+  # round's appended successful rollouts. The retrain step MUST train on a
+  # dataset that includes BOTH (core + new rollouts) -- this mask is that union.
   scout_aug_mask: scout_aug
-  # retrain epochs per round (overrides base_dp.train_cfg.num_epochs):
-  num_epochs: 1500
+  num_epochs: 1500                     # per-round retrain budget (overrides E0)
 
 # ---- runtime ------------------------------------------------------------
 device: auto                           # auto -> cuda if available, else cpu
-log_dir: logs/scout_eval_lift
+log_dir: logs/scout_eval_lift_image

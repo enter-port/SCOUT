@@ -1,240 +1,221 @@
-"""E0: train the base Diffusion Policy (unguided) on robomimic low_dim.
+"""E0 base Diffusion Policy training -- thin pointer to the LPB ``train.py``.
 
-Single-GPU, no DDP. Minimal loop mirroring SOE ``src/train_single_gpu.py``:
-AdamW + cosine LR (with warmup); ``DP.forward(obs_dict, actions)`` returns a
-scalar loss; ckpt + loss PNG saved every ``save_epochs``.
+**Entry point**: the repo-root ``train.py`` (hydra + ``TrainDiffusionUnetHybridWorkspace``)
+plus an LPB-format yaml in ``configs/`` (default ``configs/base_dp_lift_image.yaml``).
+The base DP is the LPB ``DiffusionUnetHybridImagePolicy`` -- the same class
+:class:`scout.guidance.policy.ScoutPolicy` subclasses at inference. Training is
+**not** reimplemented here; LPB's workspace already owns the AdamW + cosine-LR +
+EMA + rollout/checkpoint loop (see
+``diffusion_policy/workspace/train_diffusion_unet_hybrid_workspace.py``).
 
-Why a chunked loader instead of ``scout.data.RobomimicLowdimSource``:
-the base DP needs chunked ``(obs_dict, action_chunk)`` batches with per-key
-observations -- a different shape from ``RobomimicLowdimSource``'s per-frame
-``(S_t, A_t, S_{t+1})`` transitions (which feed the VIB in Phase 3). The two
-loaders are complementary, not duplicative. This one is modelled on SOE
-``src/dataset/robomimic_v2.py`` but stripped to the low_dim essentials.
+This module exists so :mod:`scout.eval.self_improvement`'s ``default_retrain_fn``
+has a single SCOUT-side entry point that writes an augmented-hdf5 round config
+and shells out to LPB ``train.py`` (the SOE ``run_full_multi_round`` pattern:
+each round = subprocess train on augmented data; **no** in-memory buffer).
 
-Usage:
-    python -m scout.train_base_dp --config configs/base_dp_lift_lowdim.yaml
+Usage (manual / round 0):
+
+    python train.py --config-path configs --config-name base_dp_lift_image \\
+        task.dataset_path=<core_hdf5> \\
+        training.num_epochs=<N> hydra.run.dir=<log_dir>
+
+Or programmatically:
+
+    from scout.train_base_dp import train
+    ckpt_path = train(cfg_overrides={"task.dataset_path": "...", ...},
+                      config_name="base_dp_lift_image",
+                      config_dir="configs", log_dir="logs/round_0",
+                      num_epochs=1500)
+
+The lazy imports (``robomimic``, ``hydra``, ``diffusion_policy``) are deferred to
+:func:`train` / :func:`build_lpb_overrides` so this module imports cleanly in
+environments without the LPB stack (the verify host) -- only the actual
+subprocess call needs the training env.
+
+.. note:: The LPB workspace saves checkpoints as ``checkpoints/<epoch>.ckpt`` and
+   ``checkpoints/latest.ckpt`` (``save_last_ckpt=True``). :func:`train` returns
+   the ``latest.ckpt`` path -- the canonical "DP_i" handle the self-improvement
+   loop threads round-to-round.
 """
+from __future__ import annotations
 
-import argparse
 import os
-import time
-
-import h5py
-import matplotlib
-matplotlib.use("Agg")  # headless
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import torch.nn as nn
-import yaml
-from easydict import EasyDict
-from diffusers.optimization import get_cosine_schedule_with_warmup
-from torch.utils.data import Dataset, DataLoader
-
-from scout.policy.dp import DP
+import subprocess
+from typing import Any, Dict, List, Optional
 
 
 # --------------------------------------------------------------------------- #
-# utilities
+# config helpers
 # --------------------------------------------------------------------------- #
-def to_plain(obj):
-    """Recursively convert EasyDicts (and tuples) into plain yaml-safe types."""
-    if isinstance(obj, dict):
-        return {k: to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_plain(v) for v in obj]
-    return obj
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+LPB_TRAIN_PY = os.path.join(REPO_ROOT, "train.py")
+DEFAULT_CONFIG_DIR = os.path.join(REPO_ROOT, "configs")
+DEFAULT_CONFIG_NAME = "base_dp_lift_image"
 
 
-def set_seed(seed):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def build_lpb_overrides(
+    *,
+    dataset_path: Optional[str] = None,
+    train_filter_key: Optional[str] = None,
+    num_epochs: Optional[int] = None,
+    resume_ckpt: Optional[str] = None,
+    log_dir: Optional[str] = None,
+    device: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Compose the hydra CLI override list for one LPB training run.
 
+    Only non-``None`` keys are emitted. Keys map to the LPB
+    ``train_diffusion_unet_hybrid_workspace`` schema:
 
-def load_mask_demos(hdf5, mask_key):
-    """All ``demo_*`` names under ``data/``, optionally filtered by ``mask/<key>``."""
-    all_demos = sorted([k for k in hdf5["data"].keys() if k.startswith("demo")])
-    if mask_key is None or f"mask/{mask_key}" not in hdf5:
-        return all_demos
-    node = hdf5[f"mask/{mask_key}"]
-    if isinstance(node, h5py.Group):
-        if "mask" in node:
-            arr = node["mask"][()]
-            if arr.dtype == bool:
-                return [d for d, keep in zip(all_demos, arr) if keep]
-        return all_demos
-    arr = node[()]
-    if arr.dtype == bool:
-        return [d for d, keep in zip(all_demos, arr) if keep]
-    return [s.decode("utf-8") if isinstance(s, bytes) else str(s) for s in arr]
+      ``task.dataset_path``         -- robomimic hdf5 (core or augmented).
+      ``task.train_filter_key``     -- mask/<key> selecting demos.
+      ``training.num_epochs``       -- round epoch budget.
+      ``training.resume``           -- True if ``resume_ckpt`` given.
+      ``hydra.run.dir``             -- output dir for this run.
+      ``training.device``           -- "cuda:0" etc.
 
-
-def plot_history(history, save_path):
-    if not history:
-        return
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(history, linewidth=0.8)
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("loss")
-    ax.set_title("base DP training loss")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=120)
-    plt.close(fig)
-
-
-# --------------------------------------------------------------------------- #
-# chunked robomimic low_dim dataset (num_obs = 1)
-# --------------------------------------------------------------------------- #
-class RobomimicLowdimChunkDataset(Dataset):
-    """Chunked ``(obs_dict, action_chunk)`` loader for the base DP, low_dim only.
-
-    Mirrors SOE ``robomimic_v2`` chunking with ``num_obs=1`` and
-    ``action_offset=1``: sample ``i`` is
-    ``(obs_t = state[cur], action_chunk = actions[cur+1 : cur+1+num_action])``
-    with end-padding (repeat the last frame's action). This matches the
-    Phase-1 ``RobomimicLowdimSource`` alignment. Only the low_dim obs keys in
-    ``obs_shape_meta`` are emitted, as per-key ``(1, dim)`` tensors.
+    ``extra`` is appended verbatim (caller-specified hydra overrides).
     """
-
-    def __init__(self, path, obs_keys, num_action=20, mask_key="train"):
-        self.num_action = int(num_action)
-        self.obs_keys = list(obs_keys)
-        self.demos_obs = []        # list of {key: (T, dim)}
-        self.demos_actions = []    # list of (T, action_dim)
-        self.index = []            # (demo_id, cur_idx)
-
-        with h5py.File(path, "r") as f:
-            demos = load_mask_demos(f, mask_key)
-            assert len(demos) > 0, f"no demos under mask='{mask_key}' in {path}"
-            for d_id, demo in enumerate(demos):
-                grp = f["data"][demo]
-                obs_d = {k: grp["obs"][k][()].astype(np.float32) for k in self.obs_keys}
-                acts = grp["actions"][()].astype(np.float32)
-                T = acts.shape[0]
-                assert T - 1 >= 1, f"demo {demo} too short (T={T})"
-                self.demos_obs.append(obs_d)
-                self.demos_actions.append(acts)
-                for cur in range(T - 1):
-                    self.index.append((d_id, cur))
-        print(f"[dataset] {len(self.index)} chunked samples from {len(demos)} demos")
-
-    def __len__(self):
-        return len(self.index)
-
-    def __getitem__(self, i):
-        d_id, cur = self.index[i]
-        obs_d = self.demos_obs[d_id]
-        acts = self.demos_actions[d_id]
-        T = acts.shape[0]
-        # obs: num_obs=1 -> (1, dim) per key (collate squeezes to (B, dim))
-        obs_dict = {k: torch.from_numpy(obs_d[k][cur:cur + 1].copy()).float()
-                    for k in self.obs_keys}
-        # action chunk: acts[cur+1 : cur+1+num_action], end-pad with last action
-        start = cur + 1
-        end = min(start + self.num_action, T)
-        chunk = acts[start:end]
-        if end - start < self.num_action:
-            pad = np.repeat(acts[-1:], self.num_action - (end - start), axis=0)
-            chunk = np.concatenate([chunk, pad], axis=0)
-        return {"obs": obs_dict, "action": torch.from_numpy(chunk).float()}
-
-
-def collate_fn(batch):
-    """Stack per-key obs (squeeze num_obs=1) + action chunks into a DP-ready batch."""
-    obs_keys = batch[0]["obs"].keys()
-    obs_dict = {k: torch.stack([b["obs"][k] for b in batch], dim=0).squeeze(1)
-                for k in obs_keys}                              # (B, dim) per key
-    actions = torch.stack([b["action"] for b in batch], dim=0)  # (B, num_action, action_dim)
-    return {"obs_dict": obs_dict, "actions": actions}
+    overrides: List[str] = []
+    if dataset_path is not None:
+        overrides.append(f"task.dataset_path={os.path.abspath(dataset_path)}")
+    if train_filter_key is not None:
+        overrides.append(f"task.train_filter_key={train_filter_key}")
+    if num_epochs is not None:
+        overrides.append(f"training.num_epochs={int(num_epochs)}")
+    if resume_ckpt:
+        # A non-empty resume path -> ask the LPB workspace to resume from its
+        # checkpoint dir (LPB's get_checkpoint_path finds <log_dir>/checkpoints/
+        # latest.ckpt). Caller points log_dir at the prior round's dir.
+        overrides.append("training.resume=True")
+    if log_dir is not None:
+        overrides.append(f"hydra.run.dir={os.path.abspath(log_dir)}")
+    if device is not None:
+        overrides.append(f"training.device={device}")
+    if extra:
+        for k, v in extra.items():
+            overrides.append(f"{k}={v}")
+    return overrides
 
 
 # --------------------------------------------------------------------------- #
-# training loop
+# train entry (subprocess to LPB train.py)
 # --------------------------------------------------------------------------- #
-def train(cfg):
-    set_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
+def train(
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+    *,
+    config_name: str = DEFAULT_CONFIG_NAME,
+    config_dir: str = DEFAULT_CONFIG_DIR,
+    log_dir: Optional[str] = None,
+    num_epochs: Optional[int] = None,
+    dataset_path: Optional[str] = None,
+    train_filter_key: Optional[str] = None,
+    resume_ckpt: Optional[str] = None,
+    device: Optional[str] = None,
+    extra_overrides: Optional[Dict[str, Any]] = None,
+    dry_run: bool = False,
+    cuda_visible_devices: Optional[str] = None,
+) -> str:
+    """Shell out to LPB ``train.py`` (repo root) and return the new ckpt path.
 
-    # dataset / loader
-    obs_keys = list(cfg.policy.params.obs_shape_meta.keys())
-    dataset = RobomimicLowdimChunkDataset(
-        path=cfg.dataset.path,
-        obs_keys=obs_keys,
-        num_action=cfg.policy.params.num_action,
-        mask_key=cfg.dataset.get("train_filter_key", "train"),
+    Aggregates all kwargs + ``cfg_overrides``/``extra_overrides`` into hydra CLI
+    overrides via :func:`build_lpb_overrides`, then ``subprocess.run`` the LPB
+    entry. Returns ``<log_dir>/checkpoints/latest.ckpt`` (the LPB
+    ``save_last_ckpt=True`` artefact). Use ``dry_run=True`` to get the command +
+    path without executing (used by the self-improvement mock -- real training
+    needs the SOE/LPB conda env).
+
+    The returned path is what :class:`scout.eval.self_improvement.SelfImprovementLoop`
+    threads into the next round's ``dp_factory``.
+    """
+    merged = dict(cfg_overrides or {})
+    # explicit kwargs take precedence over cfg_overrides dict values
+    if dataset_path is not None:
+        merged["task.dataset_path"] = dataset_path
+    if train_filter_key is not None:
+        merged["task.train_filter_key"] = train_filter_key
+    if num_epochs is not None:
+        merged["training.num_epochs"] = num_epochs
+    if device is not None:
+        merged["training.device"] = device
+    if log_dir is not None:
+        merged["hydra.run.dir"] = log_dir
+    if extra_overrides:
+        merged.update(extra_overrides)
+
+    overrides = build_lpb_overrides(
+        dataset_path=merged.get("task.dataset_path"),
+        train_filter_key=merged.get("task.train_filter_key"),
+        num_epochs=merged.get("training.num_epochs"),
+        resume_ckpt=resume_ckpt,                       # path kwarg, not the bool flag
+        log_dir=merged.get("hydra.run.dir"),
+        device=merged.get("training.device"),
+        # everything else (including an explicit "training.resume" override)
+        # flows through `extra` verbatim -- last-one-wins under hydra.
+        extra={k: v for k, v in merged.items()
+               if k not in {"task.dataset_path", "task.train_filter_key",
+                            "training.num_epochs", "training.device",
+                            "hydra.run.dir"}},
     )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        num_workers=cfg.dataset.get("num_workers", 0),
-        collate_fn=collate_fn,
-        shuffle=True,
-        drop_last=True,
-    )
 
-    # policy
-    policy = DP(**cfg.policy.params).to(device)
-    n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"trainable params: {n_params / 1e6:.2f}M")
+    abs_log_dir = os.path.abspath(
+        log_dir or merged.get("hydra.run.dir")
+        or os.path.join("logs", config_name, "run"))
+    cmd = [
+        "python", LPB_TRAIN_PY,
+        "--config-path", os.path.abspath(config_dir),
+        "--config-name", config_name,
+    ] + overrides
 
-    # optimizer + scheduler
-    optimizer = torch.optim.AdamW(policy.parameters(), **cfg.optimizer.params)
-    total_steps = len(dataloader) * cfg.num_epochs
-    warmup = int(cfg.lr_scheduler.get("num_warmup_steps", 2000))
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=min(warmup, max(1, total_steps // 10)),
-        num_training_steps=total_steps,
-    )
+    env = os.environ.copy()
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
 
-    # output dirs
-    log_root = os.path.join(cfg.log_dir, time.strftime("%Y%m%d-%H%M%S", time.localtime()))
-    ckpt_dir = os.path.join(log_root, "ckpt")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    with open(os.path.join(log_root, "config.yaml"), "w") as f:
-        yaml.safe_dump(to_plain(cfg), f, default_flow_style=False)
+    if dry_run:
+        print(f"[train_base_dp] DRY-RUN cmd: {' '.join(cmd)}")
+        return _latest_ckpt_path(abs_log_dir)
 
-    # train
-    train_history = []
-    policy.train()
-    for epoch in range(cfg.num_epochs):
-        epoch_loss = 0.0
-        n_batches = 0
-        for batch in dataloader:
-            obs_dict = {k: v.to(device) for k, v in batch["obs_dict"].items()}
-            actions = batch["actions"].to(device)
-            loss = policy(obs_dict, actions)        # scalar
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            epoch_loss += loss.item()
-            n_batches += 1
+    os.makedirs(abs_log_dir, exist_ok=True)
+    print(f"[train_base_dp] running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, cwd=REPO_ROOT, env=env)
+    return _latest_ckpt_path(abs_log_dir)
 
-        avg = epoch_loss / max(1, n_batches)
-        train_history.append(avg)
-        print(f"epoch {epoch:4d} | loss {avg:.6f}")
 
-        save_now = ((epoch + 1) % cfg.save_epochs == 0) or (epoch + 1 == cfg.num_epochs)
-        if save_now:
-            torch.save(policy.state_dict(),
-                       os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}.ckpt"))
-            plot_history(train_history, os.path.join(ckpt_dir, "loss.png"))
-            print(f"  saved ckpt + loss.png @ epoch {epoch + 1}")
-
-    return log_root
+def _latest_ckpt_path(log_dir: str) -> str:
+    """Canonical ckpt path produced by the LPB workspace (``save_last_ckpt``)."""
+    return os.path.join(log_dir, "checkpoints", "latest.ckpt")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, help="YAML config path")
-    args = parser.parse_args()
-    with open(args.config, "r") as f:
-        cfg = EasyDict(yaml.safe_load(f))
-    print(dict(cfg))
-    train(cfg)
+    # Manual E0 entry: python -m scout.train_base_dp [--config-name ...] [overrides ...]
+    # Most users will invoke `python train.py ...` directly; this is a thin
+    # convenience that forwards unknown args as hydra overrides.
+    import argparse
+
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config-name", default=DEFAULT_CONFIG_NAME)
+    p.add_argument("--config-dir", default=DEFAULT_CONFIG_DIR)
+    p.add_argument("--log-dir", default=None)
+    p.add_argument("--num-epochs", type=int, default=None)
+    p.add_argument("--dataset-path", default=None)
+    p.add_argument("--train-filter-key", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("overrides", nargs="*",
+                   help="extra hydra overrides (key=value)")
+    args = p.parse_args()
+
+    extra = {}
+    for kv in args.overrides:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            extra[k] = v
+
+    ckpt = train(
+        config_name=args.config_name, config_dir=args.config_dir,
+        log_dir=args.log_dir, num_epochs=args.num_epochs,
+        dataset_path=args.dataset_path,
+        train_filter_key=args.train_filter_key,
+        dry_run=args.dry_run, extra_overrides=extra,
+    )
+    print(f"[train_base_dp] ckpt -> {ckpt}")

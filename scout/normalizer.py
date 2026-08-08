@@ -78,17 +78,55 @@ class NormalizerBridge(ActionNormalizerBridge):
         )
 
 
+class UnnormalizeOnlyBridge(ActionNormalizerBridge):
+    """DP-normalized -> raw only (seam ②; scout_design.md §4 "归一化桥").
+
+    The LPB base DP (``DiffusionUnetHybridImagePolicy``) carries a fitted
+    ``self.normalizer['action']``; its ``guided_conditional_sample`` operates on
+    the **normalized** trajectory, so the one-step clean-action estimate
+    ``x̂_0`` lives in DP-normalized space. The SCOUT VIB encoder was trained on
+    **raw** hdf5 actions (``train_vib.py::_slice_transition`` feeds raw ``A_t``).
+    => the cost must unnormalize ``x̂_0`` back to raw; the VIB side needs no
+    further transform (raw == VIB space). This bridge is that single
+    ``unnormalize`` call -- differentiable (affine), so ``autograd.grad(cost,
+    x_t)`` flows straight through. LPB analogue:
+    ``dyn_model/planner.py:211-213`` with a passthrough VIB normalizer.
+    """
+
+    def __init__(self, policy_action_normalizer):
+        self.policy_action_normalizer = policy_action_normalizer
+
+    def __call__(self, x0_hat):
+        return self.policy_action_normalizer.unnormalize(x0_hat)
+
+    def __repr__(self):
+        return (
+            f"UnnormalizeOnlyBridge(policy="
+            f"{type(self.policy_action_normalizer).__name__})"
+        )
+
+
 def make_bridge(
     policy_action_normalizer: Optional[object] = None,
     vib_action_normalizer: Optional[object] = None,
 ) -> ActionNormalizerBridge:
-    """Factory: return the identity bridge if neither normalizer is given
-    (stage-1), otherwise a :class:`NormalizerBridge` (both must be provided)."""
+    """Factory picking the right bridge for the (DP-space -> VIB-space) map.
+
+    - neither given                           -> :class:`IdentityBridge`
+      (both spaces equal; hermetic dummy / no-fitted-normalizer path).
+    - ``policy_action_normalizer`` only       -> :class:`UnnormalizeOnlyBridge`
+      (DP normalized -> raw; VIB consumes raw -- the LPB-wired stage-1 default).
+    - both given                              -> :class:`NormalizerBridge`
+      (DP normalized -> raw -> VIB normalized; full LPB ``planner.py:211-213``).
+    """
     if policy_action_normalizer is None and vib_action_normalizer is None:
         return IdentityBridge()
-    if policy_action_normalizer is None or vib_action_normalizer is None:
-        raise ValueError(
-            "Either both `policy_action_normalizer` and `vib_action_normalizer` "
-            "must be provided (NormalizerBridge) or neither (IdentityBridge)."
-        )
-    return NormalizerBridge(policy_action_normalizer, vib_action_normalizer)
+    if policy_action_normalizer is not None and vib_action_normalizer is None:
+        return UnnormalizeOnlyBridge(policy_action_normalizer)
+    if policy_action_normalizer is not None and vib_action_normalizer is not None:
+        return NormalizerBridge(policy_action_normalizer, vib_action_normalizer)
+    # vib given but policy missing -> not a meaningful transform.
+    raise ValueError(
+        "vib_action_normalizer without policy_action_normalizer is not a valid "
+        "bridge (need a source space to unnormalize from)."
+    )

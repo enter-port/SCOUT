@@ -1,43 +1,39 @@
-"""E4: 5-step multi-round self-improvement loop (Phase 5.3,
-scout_design.md §5, scout_impl_plan.md Task 5.3).
+"""E4: 5-step multi-round self-improvement loop (Phase 5.3 / scout_design.md §5).
 
-Per round (6 rounds by default; config: num_rounds):
+Per round (6 by default; cfg.self_improvement.num_rounds):
 
-  1. DP_i            -- loaded from ckpt (round 0 = the Phase-2 output DP_0).
-  2. ScoutVIB        -- loaded ONCE from the Phase-3 chosen-β ckpt; reused
-                        across all rounds.
+  1. DP_i            -- loaded from ckpt (round 0 = the E0 base DP).
+  2. ScoutVIB        -- loaded ONCE from the E1 chosen-β ckpt; reused across
+                        all rounds (design §5: VIB dynamics don't change).
   3. Rollouts        -- baseline DP_i on N init states (1 try each); guided
                         exploration (GuidedAdapter with z~N(0,I), guidance_scale)
                         on the failed init states (up to try_times tries).
-  4. Write-back      -- successful exploration rollouts -> source.add
-                        (Phase-1 TransitionSource) -> merge-with-core ->
-                        ``retrain_fn`` -> DP_{i+1} ckpt path.
+  4. Write-back      -- successful exploration rollouts -> **augmented hdf5**
+                        (core demos + appended rollouts, with a `scout_aug` mask)
+                        -> retrain via LPB train.py -> DP_{i+1} ckpt path.
+                        This is the SOE ``run_full_multi_round`` pattern -- **no
+                        in-memory ReplayBuffer** (design §3, §5).
   5. Metrics         -- success_rate / pass@k / yield / jerk (DP_{i+1} vs DP_i).
 
-Real E4 (full robomimic env + mujoco + trained ckpts + GPU) is DEFERRED. To
-keep the orchestration unit-testable in this dev env, every external dependency
-is a factory passed into :class:`SelfImprovementLoop`:
+Real E4 (full robomimic env + mujoco + trained ckpts + GPU) is DEFERRED. Every
+external dependency is a factory injected into :class:`SelfImprovementLoop`:
 
-  dp_factory(ckpt_path)        -> a fresh :class:`scout.policy.dp.DP`
-                                  (state_dict loaded).
-  scout_vib_factory()          -> a fresh :class:`scout.model.scout_vib.ScoutVIB`
-                                  (state_dict loaded).
-  env_factory()                -> an env (robomimic EnvBase or a mock).
+  dp_factory(ckpt_path)        -> a fresh ScoutPolicy (LPB base DP subclass; the
+                                  planner is attached later for guided rollout).
+  scout_vib_factory()          -> a fresh ScoutVIB (state loaded).
+  env_factory()                -> an env (robomimic via
+                                  rollout.make_robomimic_env_factory, or a mock).
   retrain_fn(cfg, round_idx,   -> path to the DP_{i+1} ckpt. The default impl
     successful_rollouts,         writes an augmented HDF5 (core + successful
-    prev_dp_ckpt_path)           rollouts) and calls train_base_dp.train, but
-                                  it's an injected dependency so the dry-run
-                                  substitutes a no-op stub.
-  source_factory()             -> a fresh :class:`TransitionSource` used to
-                                  write back the round's successful transitions
-                                  (default RobomimicLowdimSource on the core
-                                  dataset; mock in the dry-run).
+    prev_dp_ckpt_path)           rollouts) and shells out to LPB ``train.py`` via
+                                  :func:`scout.train_base_dp.train`; injected so
+                                  the dry-run substitutes a no-op stub.
 
-The dry-run (``python -m scout.eval.self_improvement``) wires a mock DP /
-mock ScoutVIB / mock env / mock retrain_fn and verifies ONE round end-to-end:
-loop iterates -> baseline runs -> guided exploration runs -> successful
-rollouts are filtered and source.add is called -> retrain_fn fires -> metric
-compare is recorded.
+The dry-run (``python -m scout.eval.self_improvement``) wires a mock ScoutPolicy
+/ mock ScoutVIB / mock env / mock retrain_fn and verifies ONE + TWO round(s)
+end-to-end: loop iterates -> baseline runs -> planner attached -> guided rollout
+runs -> successful rollouts filtered -> augmented hdf5 written -> retrain fires
+-> metric compare logged.
 """
 
 from __future__ import annotations
@@ -52,7 +48,6 @@ import torch
 import yaml
 from easydict import EasyDict
 
-from scout.data.transition_source import TransitionSource
 from scout.eval.metrics import summarize_round
 from scout.eval.rollout import (
     BaseDPAdapter,
@@ -60,7 +55,8 @@ from scout.eval.rollout import (
     collect_initial_states,
     evaluate_baseline,
     evaluate_exploration,
-    rollout_to_transitions,
+    make_action_bridge,
+    make_obs_adapter,
 )
 
 
@@ -70,7 +66,6 @@ from scout.eval.rollout import (
 DPFactory = Callable[[str], torch.nn.Module]
 VIBFactory = Callable[[], torch.nn.Module]
 EnvFactory = Callable[[], Any]
-SourceFactory = Callable[[], TransitionSource]
 RetrainFn = Callable[
     [EasyDict, int, List[dict], str],  # cfg, round_idx, successful_rollouts, prev_dp_ckpt
     str,                                # new DP ckpt path
@@ -83,8 +78,13 @@ RetrainFn = Callable[
 class SelfImprovementLoop:
     """Multi-round DP self-improvement via VIB-guided exploration.
 
-    Args mirror the 5-step design (above). All factories are required so the
-    loop has no hard dependency on robomimic / mujoco / a particular ckpt path.
+    Args mirror the 5-step design. ``dp_factory`` / ``scout_vib_factory`` /
+    ``env_factory`` / ``retrain_fn`` are all required so the loop has no hard
+    dependency on robomimic / mujoco / a particular ckpt path (the dry-run
+    injects mocks). ``view_names`` / ``proprio_keys`` configure seam ① (obs
+    adapter); ``guidance_scale`` / ``guidance_start_timestep`` are SCOUT guidance
+    knobs (seam ② is auto-derived from each round's DP via
+    :func:`scout.eval.rollout.make_action_bridge`).
     """
 
     def __init__(self,
@@ -93,8 +93,6 @@ class SelfImprovementLoop:
                  scout_vib_factory: VIBFactory,
                  env_factory: EnvFactory,
                  retrain_fn: RetrainFn,
-                 source_factory: Optional[SourceFactory] = None,
-                 state_to_vec: Optional[Callable] = None,
                  device: Optional[torch.device] = None,
                  verbose: bool = True):
         self.cfg = cfg
@@ -102,11 +100,15 @@ class SelfImprovementLoop:
         self.scout_vib_factory = scout_vib_factory
         self.env_factory = env_factory
         self.retrain_fn = retrain_fn
-        self.source_factory = source_factory
-        self.state_to_vec = state_to_vec
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.verbose = verbose
+
+        # guidance / obs-adapter config (read once from cfg)
+        self.guidance_scale = float(cfg.exploration.guidance_scale)
+        self.guidance_start_timestep = int(cfg.exploration.guidance_start_timestep)
+        self.view_names = list(cfg.eval.view_names)
+        self.proprio_keys = list(cfg.eval.proprio_keys)
 
         # bookkeeping
         self.dp_path: str = cfg.base_dp.initial_ckpt_path
@@ -123,19 +125,32 @@ class SelfImprovementLoop:
         return evaluate_baseline(adapter, self.env_factory, init_states,
                                  horizon=int(self.cfg.eval.horizon))
 
+    def _build_guided_adapter(self, dp, scout_vib) -> GuidedAdapter:
+        """Attach the SCOUT planner to ``dp`` (seam ① + ②), return a GuidedAdapter.
+
+        Per design §4: planner carries the frozen ScoutVIB (``E_s`` + ``vib_enc``)
+        + the unnormalize-only action bridge (from this round's DP normalizer) +
+        the obs-adapter (LPB keyed obs -> E_s format). z is sampled fresh inside
+        ScoutPolicy on each inference call.
+        """
+        from scout.guidance.planner import ScoutPlanner
+        bridge = make_action_bridge(dp)                      # seam ②
+        obs_adapter = make_obs_adapter(self.view_names,      # seam ①
+                                       self.proprio_keys)
+        planner = ScoutPlanner(scout_vib, bridge=bridge,
+                               obs_adapter=obs_adapter, z=None)
+        # ScoutPolicy.initialize_scout_planner sets guidance_start_timestep /
+        # guidance_scale + attaches the planner. If dp is a plain LPB DP (no
+        # scout hook, e.g. a mock), skip -- the mock must already mimic the
+        # guided interface.
+        init = getattr(dp, "initialize_scout_planner", None)
+        if callable(init):
+            init(planner, self.guidance_start_timestep, self.guidance_scale)
+        return GuidedAdapter(dp, self.device)
+
     def _exploration_round(self, dp, scout_vib, init_states,
                            baseline_results) -> List[dict]:
-        if self.state_to_vec is None:
-            raise ValueError(
-                "GuidedAdapter requires `state_to_vec`; pass it to "
-                "SelfImprovementLoop (env-obs -> (state_dim,) tensor).")
-        adapter = GuidedAdapter(
-            dp, self.device, scout_vib, self.state_to_vec,
-            guidance_scale=float(self.cfg.exploration.guidance_scale),
-            guidance_start_timestep=int(
-                self.cfg.exploration.guidance_start_timestep),
-            bridge=None,                                  # Identity in stage-1
-        )
+        adapter = self._build_guided_adapter(dp, scout_vib)
         return evaluate_exploration(
             adapter, self.env_factory, init_states,
             horizon=int(self.cfg.eval.horizon),
@@ -144,40 +159,24 @@ class SelfImprovementLoop:
         )
 
     def _collect_successful(self,
-                            exploration_results: List[dict],
-                            obs_keys: Sequence[str],
-                            action_dim: int) -> List[dict]:
-        """Pull successful rollouts (+ their transitions) from a round's results.
+                            exploration_results: List[dict]) -> List[dict]:
+        """Pull successful rollouts from a round's exploration results.
 
-        Returns the list of successful traj dicts (the same objects the loop
-        forwards to ``retrain_fn``). As a side-effect, if ``source_factory`` was
-        provided, the transitions are written back via ``source.add`` (Phase-1
-        write-back entry) -- this is the SOE multi-round loop's retrain data.
+        No in-memory buffer (design §3, §5): the rollouts are forwarded straight
+        to ``retrain_fn``, which writes the augmented hdf5 and retrains.
         """
-        succ_rollouts: List[dict] = []
-        if self.source_factory is not None:
-            source = self.source_factory()
-        else:
-            source = None
-        for r in exploration_results:
-            for traj in r["successful_trajs"]:
-                succ_rollouts.append(traj)
-                if source is not None:
-                    trans = rollout_to_transitions(traj, obs_keys=obs_keys,
-                                                   action_dim=action_dim)
-                    if trans is not None:
-                        source.add(trans)
-        self._log(f"  round collected {len(succ_rollouts)} successful rollouts "
-                  f"(source len now {len(source) if source else 'n/a'})")
-        return succ_rollouts
+        succ = [traj for r in exploration_results for traj in r["successful_trajs"]]
+        self._log(f"  round collected {len(succ)} successful rollouts "
+                  f"(accumulated {len(self.accumulated_rollouts) + len(succ)})")
+        return succ
 
     # ---- full loop ------------------------------------------------------- #
     def run(self, num_rounds: Optional[int] = None) -> List[dict]:
-        """Run ``num_rounds`` rounds (defaults to ``cfg.self_improvement.num_rounds``).
+        """Run ``num_rounds`` rounds (defaults to cfg.self_improvement.num_rounds).
 
-        Per round: baseline DP_i -> guided exploration -> write-back -> retrain
-        -> DP_{i+1}. The ScoutVIB is loaded ONCE (round 0) and reused (per
-        design: VIB dynamics don't change across rounds).
+        Per round: baseline DP_i -> guided exploration -> write-back (augmented
+        hdf5 + retrain) -> DP_{i+1}. The ScoutVIB is loaded ONCE (round 0) and
+        reused (design: VIB dynamics don't change across rounds).
 
         Returns the per-round summaries (also stored in ``self.history``).
         """
@@ -189,11 +188,6 @@ class SelfImprovementLoop:
             self.env_factory, n_init_states=int(self.cfg.eval.n_init_states))
         self._log(f"[loop] collected {len(init_states)} init states (fixed "
                   f"across {n_rounds} rounds)")
-
-        action_dim = int(self.cfg.action_dim)
-        obs_keys = list(self.cfg.eval.get("obs_keys",
-                                          ["robot0_eef_pos", "object",
-                                           "robot0_gripper_qpos"]))
 
         for r in range(n_rounds):
             self._log(f"\n=== round {r} ===  (dp_ckpt={self.dp_path})")
@@ -218,8 +212,8 @@ class SelfImprovementLoop:
                       f"jerk_base={summary['jerk_baseline']:.4f} "
                       f"jerk_expl={summary['jerk_exploration']:.4f}")
 
-            # write-back + retrain -> next dp ckpt path
-            successful = self._collect_successful(expl, obs_keys, action_dim)
+            # write-back (augmented hdf5) + retrain -> next dp ckpt path
+            successful = self._collect_successful(expl)
             self.accumulated_rollouts.extend(successful)
             if r + 1 < n_rounds:                  # no retrain needed after last round
                 new_dp_path = self.retrain_fn(
@@ -231,56 +225,86 @@ class SelfImprovementLoop:
 
 
 # --------------------------------------------------------------------------- #
-# default retrain_fn (writes augmented HDF5 + calls train_base_dp.train)
+# default retrain_fn (writes augmented HDF5 + calls scout.train_base_dp.train)
 # --------------------------------------------------------------------------- #
 def default_retrain_fn_factory(log_root: str) -> RetrainFn:
     """Build the default retrain callback.
 
     Returns a closure that, on each round, writes an augmented HDF5
     (core demos + accumulated successful rollouts as new demo_*) and invokes
-    :func:`scout.train_base_dp.train` with the cfg's ``base_dp.cfg`` path
-    overridden to the new hdf5. Real run only -- the dry-run swaps in a stub.
+    :func:`scout.train_base_dp.train` -- which shells out to the LPB ``train.py``
+    (repo root) with ``cfg.base_dp.config_name`` overridden to point at the new
+    hdf5 + per-round log dir. Real run only -- the dry-run swaps in a stub.
 
-    .. note:: The HDF5 writer is structurally complete (robomimic ``data/demo_N``
-       schema with ``obs/<key>``, ``actions``, ``done``, ``success`` per frame),
-       but UNTESTED against a real robomimic loader (env install deferred). If
-       the real run trips on schema details, this is the place to fix.
+    .. note:: The HDF5 writer is structurally faithful to robomimic's
+       ``data/demo_N`` schema (per-demo ``obs/<key>``, ``actions``, ``done``,
+       ``success``, ``states``) and to SOE's ``run_full_multi_round`` write path,
+       but UNTESTED against the real robomimic loader (env install deferred). If
+       a real run trips on schema details (e.g. ``env``/``model_file`` attrs,
+       ``abs_action`` rotation fields), this is the place to fix.
     """
 
     def retrain_fn(cfg: EasyDict, round_idx: int,
                    successful_rollouts: List[dict],
                    prev_dp_ckpt: str) -> str:
-        from scout.train_base_dp import train       # lazy: keeps dry-run hermetic
+        from scout.train_base_dp import train
 
-        # 1. write augmented hdf5
+        # 1. write augmented hdf5 (core + successful rollouts, scout_aug mask)
         core_path = cfg.dataset.path
         round_dir = os.path.join(log_root, f"round_{round_idx + 1}")
         os.makedirs(round_dir, exist_ok=True)
         new_path = os.path.join(round_dir, "augmented.hdf5")
-        aug_mask_key = cfg.self_improvement.get("scout_aug_mask", "scout_aug")
+        aug_mask_key = cfg.self_improvement.scout_aug_mask
         _write_augmented_hdf5(core_path, new_path, successful_rollouts,
-                              core_filter_key=cfg.self_improvement.core_filter_key,
+                              core_filter_key=cfg.dataset.core_filter_key,
                               aug_mask_key=aug_mask_key)
 
-        # 2. retrain cfg -- clone, override dataset path + ckpt resume
-        import copy
-        base_dp_cfg = EasyDict(copy.deepcopy(dict(cfg.base_dp.train_cfg)))
-        base_dp_cfg.dataset.path = new_path
-        # The augmented HDF5 contains core demos + appended successful rollouts.
-        # `train_filter_key` MUST point at a mask that includes BOTH, else the
-        # retrain would ignore the new rollouts (the bug we avoid). The augmented
-        # file writes such a mask (`mask/<scout_aug_mask>`); point at it here.
-        base_dp_cfg.dataset.train_filter_key = cfg.self_improvement.scout_aug_mask
-        base_dp_cfg.resume_ckpt = prev_dp_ckpt
-        base_dp_cfg.log_dir = round_dir
-        if "num_epochs" in cfg.self_improvement:
-            base_dp_cfg.num_epochs = int(cfg.self_improvement.num_epochs)
-        log_run = train(base_dp_cfg)
-        new_ckpt = os.path.join(log_run, "ckpt",
-                                f"policy_epoch_{base_dp_cfg.num_epochs}.ckpt")
+        # 2. retrain via LPB train.py -- per-round log_dir, train on scout_aug mask
+        new_ckpt = train(
+            config_name=cfg.base_dp.config_name,
+            config_dir=cfg.base_dp.config_dir,
+            dataset_path=new_path,
+            train_filter_key=aug_mask_key,        # core + new rollouts
+            log_dir=round_dir,
+            num_epochs=int(cfg.self_improvement.num_epochs),
+            # SCOUT threads the prior DP as the resume point (LPB workspace
+            # resumes from <log_dir>/checkpoints/latest.ckpt when
+            # training.resume=True; for true round-to-round init, copy
+            # prev_dp_ckpt into round_dir/checkpoints/latest.ckpt before train).
+            extra_overrides={"training.resume": False},
+        )
         return new_ckpt
 
     return retrain_fn
+
+
+# --------------------------------------------------------------------------- #
+# augmented HDF5 writer (SOE run_full_multi_round pattern; no in-memory buffer)
+# --------------------------------------------------------------------------- #
+def _demo_list(hdf5_file, mask_key: Optional[str]) -> List[str]:
+    """Sorted ``data/demo*`` names, optionally filtered by ``mask/<mask_key>``."""
+    all_demos = sorted([k for k in hdf5_file["data"].keys() if k.startswith("demo")])
+    if mask_key is None or f"mask/{mask_key}" not in hdf5_file:
+        return all_demos
+    node = hdf5_file[f"mask/{mask_key}"]
+    if isinstance(node, h5py_group_class()) and "mask" in node:
+        arr = node["mask"][()]
+    else:
+        arr = node[()]
+    if arr.dtype == bool:
+        return [d for d, keep in zip(all_demos, arr) if keep]
+    return [s.decode("utf-8") if isinstance(s, bytes) else str(s) for s in arr]
+
+
+def _discover_obs_keys(data_grp, demo_name: str) -> List[str]:
+    """Per-key obs keys present in ``data/<demo>/obs`` (robomimic schema)."""
+    return sorted(data_grp[demo_name]["obs"].keys())
+
+
+def h5py_group_class():
+    """Lazy h5py import (module top-level imports stay clean)."""
+    import h5py
+    return h5py.Group
 
 
 def _write_augmented_hdf5(core_path: str, out_path: str,
@@ -289,17 +313,18 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
                           aug_mask_key: str = "scout_aug"):
     """Write ``core_path``'s filtered demos + ``rollouts`` as a new HDF5.
 
-    Mirrors robomimic's ``data/demo_N`` schema: per-demo ``obs/<key>`` (T, dim),
-    ``actions`` (T, action_dim), ``done``/``success`` (T,) bool, ``states`` (T, D).
-    Also writes ``mask/<aug_mask_key>`` = boolean over ALL ``data/`` demos that
-    selects ``core_filter_key`` demos + the appended rollout demos, so the
-    retrain step can pick up both via a single mask (otherwise it would
-    re-train on core-only and silently ignore the new rollouts).
+    Mirrors robomimic's ``data/demo_N`` schema: per-demo ``obs/<key>``
+    (T, dim), ``actions`` (T, action_dim), ``done``/``success`` (T,) bool,
+    ``states`` (T, D) when available. Also writes ``mask/<aug_mask_key>`` =
+    boolean over ALL ``data/`` demos selecting ``core_filter_key`` demos + the
+    appended rollout demos, so the retrain step picks up both via one mask
+    (otherwise it would train on core-only and silently ignore the new
+    rollouts -- the bug this avoids).
 
     .. warning:: UNTESTED against the real robomimic loader (env deferred). The
-       schema is faithful to SOE's `run_full_multi_round.py` write path; if a
-       future real run finds a missing attribute (e.g. ``model_file``, ``env``
-       metadata in attrs), extend here.
+       schema is faithful to SOE's write path; if a future real run finds a
+       missing attribute (e.g. ``model_file``, ``env`` metadata, per-demo
+       ``num_samples``), extend here.
     """
     import h5py
     import shutil
@@ -308,15 +333,11 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
     shutil.copyfile(core_path, out_path)
 
     with h5py.File(out_path, "r+") as f:
-        # filter core demos
-        from scout.data.robomimic_lowdim import _demo_list, _discover_obs_keys
         core_demos = _demo_list(f, core_filter_key)
         if not core_demos:
-            raise RuntimeError(f"no core demos under mask='{core_filter_key}' in {core_path}")
+            raise RuntimeError(
+                f"no core demos under mask='{core_filter_key}' in {core_path}")
         obs_keys = _discover_obs_keys(f["data"], core_demos[0])
-
-        # all demos present BEFORE we append (used for the augmented mask)
-        all_demos_before = sorted([k for k in f["data"].keys() if k.startswith("demo")])
         core_set = set(core_demos)
 
         # find next free demo id
@@ -332,19 +353,29 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
             if ep_len == 0:
                 continue
             grp = f["data"].create_group(demo_name)
-            # obs: per-key (T, dim) arrays reconstructed from rollout["obs"]
             obs_list = rollout.get("obs") or []
             if len(obs_list) < ep_len:
-                # rollout wasn't recorded with obs -- can't recover per-key
                 raise ValueError(
                     f"rollout for {demo_name} missing obs (need record_obs=True); "
                     f"got {len(obs_list)} frames, need {ep_len}")
             obs_grp = grp.create_group("obs")
+            # Per-key frame shape = core demo's obs/<k> shape minus the leading
+            # time dim (e.g. (3,84,84) for rgb, (3,) for a low_dim key). The env
+            # records windowed obs (n_obs_steps, *frame_shape) per step; we take
+            # the LAST frame of each window so the appended demo matches the
+            # core's (T, *frame_shape) layout. Robust to both image + low_dim.
+            core_obs_ref = f["data"][core_demos[0]]["obs"]
             for k in obs_keys:
+                frame_shape = core_obs_ref[k].shape[1:]
+                frame_size = int(np.prod(frame_shape)) if frame_shape else 1
+
+                def _to_frame(o_k, fs=frame_size, fshape=frame_shape):
+                    arr = np.asarray(o_k, dtype=np.float32).reshape(-1)
+                    return arr[-fs:].reshape(fshape)
+
                 obs_grp.create_dataset(
                     k, data=np.stack(
-                        [np.asarray(o[k], dtype=np.float32).reshape(-1)
-                         for o in obs_list[:ep_len]], axis=0))
+                        [_to_frame(o[k]) for o in obs_list[:ep_len]], axis=0))
             grp.create_dataset("actions",
                                data=np.asarray(rollout["actions"], dtype=np.float32))
             grp.create_dataset("done",
@@ -352,12 +383,15 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
             grp.create_dataset("success",
                                data=np.full(ep_len, bool(rollout.get("success", True)),
                                             dtype=bool))
-            # num_samples attr (robomimic convention)
+            # states (optional -- write if the rollout recorded them non-empty)
+            states = rollout.get("states")
+            if states is not None and len(states) >= ep_len:
+                grp.create_dataset("states",
+                                   data=np.asarray(states[:ep_len], dtype=np.float32))
             grp.attrs["num_samples"] = ep_len
             new_demo_names.append(demo_name)
 
         # write the augmented mask: True for core_<filter> demos + new rollouts.
-        # `data/demo_list` order is the canonical mask index order (sorted).
         all_demos_after = sorted([k for k in f["data"].keys() if k.startswith("demo")])
         new_set = set(new_demo_names)
         mask = np.array([d in core_set or d in new_set for d in all_demos_after],
@@ -371,65 +405,194 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
 
 
 # --------------------------------------------------------------------------- #
+# reference factory builders (lazy-imported; real run only)
+# --------------------------------------------------------------------------- #
+def make_lpb_dp_factory(device: Optional[torch.device] = None
+                        ) -> DPFactory:
+    """Build a ``dp_factory(ckpt_path) -> ScoutPolicy`` for the real run.
+
+    Loads the LPB base DP ckpt (saved by ``TrainDiffusionUnetHybridWorkspace``)
+    into a :class:`scout.guidance.policy.ScoutPolicy` (subclass; same state_dict
+    structure -- no new params). Fits the action normalizer from the sibling
+    ``normalizer.pth`` (saved by the LPB workspace alongside ``checkpoints/``).
+
+    Lazy-imported so :mod:`scout.eval.self_improvement` stays importable without
+    robomimic/hydra. The dry-run does NOT use this -- it injects a mock.
+    """
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def factory(ckpt_path: str) -> torch.nn.Module:
+        import hydra
+        from omegaconf import OmegaConf
+        from scout.guidance.policy import ScoutPolicy
+        from diffusion_policy.model.common.normalizer import LinearNormalizer
+
+        OmegaConf.register_new_resolver("eval", eval, replace=True)
+        payload = torch.load(ckpt_path, map_location="cpu")
+        cfg = payload["cfg"] if isinstance(payload, dict) and "cfg" in payload \
+            else payload
+        policy = hydra.utils.instantiate(cfg.policy)
+        # state_dict slot: workspace ckpt uses payload["state_dicts"]["policy"];
+        # fall back to payload["policy"] / payload["state_dict"] for other savers.
+        sd = payload["state_dicts"]["policy"] if "state_dicts" in payload \
+            else payload.get("policy", payload.get("state_dict"))
+        policy.load_state_dict(sd, strict=False)
+
+        # normalizer (sibling normalizer.pth next to the ckpt's checkpoints/ dir)
+        normalizer_path = os.path.join(
+            os.path.dirname(os.path.dirname(ckpt_path)), "normalizer.pth")
+        if os.path.isfile(normalizer_path):
+            nstate = torch.load(normalizer_path, map_location="cpu")
+            policy.normalizer = LinearNormalizer()
+            policy.normalizer.load_state_dict(nstate)
+
+        return policy.to(dev).eval()
+
+    return factory
+
+
+def make_scout_vib_factory(cfg: EasyDict,
+                           device: Optional[torch.device] = None
+                           ) -> VIBFactory:
+    """Build a ``scout_vib_factory() -> ScoutVIB`` for the real run.
+
+    Reconstructs ``E_s`` via :meth:`StateEncoder.from_base_dp_ckpt` (frozen
+    base-DP ResNet + trained proprio Conv1d) using the E_s params in
+    ``cfg.vib`` (``base_dp_ckpt``, ``view_names``, ``proprio_dim``,
+    ``proprio_emb_dim``), then loads the chosen-β VIB ckpt
+    (``cfg.vib.ckpt_path``). Lazy-imported; the dry-run injects a mock.
+
+    The E_s params MUST match the E1 VIB training config (``configs/vib_lift_*``)
+    -- duplicate them in the eval config's ``vib:`` block so this loop is
+    self-contained.
+    """
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def factory() -> torch.nn.Module:
+        from scout.model.encoder import StateEncoder
+        from scout.model.scout_vib import ScoutVIB
+
+        vcfg = cfg.vib
+        E_s = StateEncoder.from_base_dp_ckpt(
+            base_dp_ckpt=vcfg.base_dp_ckpt,
+            view_names=list(vcfg.view_names),
+            proprio_dim=int(vcfg.proprio_dim),
+            proprio_emb_dim=int(getattr(vcfg, "proprio_emb_dim", 64)),
+        )
+        ckpt = torch.load(vcfg.ckpt_path, map_location="cpu")
+        model = ScoutVIB(
+            action_dim=int(cfg.action_dim),
+            E_s=E_s,
+            style_dim=int(vcfg.style_dim),
+            hidden_dim=int(getattr(vcfg, "hidden_dim", 128)),
+            beta=float(ckpt.get("beta", 1.0e-3)),
+        )
+        model.load_state_dict(ckpt["state_dict"])
+        return model.to(dev).eval()
+
+    return factory
+
+
+def make_default_env_factory(cfg: EasyDict) -> EnvFactory:
+    """Build the real robomimic env factory (LPB robomimic_image_runner reuse).
+
+    Lazy-imports :func:`scout.eval.rollout.make_robomimic_env_factory`; reads
+    dataset_path + shape_meta from a base-DP LPB config (resolved via the
+    cfg.base_dp config_name). The dry-run does NOT use this -- it injects a mock.
+    """
+    from scout.eval.rollout import make_robomimic_env_factory
+    import hydra
+    from omegaconf import OmegaConf
+
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    config_path = os.path.join(cfg.base_dp.config_dir,
+                               cfg.base_dp.config_name + ".yaml")
+    with open(config_path) as f:
+        lpb_cfg = OmegaConf.create(yaml.safe_load(f))
+    return make_robomimic_env_factory(
+        dataset_path=OmegaConf.select(lpb_cfg, "task.dataset_path",
+                                      default=cfg.dataset.path),
+        shape_meta=OmegaConf.to_container(lpb_cfg.shape_meta, resolve=True),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # config loader
 # --------------------------------------------------------------------------- #
 def load_cfg(path: str) -> EasyDict:
-    with open(path, "r") as f:
+    # encoding=utf-8: configs carry §/β/smart-quotes in comments; Windows locale
+    # default (GBK) would otherwise UnicodeDecodeError on them.
+    with open(path, "r", encoding="utf-8") as f:
         return EasyDict(yaml.safe_load(f))
 
 
 # --------------------------------------------------------------------------- #
-# dry-run with mocks (orchestration verification, ONE round)
+# dry-run with mocks (orchestration verification)
 # --------------------------------------------------------------------------- #
-def _dry_run():
-    """Mock-DP / mock-VIB / mock-env ONE-round orchestration check.
+class _MockScoutPolicy(torch.nn.Module):
+    """Mock of ScoutPolicy for the dry-run. Exposes the LPB interface the loop
+    + adapters actually call: ``n_action_steps``, ``predict_action``,
+    ``predict_action_dyn_guided``, ``normalizer``, ``reset``, ``eval``,
+    ``initialize_scout_planner``. Unguided + guided actions differ so the
+    scripted env sees different success rates (exercising the success filter)."""
 
-    Run via ``python -m scout.eval.self_improvement``. Verifies the loop wires
-    end-to-end: round iterates -> baseline rollout -> guided rollout -> success
-    filter -> source.add fires -> retrain_fn fires -> metric compare logged.
+    def __init__(self, n_action_steps=8, action_dim=4, guided_strength=0.0):
+        super().__init__()
+        self.n_action_steps = n_action_steps
+        self.action_dim = action_dim
+        self.guided_strength = float(guided_strength)
+        self.normalizer = {}        # make_action_bridge falls back to Identity
+        self._planner_attached = False
 
-    NOTE: this is an ORCHESTRATION test (do the right components fire in the
-    right order with the right arguments?), not a correctness test (the mock
-    DP's actions are uncorrelated with success -- don't read into the absolute
-    success_rate value).
-    """
-    from scout.policy.dp import DP
-    from scout.model.scout_vib import ScoutVIB
-    from scout.data.transition_source import ReplayBuffer
+    def reset(self):
+        pass
 
-    state_dim = 8
-    action_dim = 4
-    num_action = 20
+    def eval(self):
+        return self
 
-    cfg = EasyDict({
-        "base_dp": {"initial_ckpt_path": "<mock-dp-0>"},
-        "dataset": {"path": "<mock-core>"},
-        "action_dim": action_dim,
-        "eval": {"n_init_states": 4, "try_times": 3, "horizon": 10,
-                 "obs_keys": ["low_dim_a", "low_dim_b"]},
-        "exploration": {"guidance_scale": 5.0, "guidance_start_timestep": 50},
-        "self_improvement": {"num_rounds": 1, "core_filter_key": "train"},
-    })
+    def initialize_scout_planner(self, planner, gst, gscale):
+        self._planner_attached = True
 
-    # factories that build FRESH modules per call (DP needs to be re-created
-    # per round so the retrain "takes effect"; ScoutVIB is created once by the
-    # loop itself).
-    def dp_factory(ckpt_path: str) -> torch.nn.Module:
-        dp = DP(num_action=num_action, action_dim=action_dim,
-                obs_shape_meta={"low_dim_a": dict(shape=[action_dim], type="low_dim"),
-                                "low_dim_b": dict(shape=[action_dim], type="low_dim")})
-        dp.to(torch.device("cpu"))
-        return dp
+    def _chunk(self, B, guided):
+        # baseline: small action[0]; guided: amplified -- so the scripted env
+        # (threshold over |action|.sum()) solves more in exploration.
+        mag = (0.2 + self.guided_strength) if guided else 0.2
+        c = torch.zeros((B, self.n_action_steps, self.action_dim))
+        c[..., 0] = mag
+        return c
 
-    def scout_vib_factory() -> torch.nn.Module:
-        return ScoutVIB(state_dim=state_dim, action_dim=action_dim,
-                        style_dim=8, hidden_dim=32, beta=1e-3).to(torch.device("cpu"))
+    def predict_action(self, obs_dict):
+        B = next(iter(obs_dict.values())).shape[0]
+        c = self._chunk(B, guided=False)
+        return {"action": c, "action_pred": c}
 
-    # Mock env: scripted success threshold (same as rollout smoke).
+    def predict_action_dyn_guided(self, obs_dict):
+        B = next(iter(obs_dict.values())).shape[0]
+        c = self._chunk(B, guided=True)
+        return {"action": c, "action_pred": c}
+
+
+class _MockScoutVIB(torch.nn.Module):
+    """Mock ScoutVIB: just the attrs ScoutPlanner touches (style_dim + eval)."""
+
+    def __init__(self, style_dim=8):
+        super().__init__()
+        self.style_dim = style_dim
+
+    def eval(self):
+        return self
+
+    def encode(self, obs):
+        # dim-agnostic placeholder s̄ (planner caches it but the mock policy
+        # never calls into the real cost path).
+        return torch.zeros(1, self.style_dim)
+
+
+def _make_dry_run_env_factory(action_dim, horizon, lo, hi):
     class MockEnv:
         def __init__(self, seed=0):
             self.action_dim = action_dim
-            self.horizon = cfg.eval.horizon
+            self.horizon = horizon
             self._step = 0
             self._cum = 0.0
             self._state_dict = {"s": 0.0}
@@ -439,12 +602,7 @@ def _dry_run():
         def reset(self):
             self._step = 0
             self._cum = 0.0
-            # Mid-range threshold: untrained-DP chunk magnitudes vary enough
-            # across diffusion noise + guided-z that ~1-2 of 4 init states
-            # solve in baseline; some of the remaining solve in exploration
-            # (try_times=3) via different z draws. Exercises success-filter
-            # AND write-back.
-            self._state_dict = {"s": float(self._rng.uniform(1.5, 3.5))}
+            self._state_dict = {"s": float(self._rng.uniform(lo, hi))}
             return self._get_obs()
 
         def reset_to(self, state_dict):
@@ -454,182 +612,15 @@ def _dry_run():
             return self._get_obs()
 
         def _get_obs(self):
-            return {"low_dim_a": np.zeros(self.action_dim, dtype=np.float32),
-                    "low_dim_b": np.ones(self.action_dim, dtype=np.float32)}
+            return {"agentview_image": np.zeros((2, 3, 4, 4), dtype=np.float32),
+                    "robot0_eye_in_hand_image": np.ones((2, 3, 4, 4), dtype=np.float32),
+                    "robot0_eef_pos": np.zeros((2, action_dim // 2), dtype=np.float32),
+                    "robot0_eef_quat": np.zeros((2, 4), dtype=np.float32),
+                    "robot0_gripper_qpos": np.zeros((2, 2), dtype=np.float32)}
 
         def step(self, action):
             self._step += 1
-            # Magnify so untrained chunks (~|a[0]|~0.1) cumulate to >threshold:
-            self._cum += float(np.abs(action).sum()) * 0.5
-            r = float(np.linalg.norm(action))
-            done = self.is_success()["task"] or (self._step >= self.horizon)
-            return self._get_obs(), r, done, {}
-
-        def is_success(self):
-            return {"task": bool(self._cum >= self._state_dict["s"])}
-
-        def get_state(self):
-            return dict(self._state_dict)
-
-        def close(self):
-            pass
-
-    def env_factory():
-        return MockEnv()
-
-    def state_to_vec(obs_dict):
-        a = obs_dict["low_dim_a"]
-        b = obs_dict["low_dim_b"]
-        if not isinstance(a, torch.Tensor):
-            a = torch.as_tensor(a); b = torch.as_tensor(b)
-        v = torch.cat([a, b], dim=-1).float()
-        if v.dim() == 1:
-            v = v.unsqueeze(0)
-        return v
-
-    # mock retrain_fn: record calls + return a new fake path (no real training)
-    retrain_calls: List[Tuple] = []
-
-    def mock_retrain_fn(cfg, round_idx, successful_rollouts, prev_dp_ckpt):
-        retrain_calls.append((round_idx, len(successful_rollouts), prev_dp_ckpt))
-        return f"<mock-dp-{round_idx + 1}>"
-
-    # mock source: a tiny ReplayBuffer we can inspect for write-back counts
-    written_back = {"count": 0}
-    mock_buffer = ReplayBuffer(state_dim=2 * action_dim, action_dim=action_dim,
-                               capacity=1000)
-    orig_add = mock_buffer.add
-
-    def counting_add(trans):
-        orig_add(trans)
-        written_back["count"] += len(trans["S_t"])
-
-    mock_buffer.add = counting_add                                  # type: ignore
-
-    def source_factory():
-        return mock_buffer
-
-    loop = SelfImprovementLoop(
-        cfg=cfg,
-        dp_factory=dp_factory,
-        scout_vib_factory=scout_vib_factory,
-        env_factory=env_factory,
-        retrain_fn=mock_retrain_fn,
-        source_factory=source_factory,
-        state_to_vec=state_to_vec,
-        device=torch.device("cpu"),
-    )
-    history = loop.run()
-
-    print("\n--- dry-run results ---")
-    print(f"rounds run         : {len(history)}")
-    print(f"history[0]         : {history[0]}")
-    print(f"retrain calls      : {retrain_calls}")
-    print(f"buffer.add rows    : {written_back['count']}")
-    print(f"buffer size        : {len(mock_buffer)}")
-    print(f"accumulated rollouts: {len(loop.accumulated_rollouts)}")
-
-    # assertions
-    assert len(history) == 1, "expected 1 round"
-    h = history[0]
-    assert "success_rate" in h and "pass_at_k" in h and "exploration_yield" in h \
-        and "jerk_baseline" in h, "missing metric keys"
-    assert 0.0 <= h["success_rate"] <= 1.0
-    assert 0.0 <= h["pass_at_k"] <= 1.0
-    assert h["exploration_yield"] >= 0
-    # retrain was called for the not-last round (round 0 with num_rounds=1: NO
-    # retrain expected -- last round skips it). This makes num_rounds=1 a pure
-    # "does the baseline+exploration pipeline fire" check; for the full retrain
-    # wiring verification, see _dry_run_two_rounds below.
-    assert retrain_calls == [], "(num_rounds=1 -> no retrain expected)"
-
-    # Airtight write-back assertion: directly exercise _collect_successful with
-    # a synthetic successful rollout, so source.add coverage doesn't hinge on
-    # mock-env stochasticity (untrained DPs have unpredictable success rates).
-    synth_traj = {
-        "actions": np.random.standard_normal((6, action_dim)).astype(np.float32),
-        "rewards": np.zeros(6, dtype=np.float32),
-        "dones": np.zeros(6, dtype=bool),
-        "states": [{} for _ in range(6)],
-        "obs": [{"low_dim_a": np.zeros(action_dim, dtype=np.float32),
-                 "low_dim_b": np.ones(action_dim, dtype=np.float32)}
-                for _ in range(6)],
-        "next_obs": [{"low_dim_a": np.zeros(action_dim, dtype=np.float32),
-                      "low_dim_b": np.ones(action_dim, dtype=np.float32)}
-                     for _ in range(6)],
-        "horizon": 6, "success": True, "initial_state_dict": None,
-    }
-    synth_expl = [{"solved": True, "n_tries": 1,
-                   "successful_trajs": [synth_traj], "all_trajs": [synth_traj],
-                   "baseline_solved": False}]
-    before = len(mock_buffer)
-    loop._collect_successful(synth_expl, obs_keys=cfg.eval.obs_keys,
-                             action_dim=action_dim)
-    after = len(mock_buffer)
-    print(f"[write-back] synth rollout: buffer {before} -> {after} "
-          f"(written_back count={written_back['count']})")
-    assert after == before + 6, "source.add did not fire for synthetic successful rollout"
-    print("[dry-run] self_improvement.py OK (orchestration + write-back)")
-
-
-def _dry_run_two_rounds():
-    """Two-round variant to exercise the retrain + DP_{i+1} wiring.
-
-    Round 0's retrain fires (mock) -> its returned path becomes round 1's DP
-    ckpt path. Verifies retrain_fn invocation count + path hand-off.
-    """
-    from scout.policy.dp import DP
-    from scout.model.scout_vib import ScoutVIB
-
-    state_dim = 8
-    action_dim = 4
-    num_action = 20
-    cfg = EasyDict({
-        "base_dp": {"initial_ckpt_path": "<mock-dp-0>"},
-        "dataset": {"path": "<mock-core>"},
-        "action_dim": action_dim,
-        "eval": {"n_init_states": 3, "try_times": 2, "horizon": 8,
-                 "obs_keys": ["low_dim_a", "low_dim_b"]},
-        "exploration": {"guidance_scale": 1.0, "guidance_start_timestep": 50},
-        "self_improvement": {"num_rounds": 2, "core_filter_key": "train"},
-    })
-
-    def dp_factory(ckpt_path):
-        dp = DP(num_action=num_action, action_dim=action_dim,
-                obs_shape_meta={"low_dim_a": dict(shape=[action_dim], type="low_dim"),
-                                "low_dim_b": dict(shape=[action_dim], type="low_dim")})
-        return dp.to(torch.device("cpu"))
-
-    def vib_factory():
-        return ScoutVIB(state_dim=state_dim, action_dim=action_dim,
-                        style_dim=8, hidden_dim=32, beta=1e-3).to(torch.device("cpu"))
-
-    class MockEnv:
-        def __init__(self, seed=0):
-            self.action_dim = action_dim
-            self.horizon = cfg.eval.horizon
-            self._step = 0; self._cum = 0.0
-            self._state_dict = {"s": 0.5}
-            self._rng = np.random.default_rng(seed)
-            self.rollout_exceptions = ()
-
-        def reset(self):
-            self._step = 0; self._cum = 0.0
-            self._state_dict = {"s": float(self._rng.uniform(0.3, 1.5))}
-            return self._get_obs()
-
-        def reset_to(self, sd):
-            self._step = 0; self._cum = 0.0
-            self._state_dict = dict(sd)
-            return self._get_obs()
-
-        def _get_obs(self):
-            return {"low_dim_a": np.zeros(self.action_dim, dtype=np.float32),
-                    "low_dim_b": np.ones(self.action_dim, dtype=np.float32)}
-
-        def step(self, a):
-            self._step += 1
-            self._cum += float(np.abs(a[0]).sum()) * 0.05
+            self._cum += float(np.abs(action).sum())
             done = self.is_success()["task"] or (self._step >= self.horizon)
             return self._get_obs(), 0.0, done, {}
 
@@ -642,23 +633,115 @@ def _dry_run_two_rounds():
         def close(self):
             pass
 
-    def state_to_vec(obs):
-        a = obs["low_dim_a"]; b = obs["low_dim_b"]
-        if not isinstance(a, torch.Tensor):
-            a = torch.as_tensor(a); b = torch.as_tensor(b)
-        v = torch.cat([a, b], dim=-1).float()
-        return v.unsqueeze(0) if v.dim() == 1 else v
+    return lambda: MockEnv()
 
+
+def _dry_run():
+    """Mock-DP / mock-VIB / mock-env ONE-round orchestration check.
+
+    Verifies the loop wires end-to-end: round iterates -> baseline rollout ->
+    planner attached -> guided rollout -> success filter -> retrain_fn fires ->
+    metric compare logged.
+    """
+    action_dim = 4
+    cfg = EasyDict({
+        "base_dp": {"initial_ckpt_path": "<mock-dp-0>",
+                    "config_name": "base_dp_lift_image", "config_dir": "configs"},
+        "vib": {"ckpt_path": "<mock-vib>"},
+        "dataset": {"path": "<mock-core>", "core_filter_key": "train"},
+        "action_dim": action_dim,
+        "eval": {"n_init_states": 4, "try_times": 3, "horizon": 10,
+                 "view_names": ["agentview_image", "robot0_eye_in_hand_image"],
+                 "proprio_keys": ["robot0_eef_pos", "robot0_eef_quat",
+                                  "robot0_gripper_qpos"]},
+        "exploration": {"guidance_scale": 5.0, "guidance_start_timestep": 50},
+        "self_improvement": {"num_rounds": 1, "scout_aug_mask": "scout_aug",
+                             "num_epochs": 1},
+    })
+
+    # factories -- mock policy amplifies guided actions so some init states solve
+    # in exploration (exercises success-filter + write-back wiring).
+    def dp_factory(ckpt_path):
+        return _MockScoutPolicy(n_action_steps=8, action_dim=action_dim,
+                                guided_strength=0.6)
+
+    def scout_vib_factory():
+        return _MockScoutVIB(style_dim=8)
+
+    env_factory = _make_dry_run_env_factory(action_dim, cfg.eval.horizon,
+                                            lo=2.5, hi=5.0)
+
+    retrain_calls: List[Tuple] = []
+
+    def mock_retrain_fn(c, round_idx, successful_rollouts, prev_dp_ckpt):
+        retrain_calls.append((round_idx, len(successful_rollouts), prev_dp_ckpt))
+        return f"<mock-dp-{round_idx + 1}>"
+
+    loop = SelfImprovementLoop(
+        cfg=cfg,
+        dp_factory=dp_factory,
+        scout_vib_factory=scout_vib_factory,
+        env_factory=env_factory,
+        retrain_fn=mock_retrain_fn,
+        device=torch.device("cpu"),
+    )
+    history = loop.run()
+
+    print("\n--- dry-run results ---")
+    print(f"rounds run         : {len(history)}")
+    print(f"history[0]         : {history[0]}")
+    print(f"retrain calls      : {retrain_calls}")
+    print(f"accumulated rollouts: {len(loop.accumulated_rollouts)}")
+
+    # assertions
+    assert len(history) == 1, "expected 1 round"
+    h = history[0]
+    for k in ("success_rate", "pass_at_k", "exploration_yield", "jerk_baseline"):
+        assert k in h, f"missing metric {k}"
+    assert 0.0 <= h["success_rate"] <= 1.0
+    assert 0.0 <= h["pass_at_k"] <= 1.0
+    assert h["exploration_yield"] >= 0
+    # num_rounds=1 -> last round skips retrain
+    assert retrain_calls == [], "(num_rounds=1 -> no retrain expected)"
+    print("[dry-run] self_improvement.py OK (orchestration)")
+
+
+def _dry_run_two_rounds():
+    """Two-round variant: retrain fires after round 0; its ckpt path feeds
+    round 1. Verifies retrain_fn invocation count + path hand-off.
+    """
+    action_dim = 4
+    cfg = EasyDict({
+        "base_dp": {"initial_ckpt_path": "<mock-dp-0>",
+                    "config_name": "base_dp_lift_image", "config_dir": "configs"},
+        "vib": {"ckpt_path": "<mock-vib>"},
+        "dataset": {"path": "<mock-core>", "core_filter_key": "train"},
+        "action_dim": action_dim,
+        "eval": {"n_init_states": 3, "try_times": 2, "horizon": 8,
+                 "view_names": ["agentview_image", "robot0_eye_in_hand_image"],
+                 "proprio_keys": ["robot0_eef_pos", "robot0_eef_quat",
+                                  "robot0_gripper_qpos"]},
+        "exploration": {"guidance_scale": 1.0, "guidance_start_timestep": 50},
+        "self_improvement": {"num_rounds": 2, "scout_aug_mask": "scout_aug",
+                             "num_epochs": 1},
+    })
+
+    def dp_factory(ckpt_path):
+        return _MockScoutPolicy(n_action_steps=8, action_dim=action_dim,
+                                guided_strength=0.4)
+
+    vib_factory = lambda: _MockScoutVIB(style_dim=8)
+    env_factory = _make_dry_run_env_factory(action_dim, cfg.eval.horizon,
+                                            lo=1.5, hi=3.0)
     retrain_calls = []
 
     def retrain_fn(c, r_idx, rollouts, prev):
-        retrain_calls.append((r_idx, prev))
+        retrain_calls.append((r_idx, len(rollouts), prev))
         return f"<mock-dp-{r_idx + 1}>"
 
     loop = SelfImprovementLoop(
         cfg=cfg, dp_factory=dp_factory, scout_vib_factory=vib_factory,
-        env_factory=lambda: MockEnv(), retrain_fn=retrain_fn,
-        source_factory=None, state_to_vec=state_to_vec,
+        env_factory=env_factory, retrain_fn=retrain_fn,
         device=torch.device("cpu"), verbose=False,
     )
     history = loop.run()
@@ -670,7 +753,8 @@ def _dry_run_two_rounds():
     print(f"history: {[(h['round'], round(h['success_rate'], 3), h['exploration_yield']) for h in history]}")
     assert len(history) == 2, "expected 2 rounds"
     assert len(retrain_calls) == 1, "expected 1 retrain (after round 0)"
-    assert retrain_calls[0][1] == "<mock-dp-0>", "round 0 should start from initial"
+    assert retrain_calls[0][1] > 0, "retrain should receive non-empty rollouts"
+    assert retrain_calls[0][2] == "<mock-dp-0>", "round 0 should start from initial"
     assert loop.dp_path == "<mock-dp-1>", "round 1 should use retrain's output"
     print("[dry-run-2] self_improvement.py OK (retrain wiring)")
 
