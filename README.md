@@ -114,24 +114,145 @@ $$Cost(a, z \mid s) = \big\|\, z - \mu(s, a)\,\big\|_2$$
 ## 项目结构
 
 ```
-SCOUT/
-├── README.md                  # 本文件
-├── .gitignore
-└── idea/
-    ├── idea.md                # 导师原始 idea（训练 + 测试阶段的数学）
-    ├── idea_notes.md          # 流程梳理：网络 / loss / 前向链路 / 测试 guidance
-    ├── idea.JPEG              # 导师原始 idea 手稿图
-    ├── long_term_plan.md      # 五阶段落地计划
-    └── group_meeting_notes.md # 组会汇报提纲 + 关键开放问题
+SCOUT/                              # 当前分支:impl/scout-stage1
+├── README.md                       # 本文件
+├── train.py                        # LPB 训练入口（hydra + OmegaConf）
+├── configs/                        # base DP 等 yaml 配置（如 base_dp_lift_image.yaml）
+├── diffusion_policy/               # 【LPB 复用】base DP：DiffusionUnetHybridImagePolicy + workspace + env_runner
+├── dyn_model/                      # 【LPB 复用】E_s 前端：ResNetEncoder + proprio embed + robomimic image dataset
+├── scout/                          # 【SCOUT 自研】
+│   ├── model/                      #   scout_vib（VIB dynamics）、encoder（StateEncoder）、vib（VIB enc / D_s）
+│   ├── guidance/                   #   policy（ScoutPolicy）、planner（ScoutPlanner）、cost（‖z−μ‖）
+│   └── eval/                       #   rollout、metrics、self_improvement（multi-round 闭环）
+└── idea/                           # 研究构思 + 落地计划 + 组会笔记
+    ├── idea.md / idea_notes.md     #   导师原始 idea + 流程梳理
+    ├── scout_design.md             #   ★ 权威设计文档（LPB 对齐架构，冲突以此为准）
+    ├── stage1_plan.md / evaluation_plan.md
+    └── long_term_plan.md / group_meeting_notes.md
 ```
 
 > `SOE/`（学长基线代码）、`papers/`（参考论文 PDF）、`CLAUDE.md` / `.claude/`（本地工具配置）已按项目约定从本仓库中排除。
 
 ---
 
+## 环境配置（服务器 · uv）
+
+已在共享 GPU 服务器 `106.14.2.243:1022`（Ubuntu 22.04，8× NVIDIA H20，CUDA toolkit 12.6，驱动 550.54）上用 **uv** 验证通过。所有内容（venv、缓存、源码依赖）都装在 `/root/workspace/baojiachun/` 下，便于整体清理，不碰服务器上别的文件。
+
+> **为什么不用 SOE 写死的 Python 3.8 + torch 1.13？** 这台机器是 H20 卡（Hopper, sm_90），torch 1.13 的预编译包没有这块卡的算力核，**装上也用不了 GPU**。必须升到 torch 2.x。实测 **Python 3.10 + torch 2.4.1+cu121** 在 H20 上稳定可用；SCOUT 复用的 LPB 代码（`diffusion_policy/`、`robomimic`）是纯 Python，对版本不挑。
+
+> **网络**：该服务器在国内，官方 `download.pytorch.org` 和 `github.com` 都连不上/不稳，只有国内镜像（清华 TUNA、fb 的 CloudFront）可达。下面全程走镜像。
+
+### 0. 前置（服务器已有）
+`uv 0.11.14`、系统 Python 3.10、`/usr/local/cuda`（nvcc 12.6 + gcc 11.4）。
+
+### 1. 建独立 venv（缓存/Python 都收在 baojiachun 里）
+```bash
+cd /root/workspace/baojiachun
+export UV_CACHE_DIR=/root/workspace/baojiachun/.uv-cache
+export UV_PYTHON_INSTALL_DIR=/root/workspace/baojiachun/.uv-python
+uv venv --python 3.10 .venv
+export VIRTUAL_ENV=/root/workspace/baojiachun/.venv   # 之后所有 uv pip 都进这个 venv
+MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 2. 装 PyTorch（默认 cu121 版，driver 550 可跑 H20）
+```bash
+uv pip install --python .venv/bin/python --index-url $MIRROR torch==2.4.1 torchvision==0.19.1
+# 验证：.venv/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# 期望：True NVIDIA H20
+```
+
+### 3. robomimic 源码（固定 commit，跟 SOE 一致）
+```bash
+mkdir -p dependencies && cd dependencies
+git clone https://github.com/ARISE-Initiative/robomimic.git
+cd robomimic && git checkout 9273f9cce85809b4f49cb02c6b4d4eeb2fe95abb && cd ../..
+```
+> 服务器连不上 GitHub 时，可在能联网的机器上 clone 好再用 `rsync`/`scp` 传上去（或临时挂代理）；`dependencies/robomimic` 是源码目录，不进 git。
+
+### 4. 核心依赖（版本钉死，理由见下方「坑」）
+```bash
+uv pip install --python .venv/bin/python --index-url $MIRROR \
+  "numpy<2" "zarr<3" "mujoco<3" \
+  diffusers==0.27.2 "huggingface-hub==0.24.6" transformers==4.44.2 \
+  hydra-core einops scipy scikit-learn opencv-python matplotlib tqdm wandb \
+  dill imageio av easydict
+```
+
+### 5. robosuite / robomimic 用 `--no-deps`（见「坑」），再补漏的轻量依赖
+```bash
+uv pip install --python .venv/bin/python --index-url $MIRROR --no-deps robosuite==1.4.1
+uv pip install --python .venv/bin/python --index-url $MIRROR --no-deps -e dependencies/robomimic
+uv pip install --python .venv/bin/python --index-url $MIRROR \
+  termcolor absl-py transforms3d fastjsonschema jsonschema numba
+```
+
+### 6. pytorch3d（用 fb 预编译 wheel，免源码编译）
+GitHub 源码下不动、源码编译又慢，直接装 fb 发布的预编译 wheel（py3.10 + cu121 + torch2.4，与本项目完全匹配）：
+```bash
+uv pip install --python .venv/bin/python \
+  --find-links https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt240/download.html \
+  pytorch3d
+```
+
+### 7. 验证（全部 SCOUT/LPB 模块能 import + H20 能算）
+```bash
+cd /root/workspace/baojiachun/scout
+.venv/bin/python -c "
+import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))
+from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
+from dyn_model.models.resnet_encoder import ResNetEncoder
+from scout.model.scout_vib import ScoutVIB
+from scout.guidance.planner import ScoutPlanner
+from scout.guidance.policy import ScoutPolicy
+import scout.eval.rollout, scout.eval.self_improvement
+print('ALL_IMPORTS_OK')
+"
+```
+
+### 已验证版本（2026-08-10）
+
+| 组件 | 版本 |
+|---|---|
+| Python / uv | 3.10.12 / 0.11.14 |
+| torch / torchvision | 2.4.1+cu121 / 0.19.1 |
+| numpy / scipy / scikit-learn | 1.26.4 / 1.15.3 / 1.7.2 |
+| diffusers / transformers / huggingface-hub | 0.27.2 / 4.44.2 / 0.24.6 |
+| hydra-core / omegaconf / einops | 1.3.5 / 2.3.1 / 0.8.2 |
+| zarr / opencv-python / matplotlib | 2.18.3 / 4.11.0.86 / 3.10.9 |
+| wandb / tqdm / dill / imageio / av | 0.28.1 / 4.70.0 / 0.4.1 / 2.37.4 / 17.1.0 |
+| robomimic（源码 @9273f9c）/ robosuite / mujoco / numba | 0.3.0 / 1.4.1 / 2.3.7 / 0.66.0 |
+| pytorch3d / easydict | 0.7.8 / 1.13 |
+
+### 几个坑（踩过，记录在此防再踩）
+- **H20 vs torch1.13**：见上，必须 torch 2.x，否则 `cuda.is_available()` 假、或跑起来 `no kernel image`。
+- **`numpy<2`**：torch 2.4 本身兼容 numpy2，但 robomimic / pytorch3d / diffusers 在 numpy2 下不稳，钉 1.26.4。
+- **`zarr<3`**：LPB 的 `replay_buffer` / `normalizer` 用 zarr 2.x API，3.x 改了。
+- **`mujoco<3`**：robosuite 1.4.1 配 mujoco 2.3.x；3.x 有 breaking change。
+- **`huggingface-hub==0.24.6`**：diffusers 0.27.2 用了已删除的 `cached_download`，新版 hub 直接 ImportError。
+- **`transformers==4.44.2`**：LPB base DP 的 `diffusion_policy/common/language_models.py` 要 transformers；选与 hub 0.24.6 兼容的版本。
+- **`robosuite --no-deps`**：robosuite 1.4.1 会拉 `pynput → evdev`，evdev 源码编译要 `Python.h`（得 `apt install python3.10-dev`，属系统改动，共享服务器上不宜做）。SCOUT 不用 pynput（那是真机遥操），故 `--no-deps` 跳过，手动补 `termcolor / numba / transforms3d / absl-py / fastjsonschema`。
+- **pytorch3d**：GitHub 源码下不动；`rotation_transformer.py` 只用到 `pytorch3d.transforms`，fb 预编译 wheel 足够，免去 30 分钟源码编译。
+- **镜像**：官方 `download.pytorch.org` 与 `github.com` 在此服务器都连不上；PyPI 系走 TUNA，pytorch3d 走 fbaipublicfiles（CloudFront 可达）。
+
+### 日常使用
+```bash
+cd /root/workspace/baojiachun/scout
+source /root/workspace/baojiachun/.venv/bin/activate   # 或直接 .venv/bin/python
+# python train.py --config-name=...            # E0：训 LPB base DP
+# python -m scout.train_vib                    # E1：训 VIB dynamics
+# python -m scout.eval.self_improvement        # E4：multi-round loop
+```
+> 环境（import + CUDA）已验证；**真正跑训练/评估还缺数据与 ckpt**：需要 robomimic lift image 数据（`image_v141.hdf5`）和一个训好的 base-DP checkpoint，以及 5 个集成点的真实验证（见 `idea/` 计划）。这部分待后续。
+
+---
+
 ## 状态
 
-🚧 **早期研究阶段（idea + 规划）**。当前仓库仅含研究构思与落地计划；核心代码（VIB 动力学模型 policy 类、classifier guidance 去噪路径、multi-round 编排）尚待实现，将以冻结的 SOE base DP 为起点。落地路线见 `idea/long_term_plan.md`。
+✅ **Stage-1 已实现（branch `impl/scout-stage1`）。** SCOUT 三件套 —— VIB 动力学模型（`scout/model/`）、classifier guidance 去噪路径（`scout/guidance/`）、multi-round self-improvement 闭环 + eval（`scout/eval/`）—— 均已落地，采用 **LPB 对齐架构**：base DP 复用 LPB 的 `DiffusionUnetHybridImagePolicy`（冻结，其 ResNet 给 `E_s` 复用）；dynamics 是 SCOUT 自研的 VIB（`VIB_enc → z → D_s` + latent MSE + βKL），与 LPB 的确定性 embedding 结构不同，未 fork。每步 mock/合成验证通过。服务器环境（uv，py3.10 / torch 2.4.1+cu121）已配好并验证：SCOUT/LPB 全模块 import + H20 CUDA（见上方「环境配置」）。
+
+⏳ **真实验 deferred。** E0 base DP 训练 / E1 β 扫描 + 生死诊断 / E4 multi-round loop 尚未实跑 —— 缺 robomimic lift **image** 数据、训好的 base-DP checkpoint，以及 5 个集成点（robomimic env adapter、LPB ckpt load、core demo 提取、round warm-start、ScoutPolicy 实例化）的真实验证。落地路线见 `idea/long_term_plan.md`，**权威设计见 `idea/scout_design.md`**（正文若与之冲突，以 `scout_design.md` 为准）。
 
 ---
 
