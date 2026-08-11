@@ -359,8 +359,11 @@ def evaluate_exploration(exploration_adapter, env_factory: Callable[[], Any],
                      "successful_trajs": [], "all_trajs": [],
                      "baseline_solved": False}
             for _ in range(try_times):
+                # record obs/next_obs: successful exploration rollouts feed the
+                # augmented-hdf5 write-back (SOE run_full_multi_round pattern).
                 success, traj = rollout_episode(exploration_adapter, env, horizon,
-                                                initial_state_dict=sd)
+                                                initial_state_dict=sd,
+                                                record_obs=True)
                 entry["n_tries"] += 1
                 entry["all_trajs"].append(traj)
                 if success:
