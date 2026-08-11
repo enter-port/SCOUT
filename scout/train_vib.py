@@ -165,11 +165,28 @@ def _slice_transition(batch, device, img_transform=None):
     return obs_t, a_t, obs_tp1
 
 
+@torch.no_grad()
+def eval_val_mse(model, val_loader, device, val_img_transform):
+    """Mean latent_mse over the val split (model.eval; restores train() after).
+
+    Held-out demos -> distinguishes trivial-prediction (val~train~0) from
+    overfitting (val >> train). Uses the center-crop val transform (no random aug).
+    """
+    if val_loader is None:
+        return None
+    model.eval()
+    mses = [model(*_slice_transition(b, device, val_img_transform))["latent_mse"].item()
+            for b in val_loader]
+    model.train()
+    return float(np.mean(mses)) if mses else None
+
+
 # --------------------------------------------------------------------------- #
 # VIB training (single β; no diagnostic -- stage1_plan.md Step 1)
 # --------------------------------------------------------------------------- #
-def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta,
-                   device, out_dir, img_transform=None, wandb_run=None):
+def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
+                   device, out_dir, train_t=None, val_t=None, val_every=20,
+                   wandb_run=None):
     E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
         action_dim=action_dim,
@@ -185,13 +202,13 @@ def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta,
     steps_per_epoch = int(cfg.steps_per_epoch)
     num_epochs = int(cfg.num_epochs)
     log_every_batch = max(1, steps_per_epoch // 5)
-    history = {"latent_mse": [], "kl": [], "mu_abs": []}
+    history = {"latent_mse": [], "kl": [], "mu_abs": [], "val_mse": []}
 
     model.train()
     for epoch in range(num_epochs):
         ep = {"latent_mse": 0.0, "kl": 0.0, "mu_abs": 0.0, "n": 0}
-        for it, batch in enumerate(loader):
-            obs_t, A_t, obs_tp1 = _slice_transition(batch, device, img_transform)
+        for it, batch in enumerate(train_loader):
+            obs_t, A_t, obs_tp1 = _slice_transition(batch, device, train_t)
             out = model(obs_t, A_t, obs_tp1)
             opt.zero_grad(); out["loss"].backward(); opt.step()
 
@@ -206,25 +223,40 @@ def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta,
         history["latent_mse"].append(ep["latent_mse"] / n)
         history["kl"].append(ep["kl"] / n)
         history["mu_abs"].append(ep["mu_abs"] / n)
+
+        # val on held-out demos: trivial-prediction (val~train) vs overfit (val>>train)
+        val_mse = None
+        do_val = val_loader is not None and (
+            epoch % max(1, val_every) == 0 or epoch == num_epochs - 1)
+        if do_val:
+            val_mse = eval_val_mse(model, val_loader, device, val_t)
+            history["val_mse"].append(val_mse)
         print(f"  [β={beta:g}] epoch {epoch:4d} | latent_mse {history['latent_mse'][-1]:.4f} "
-              f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}")
+              f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}"
+              + (f" | val_mse {val_mse:.4f}" if val_mse is not None else ""))
         if wandb_run is not None:
-            wandb_run.log({"latent_mse": history["latent_mse"][-1],
-                           "kl": history["kl"][-1],
-                           "mu_abs": history["mu_abs"][-1]}, step=epoch)
+            log_d = {"latent_mse": history["latent_mse"][-1],
+                     "kl": history["kl"][-1],
+                     "mu_abs": history["mu_abs"][-1]}
+            if val_mse is not None:
+                log_d["val_mse"] = val_mse
+            wandb_run.log(log_d, step=epoch)
 
     # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1)
     torch.save({"state_dict": model.state_dict(), "beta": beta},
                os.path.join(out_dir, "scout_vib.ckpt"))
     plot_curves(history, ["latent_mse", "kl"], f"VIB losses (β={beta:g})",
                 os.path.join(out_dir, "losses.png"))
+    plot_curves(history, ["val_mse"], f"val latent_mse (β={beta:g})",
+                os.path.join(out_dir, "val_mse.png"))
     plot_curves(history, ["mu_abs"], f"|μ| (β={beta:g})",
                 os.path.join(out_dir, "mu.png"))
 
     return {"beta": beta,
             "latent_mse": history["latent_mse"][-1],
             "kl": history["kl"][-1],
-            "mu_abs": history["mu_abs"][-1]}
+            "mu_abs": history["mu_abs"][-1],
+            "val_mse": history["val_mse"][-1] if history["val_mse"] else None}
 
 
 def run(cfg):
@@ -239,18 +271,42 @@ def run(cfg):
     beta = float(cfg.get("beta", 1.0e-3))
     print(f"beta = {beta:g}  (single-β flow; no scan, no diagnostic)")
 
-    # per-sample image transform (matches base DP crop). LPB applies it in the
-    # train loop (dyn_model/train.py:438), not the dataset, so SCOUT wires it
-    # here. None => feed full image (ResNet adaptive-pool is size-agnostic).
-    from dyn_model.datasets.img_transforms import get_train_crop_transform_resnet
+    # train/val image transforms (random crop train, center crop val).
+    from dyn_model.datasets.img_transforms import (
+        get_train_crop_transform_resnet, get_eval_crop_transform_resnet)
+    train_t = val_t = None
     if bool(getattr(cfg.dataset, "use_crop", False)):
-        img_transform = get_train_crop_transform_resnet(
+        train_t = get_train_crop_transform_resnet(
             int(cfg.dataset.original_img_size), int(cfg.dataset.cropped_img_size))
-        print(f"img_transform: RandomCrop({cfg.dataset.cropped_img_size}) "
-              f"on {cfg.dataset.original_img_size} (per-sample, matches base DP)")
+        val_t = get_eval_crop_transform_resnet(
+            int(cfg.dataset.original_img_size), int(cfg.dataset.cropped_img_size))
+        print(f"img_transform: RandomCrop({cfg.dataset.cropped_img_size}) train / "
+              f"CenterCrop val, on {cfg.dataset.original_img_size}")
     else:
-        img_transform = None
         print("img_transform: none (full image)")
+
+    # episode-level train/val split: hold out the last val_ratio of demos for val
+    # (anchors whose frame index >= the first val episode's start belong to val).
+    from torch.utils.data import DataLoader, Subset
+    val_ratio = float(getattr(cfg, "val_ratio", 0.1))
+    n_eps = len(ds.episode_start_indices)
+    n_val_eps = max(1, int(round(n_eps * val_ratio))) if n_eps > 1 else 0
+    if 0 < n_val_eps < n_eps:
+        cutoff = int(ds.episode_start_indices[n_eps - n_val_eps])
+        anchors = ds.valid_anchor_indices
+        train_idx = np.where(anchors < cutoff)[0]
+        val_idx = np.where(anchors >= cutoff)[0]
+    else:
+        train_idx = np.arange(len(ds))
+        val_idx = np.array([], dtype=np.int64)
+    nw = int(getattr(cfg.dataset, "num_workers", 0))
+    train_loader = DataLoader(Subset(ds, train_idx), batch_size=int(cfg.batch_size),
+                              shuffle=True, num_workers=nw, drop_last=True)
+    val_loader = (DataLoader(Subset(ds, val_idx), batch_size=int(cfg.batch_size),
+                             shuffle=False, num_workers=nw)
+                  if len(val_idx) > 0 else None)
+    print(f"split: {len(train_idx)} train / {len(val_idx)} val anchors "
+          f"({n_val_eps}/{n_eps} demos held out for val)")
 
     run_root = os.path.join(cfg.save_dir, time.strftime("%Y%m%d-%H%M%S", time.localtime()))
     os.makedirs(run_root, exist_ok=True)
@@ -270,9 +326,11 @@ def run(cfg):
     else:
         print("wandb: disabled")
 
+    val_every = int(getattr(cfg, "val_every", 20))
     print(f"\n=== training β={beta:g} ===")
-    s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, device, run_root,
-                       img_transform=img_transform, wandb_run=wandb_run)
+    s = train_one_beta(cfg, train_loader, val_loader, ds, cfg, action_dim, beta, device,
+                       run_root, train_t=train_t, val_t=val_t, val_every=val_every,
+                       wandb_run=wandb_run)
     print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
           f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 
@@ -280,7 +338,7 @@ def run(cfg):
         yaml.safe_dump(to_plain(s), f, default_flow_style=False)
     if wandb_run is not None:
         wandb_run.log({"final/latent_mse": s["latent_mse"], "final/kl": s["kl"],
-                       "final/mu_abs": s["mu_abs"]})
+                       "final/mu_abs": s["mu_abs"], "final/val_mse": s.get("val_mse")})
         wandb_run.finish()
     print(f"run_root: {run_root}")
     return run_root

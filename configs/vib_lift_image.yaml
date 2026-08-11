@@ -56,6 +56,8 @@ optimizer:
 batch_size: 256
 num_epochs: 300             # ~9.4k lift transitions; 300×200×256 ≈ 1.6k passes (tune by loss)
 steps_per_epoch: 200
+val_ratio: 0.1             # hold out last 10% of demos for val (episode-level)
+val_every: 20              # eval val latent_mse every N epochs
 
 save_dir: /root/workspace/baojiachun/scout/data/outputs/vib_lift
 
