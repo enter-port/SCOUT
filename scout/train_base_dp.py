@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 
@@ -162,8 +163,11 @@ def train(
     abs_log_dir = os.path.abspath(
         log_dir or merged.get("hydra.run.dir")
         or os.path.join("logs", config_name, "run"))
+    # use the SAME interpreter running this process (the venv python with hydra /
+    # robomimic installed); bare "python" would resolve to system python when the
+    # launcher is invoked via the venv's absolute path (venv not on PATH).
     cmd = [
-        "python", LPB_TRAIN_PY,
+        sys.executable, LPB_TRAIN_PY,
         "--config-path", os.path.abspath(config_dir),
         "--config-name", config_name,
     ] + overrides
