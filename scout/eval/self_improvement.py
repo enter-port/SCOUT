@@ -418,6 +418,10 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
                 grip = acts[..., 9:10]
                 acts = np.concatenate([pos, rot_aa, grip], axis=-1)   # (T,7)
             grp.create_dataset("actions", data=acts)
+            # abs_actions: same 7-dim absolute aa (the policy emits absolute
+            # actions; the loader reads THIS key for training when abs_action=
+            # true, and reads demo['actions'] only for episode length).
+            grp.create_dataset("abs_actions", data=acts)
             grp.create_dataset("done",
                                data=np.asarray(rollout["dones"], dtype=bool))
             grp.create_dataset("success",
