@@ -530,10 +530,14 @@ def make_default_env_factory(cfg: EasyDict) -> EnvFactory:
                                cfg.base_dp.config_name + ".yaml")
     with open(config_path) as f:
         lpb_cfg = OmegaConf.create(yaml.safe_load(f))
+    # n_obs_steps + abs_action come from the base-DP config (the policy's
+    # obs-stacking + the env's abs controller must match training).
     return make_robomimic_env_factory(
         dataset_path=OmegaConf.select(lpb_cfg, "task.dataset_path",
                                       default=cfg.dataset.path),
         shape_meta=OmegaConf.to_container(lpb_cfg.shape_meta, resolve=True),
+        n_obs_steps=int(OmegaConf.select(lpb_cfg, "n_obs_steps", default=2)),
+        abs_action=bool(OmegaConf.select(lpb_cfg, "abs_action", default=False)),
     )
 
 

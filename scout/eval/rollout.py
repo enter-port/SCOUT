@@ -374,43 +374,84 @@ def evaluate_exploration(exploration_adapter, env_factory: Callable[[], Any],
 # robomimic env factory (LPB robomimic_image_runner reuse; lazy-imported)
 # --------------------------------------------------------------------------- #
 class RobomimicScoutEnvAdapter:
-    """Adapt LPB :class:`RobomimicImageWrapper` to the SCOUT env contract.
+    """Adapt :class:`RobomimicImageWrapper` to the SCOUT env contract
+    (:func:`rollout_episode`): ``reset`` / ``reset_to`` / ``step`` /
+    ``is_success`` / ``get_state``, with obs returned as per-key
+    ``(n_obs_steps, *shape)`` numpy arrays -- the layout the LPB
+    ``DiffusionUnetHybridImagePolicy.predict_action`` expects.
 
-    LPB's wrapper exposes ``reset``/``step``/``get_flattened_state``/
-    ``get_success_label``; SCOUT's :func:`rollout_episode` also needs
-    ``reset_to(state_dict)`` + ``get_state()`` + ``is_success()["task"]``. This
-    thin shim wires those (used by :func:`make_robomimic_env_factory`).
+    The n_obs_steps stacking is managed HERE (a bounded obs buffer) rather than
+    via a :class:`MultiStepWrapper`, so the per-step rollout + the SOE
+    ``reset_to(start_state)`` replay both work on the same env
+    (MultiStepWrapper's reset/step API has no reset_to). On reset the first frame
+    is repeated to fill the buffer (matches MultiStepWrapper's pad behaviour).
 
-    ``model_file`` (robomimic sim) is forwarded to ``env.reset_to`` when present
-    (matches the wrapper's internal reset path).
+    abs_action: the policy emits 10-dim abs_6drot actions (3 trans + 6 rot_6d +
+    1 gripper) but the robomimic controller (``control_delta=False``, set in the
+    factory) consumes 7-dim axis-angle -- this adapter converts per step,
+    mirroring the LPB runner's ``undo_transform_action``.
     """
 
-    def __init__(self, wrapper):
+    def __init__(self, wrapper, n_obs_steps: int = 2, abs_action: bool = False):
         self.wrapper = wrapper
         self.env = wrapper.env
-        self.rollout_exceptions = ()  # robomimic numerical instability swallows
-
-    def _model_file(self):
-        return getattr(self.wrapper, "model_file", None)
-
-    def reset(self):
-        # random reset (init_state=None, no seed) -- the wrapper handles caching.
-        self.wrapper.init_state = None
-        self.wrapper._seed = None
-        return self.wrapper.reset()
-
-    def reset_to(self, state_dict):
-        self.wrapper.init_state = None
-        self.wrapper._seed = None
-        mf = self._model_file()
-        if mf is None:
-            raw_obs = self.env.reset_to({"states": state_dict})
+        self.n_obs_steps = int(n_obs_steps)
+        self.abs_action = bool(abs_action)
+        self.rollout_exceptions = ()  # robomimic numerical-instability swallows
+        if self.abs_action:
+            from diffusion_policy.model.common.rotation_transformer import (
+                RotationTransformer,)
+            # forward = aa->6d (dataset); .inverse = 6d->aa (policy->env), same
+            # convention as the LPB runner's undo_transform_action.
+            self._rot = RotationTransformer("axis_angle", "rotation_6d")
         else:
-            raw_obs = self.env.reset_to({"states": state_dict, "model": mf})
-        return self.wrapper.get_observation(raw_obs)
+            self._rot = None
+        self._obs_buffer: List[dict] = []
+
+    # -- obs stacking: per-key (n_obs_steps, *shape) ----------------------- #
+    def _stack(self) -> dict:
+        from diffusion_policy.gym_util.multistep_wrapper import stack_last_n_obs
+        keys = self._obs_buffer[0].keys()
+        return {k: stack_last_n_obs([o[k] for o in self._obs_buffer],
+                                    self.n_obs_steps)
+                for k in keys}
+
+    def _seed_buffer(self, obs: dict):
+        self._obs_buffer = [obs] * self.n_obs_steps   # pad with the first frame
+
+    # -- SCOUT env contract ------------------------------------------------ #
+    def reset(self) -> dict:
+        # random reset (init_state=None, no seed) -- the wrapper caches states.
+        self.wrapper.init_state = None
+        self.wrapper._seed = None
+        obs = self.wrapper.reset()
+        self._seed_buffer(obs)
+        return self._stack()
+
+    def reset_to(self, state) -> dict:
+        # deterministic replay: wrapper.reset() uses init_state -> env.reset_to.
+        self.wrapper.init_state = np.asarray(state)
+        self.wrapper._seed = None
+        obs = self.wrapper.reset()
+        self._seed_buffer(obs)
+        return self._stack()
+
+    def _to_env_action(self, action) -> np.ndarray:
+        a = np.asarray(action)
+        if not self.abs_action:
+            return a
+        d_rot = a.shape[-1] - 4                        # 10 -> 6 (rot_6d portion)
+        pos = a[..., :3]
+        rot = np.asarray(self._rot.inverse(a[..., 3:3 + d_rot]))  # rot_6d -> aa
+        gripper = a[..., [-1]]
+        return np.concatenate([pos, rot, gripper], axis=-1)
 
     def step(self, action):
-        return self.wrapper.step(action)
+        env_action = self._to_env_action(action)
+        obs, reward, done, info = self.wrapper.step(env_action)
+        self._obs_buffer.append(obs)
+        self._obs_buffer = self._obs_buffer[-self.n_obs_steps:]
+        return self._stack(), reward, done, info
 
     def is_success(self):
         return {"task": bool(self.wrapper.get_success_label())}
@@ -424,17 +465,20 @@ class RobomimicScoutEnvAdapter:
 
 
 def make_robomimic_env_factory(dataset_path: str, shape_meta: dict,
+                               n_obs_steps: int = 2,
+                               abs_action: bool = False,
                                render_obs_key: str = "agentview_image"
                                ) -> Callable[[], Any]:
     """Build a :class:`RobomimicScoutEnvAdapter` factory (real robomimic run).
 
-    Reuses the LPB ``robomimic_image_runner.create_env`` env-construction path
-    (env_meta from dataset + ``EnvUtils.create_env_from_metadata``). Lazy-imported
-    so this module imports cleanly without robomimic/mujoco installed.
+    Reuses the LPB env-construction path (env_meta from dataset +
+    ``EnvUtils.create_env_from_metadata``). For ``abs_action`` it sets
+    ``controller_configs.control_delta=False`` (absolute controller) -- mirrors
+    the LPB ``robomimic_image_runner``. Lazy-imported so this module imports
+    cleanly without robomimic/mujoco installed.
     """
     def factory() -> Any:
         import collections
-        import h5py
         import robomimic.utils.file_utils as FileUtils
         import robomimic.utils.env_utils as EnvUtils
         import robomimic.utils.obs_utils as ObsUtils
@@ -444,6 +488,8 @@ def make_robomimic_env_factory(dataset_path: str, shape_meta: dict,
 
         env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
         env_meta["env_kwargs"]["use_object_obs"] = False
+        if abs_action:
+            env_meta["env_kwargs"]["controller_configs"]["control_delta"] = False
 
         modality_mapping = collections.defaultdict(list)
         for key, attr in shape_meta["obs"].items():
@@ -459,7 +505,8 @@ def make_robomimic_env_factory(dataset_path: str, shape_meta: dict,
             env=robomimic_env, shape_meta=shape_meta, init_state=None,
             render_obs_key=render_obs_key,
         )
-        return RobomimicScoutEnvAdapter(wrapper)
+        return RobomimicScoutEnvAdapter(wrapper, n_obs_steps=n_obs_steps,
+                                        abs_action=abs_action)
 
     return factory
 
