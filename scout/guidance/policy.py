@@ -187,12 +187,21 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             # (task verify step 2). Caller can pass z explicitly for full
             # reproducibility (E2 z-set sweep).
             B = condition_data.shape[0]
+            # z precedence: explicit ``z`` arg  >  caller-locked ``planner.z``
+            # (per-trajectory skill, set via planner.set_z and held across ALL
+            # chunks of one rollout -- scout_design §1 "z 整段定住", distinct
+            # from SOE which resamples z per chunk)  >  fresh z~N(0,I) (per-chunk,
+            # SOE-style). ``planner.reset()`` between calls unlocks -> per-chunk.
+            if z is None:
+                z = self.scout_planner.z
             if z is None:
                 z = torch.randn(
                     size=(B, self.scout_planner.scout_vib.style_dim),
                     device=condition_data.device,
                     dtype=condition_data.dtype,
                 )
+            else:
+                z = z.to(device=condition_data.device, dtype=condition_data.dtype)
             self.scout_planner.set_z(z)
             # pre-encode s̄_t once (design §4: "s̄_t 定住") -- cached across
             # denoise steps; compute_loss reuses it instead of re-running the

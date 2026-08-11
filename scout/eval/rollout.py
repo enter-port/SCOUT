@@ -168,8 +168,10 @@ class GuidedAdapter(BaseDPAdapter):
     Same chunk/replay shell as :class:`BaseDPAdapter`, but each chunk is produced
     by :meth:`DiffusionUnetHybridImagePolicy.predict_action_dyn_guided`, which
     calls ScoutPolicy's overridden ``guided_conditional_sample`` (SCOUT cost +
-    gate (b) dropped). A fresh ``z ~ N(0,I)`` is sampled inside the policy per
-    inference call and held fixed across the chunk (scout_design.md §1, §4).
+    gate (b) dropped). A fresh skill latent ``z ~ N(0,I)`` is sampled per ROLLOUT
+    in :meth:`start_episode` and locked on the planner, held fixed across ALL
+    chunks of that rollout (scout_design.md §1; distinct from SOE which
+    resamples z per chunk).
 
     The SCOUT planner (carrying the frozen ScoutVIB + seam ①/②) is attached to
     the policy ONCE at construction (caller does
@@ -177,6 +179,22 @@ class GuidedAdapter(BaseDPAdapter):
     before passing the policy in). This class is agnostic to that -- it just
     calls ``predict_action_dyn_guided``.
     """
+
+    def start_episode(self):
+        """Reset chunk state + sample/lock a fresh skill latent for this rollout.
+
+        z is fixed across the whole rollout (one committed skill per trajectory,
+        scout_design §1); a new z is drawn on the next call. Real ScoutPolicy
+        only -- mock policies without a ``scout_planner`` are left untouched
+        (so rollout.py's mock smoke + self_improvement's dry-run still pass).
+        """
+        super().start_episode()
+        planner = getattr(self.dp, "scout_planner", None)
+        scout_vib = getattr(planner, "scout_vib", None) if planner is not None else None
+        if scout_vib is not None:
+            z = torch.randn(1, scout_vib.style_dim,
+                            device=self.device, dtype=torch.float32)
+            planner.set_z(z)
 
     def __call__(self, obs) -> np.ndarray:
         if self._chunk is None or self._t >= self.inference_horizon:
