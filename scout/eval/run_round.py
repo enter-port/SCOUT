@@ -122,6 +122,11 @@ def main():
                    help="default SCOUT-baseDP-{task}-exp1")
     p.add_argument("--log-root", default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--force-explore-all", action="store_true",
+                   help="smoke-only: guided exploration on ALL init states "
+                        "(ignores only_failed_of) so a tiny smoke exercises the "
+                        "guided + write-back + retrain path even if baseline "
+                        "solves everything. Real run leaves this off.")
     args = p.parse_args()
 
     cfg = load_cfg(args.config)
@@ -159,6 +164,7 @@ def main():
     loop = SelfImprovementLoop(
         cfg=cfg, dp_factory=dp_factory, scout_vib_factory=scout_vib_factory,
         env_factory=env_factory, retrain_fn=retrain_fn, device=device,
+        force_explore_all=args.force_explore_all,
     )
     # ONE exploration round (loop.run(1) does baseline + guided exploration +
     # metrics; it skips retrain after the last round -- we run it ourselves).

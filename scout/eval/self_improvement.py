@@ -94,7 +94,8 @@ class SelfImprovementLoop:
                  env_factory: EnvFactory,
                  retrain_fn: RetrainFn,
                  device: Optional[torch.device] = None,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 force_explore_all: bool = False):
         self.cfg = cfg
         self.dp_factory = dp_factory
         self.scout_vib_factory = scout_vib_factory
@@ -103,6 +104,11 @@ class SelfImprovementLoop:
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.verbose = verbose
+        # smoke-only: when True, guided exploration runs on ALL init states
+        # (only_failed_of=None) regardless of baseline -- lets a tiny smoke
+        # exercise the guided + write-back + retrain path even when the baseline
+        # happens to solve every init state. The real run leaves this False.
+        self.force_explore_all = force_explore_all
 
         # guidance / obs-adapter config (read once from cfg)
         self.guidance_scale = float(cfg.exploration.guidance_scale)
@@ -155,7 +161,7 @@ class SelfImprovementLoop:
             adapter, self.env_factory, init_states,
             horizon=int(self.cfg.eval.horizon),
             try_times=int(self.cfg.eval.try_times),
-            only_failed_of=baseline_results,
+            only_failed_of=(None if self.force_explore_all else baseline_results),
         )
 
     def _collect_successful(self,
