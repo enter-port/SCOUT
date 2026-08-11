@@ -23,10 +23,7 @@ dataset:
   original_img_size: 84
   cropped_img_size: 76
   action_dim: 10            # abs_6drot: 3 trans + 6 rot_6d + 1 gripper (per-step)
-  frameskip: 8              # predict s_{t+8}; action chunk = 8 steps (80-dim),
-                            # matching base DP n_action_steps=8. frameskip=1 makes
-                            # next-latent prediction trivial (s_{t+1}~=s_t) and z
-                            # collapses -- LPB uses 8.
+  frameskip: 8              # predict s_{t+8}; action chunk = 8 steps (80-dim) = base DP n_action_steps
   num_workers: 0            # torch shm "Operation not supported" -> 0 (known-good; data in-RAM)
   shape_obs:
     robot0_eef_pos:      {shape: [3]}
@@ -46,9 +43,8 @@ model:
   style_dim: 16             # VIB skill latent z
   hidden_dim: 128           # EncoderMLP hidden (SOE vqvae_modules default)
 
-beta: 1.0e-3                # single β (make-or-break knob). NO-GO at Step 4 ->
-                            # re-run scout.diagnose.sensitivity_ratio (β too large
-                            # => μ insensitive to a => guidance no-op).
+beta: 1.0e-3                # single β (KL pulls z -> N(0,I), which is the intended prior
+                            # so test can sample z~N(0,I)).
 
 optimizer:
   name: AdamW
