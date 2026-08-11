@@ -343,13 +343,47 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
         if not core_demos:
             raise RuntimeError(
                 f"no core demos under mask='{core_filter_key}' in {core_path}")
-        obs_keys = _discover_obs_keys(f["data"], core_demos[0])
+        core_obs_keys = set(_discover_obs_keys(f["data"], core_demos[0]))
+        # rollout obs carries only the policy's shape_meta keys (use_object_obs=
+        # False drops 'object' etc.); write the intersection so appended demos
+        # match what the DP loads. Core demos keep their full key set.
+        rollout_keys = set()
+        for _r in rollouts:
+            _ro = _r.get("obs") or []
+            if _ro:
+                rollout_keys |= set(_ro[0].keys())
+        obs_keys = sorted((core_obs_keys & rollout_keys) if rollout_keys
+                          else core_obs_keys)
         core_set = set(core_demos)
 
         # find next free demo id
         existing_ids = [int(d.split("_")[-1]) for d in f["data"].keys()
                         if d.startswith("demo_") and d.split("_")[-1].isdigit()]
         next_id = (max(existing_ids) + 1) if existing_ids else 0
+
+        # abs_action: rollout actions are the policy's 10-dim rot_6d output; the
+        # core hdf5 stores 7-dim axis-angle (the loader re-converts to 6d via
+        # abs_action=true). Transform back so the augmented hdf5 is consistent.
+        from diffusion_policy.model.common.rotation_transformer import (
+            RotationTransformer,)
+        rot = RotationTransformer("axis_angle", "rotation_6d")  # .inverse = 6d->aa
+
+        def _last_frame(o_k) -> np.ndarray:
+            """Last frame of an n_obs_steps windowed obs value -> current frame."""
+            return np.asarray(o_k, dtype=np.float32)[-1]
+
+        def _to_storage(k: str, frame) -> np.ndarray:
+            """rollout frame -> core hdf5 storage layout.
+
+            rollout image obs is (C,H,W) float (robomimic CHW); core stores
+            (H,W,C) uint8. low_dim obs is (D,) float either way.
+            """
+            if k.endswith("image"):
+                img = np.asarray(frame, dtype=np.float32)
+                if img.ndim == 3 and img.shape[0] == 3:
+                    img = np.transpose(img, (1, 2, 0))     # CHW -> HWC
+                return (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+            return np.asarray(frame, dtype=np.float32)
 
         new_demo_names: List[str] = []
         for rollout in rollouts:
@@ -360,30 +394,30 @@ def _write_augmented_hdf5(core_path: str, out_path: str,
                 continue
             grp = f["data"].create_group(demo_name)
             obs_list = rollout.get("obs") or []
+            next_obs_list = rollout.get("next_obs") or []
             if len(obs_list) < ep_len:
                 raise ValueError(
                     f"rollout for {demo_name} missing obs (need record_obs=True); "
                     f"got {len(obs_list)} frames, need {ep_len}")
             obs_grp = grp.create_group("obs")
-            # Per-key frame shape = core demo's obs/<k> shape minus the leading
-            # time dim (e.g. (3,84,84) for rgb, (3,) for a low_dim key). The env
-            # records windowed obs (n_obs_steps, *frame_shape) per step; we take
-            # the LAST frame of each window so the appended demo matches the
-            # core's (T, *frame_shape) layout. Robust to both image + low_dim.
-            core_obs_ref = f["data"][core_demos[0]]["obs"]
             for k in obs_keys:
-                frame_shape = core_obs_ref[k].shape[1:]
-                frame_size = int(np.prod(frame_shape)) if frame_shape else 1
-
-                def _to_frame(o_k, fs=frame_size, fshape=frame_shape):
-                    arr = np.asarray(o_k, dtype=np.float32).reshape(-1)
-                    return arr[-fs:].reshape(fshape)
-
                 obs_grp.create_dataset(
-                    k, data=np.stack(
-                        [_to_frame(o[k]) for o in obs_list[:ep_len]], axis=0))
-            grp.create_dataset("actions",
-                               data=np.asarray(rollout["actions"], dtype=np.float32))
+                    k, data=np.stack([_to_storage(k, _last_frame(o[k]))
+                                      for o in obs_list[:ep_len]], axis=0))
+            if next_obs_list:
+                next_grp = grp.create_group("next_obs")
+                for k in obs_keys:
+                    next_grp.create_dataset(
+                        k, data=np.stack([_to_storage(k, _last_frame(o[k]))
+                                          for o in next_obs_list[:ep_len]], axis=0))
+            # actions: 10-dim rot_6d -> 7-dim axis-angle (matches core storage).
+            acts = np.asarray(rollout["actions"], dtype=np.float32)   # (T,10)
+            if acts.shape[-1] == 10:
+                pos = acts[..., :3]
+                rot_aa = np.asarray(rot.inverse(acts[..., 3:9]))
+                grip = acts[..., 9:10]
+                acts = np.concatenate([pos, rot_aa, grip], axis=-1)   # (T,7)
+            grp.create_dataset("actions", data=acts)
             grp.create_dataset("done",
                                data=np.asarray(rollout["dones"], dtype=bool))
             grp.create_dataset("success",
