@@ -1,12 +1,13 @@
-"""E1: VIB joint training + β scan + life/death sensitivity
-(scout_design.md §3/§5, stage1_plan.md §三).
+"""Step 1: VIB dynamics joint training, single β (stage1_plan.md Step 1,
+scout_design.md §3).
 
-For each β in ``cfg.betas`` train a fresh :class:`ScoutVIB` on transitions drawn
-from LPB's :class:`RobomimicImageDynamicsModelDataset` (image + proprio), logging
-latent MSE / KL and μ mean/std. After training, compute
-:func:`sensitivity_ratio` and save ckpt + loss PNG. Finally plot sensitivity
-vs β to pick the largest β whose sensitivity ≥ ~0.3 (design §5; the
-make-or-break knob per §7 risk #1).
+Trains ONE :class:`ScoutVIB` (β = ``cfg.beta``, default 1e-3) on transitions
+drawn from LPB's :class:`RobomimicImageDynamicsModelDataset` (image + proprio),
+logging latent MSE / KL / |μ| and saving ckpt + loss PNGs. **No β scan, no
+life/death diagnostic** -- per the revised stage-1 plan (single β, run straight
+into Step 2). If Step 4 (base vs explore) is NO-GO, the first suspect is
+β too large -> guidance no-op; re-run :func:`scout.diagnose.sensitivity_ratio`
+then (it lives in its own module, not here).
 
 Loss = latent MSE + β·KL (latent-level target = ``E_s(S_{t+1}).detach()``;
 no AE / no reconstruction / no state decoder; scout_design.md §3). The frozen
@@ -150,39 +151,11 @@ def _slice_transition(batch, device, img_transform=None):
     return obs_t, a_t, obs_tp1
 
 
-def _sigma_a_from_dataset(ds):
-    """Mean per-dim std of raw actions -- the σ_a scale for sensitivity_ratio."""
-    return float(np.std(np.asarray(ds.actions), axis=0).mean())
-
-
 # --------------------------------------------------------------------------- #
-# per-β training
+# VIB training (single β; no diagnostic -- stage1_plan.md Step 1)
 # --------------------------------------------------------------------------- #
-def mu_stats(model, loader, device, img_transform, max_batches=4):
-    """Sample a few batches, return ``(obs_t, A_t, mu_mean, mu_abs_mean, sigma_mu)``."""
-    mus = []
-    obs_t_acc, a_t_acc = None, None
-    n = 0
-    for batch in loader:
-        obs_t, A_t, _ = _slice_transition(batch, device, img_transform)
-        with torch.no_grad():
-            s_bar = model.encode(obs_t)
-            mu, _ = model.vib_enc(s_bar, A_t)
-        mus.append(mu.detach())
-        if obs_t_acc is None:
-            obs_t_acc, a_t_acc = obs_t, A_t
-        n += 1
-        if n >= max_batches:
-            break
-    mu = torch.cat(mus, dim=0)
-    mu_mean = float(mu.mean())
-    sigma_mu = float(mu.std(dim=0).mean())
-    mu_abs_mean = float(mu.abs().mean())
-    return obs_t_acc, a_t_acc, mu_mean, mu_abs_mean, sigma_mu
-
-
-def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta, sigma_a,
-                   device, beta_dir, img_transform=None):
+def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta,
+                   device, out_dir, img_transform=None):
     E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
         action_dim=action_dim,
@@ -222,23 +195,18 @@ def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta, sigma_a,
         print(f"  [β={beta:g}] epoch {epoch:4d} | latent_mse {history['latent_mse'][-1]:.4f} "
               f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}")
 
-    # post-train diagnostics
-    obs_t, A_t, mu_mean, mu_abs_mean, sigma_mu = mu_stats(
-        model, loader, device, img_transform)
-    sr = sensitivity_ratio(model, obs_t, A_t, sigma_a, sigma_mu)
-
-    torch.save({"state_dict": model.state_dict(), "beta": beta,
-                "sensitivity": sr, "sigma_mu": sigma_mu, "sigma_a": sigma_a},
-               os.path.join(beta_dir, "scout_vib.ckpt"))
+    # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1)
+    torch.save({"state_dict": model.state_dict(), "beta": beta},
+               os.path.join(out_dir, "scout_vib.ckpt"))
     plot_curves(history, ["latent_mse", "kl"], f"VIB losses (β={beta:g})",
-                os.path.join(beta_dir, "losses.png"))
+                os.path.join(out_dir, "losses.png"))
     plot_curves(history, ["mu_abs"], f"|μ| (β={beta:g})",
-                os.path.join(beta_dir, "mu.png"))
+                os.path.join(out_dir, "mu.png"))
 
     return {"beta": beta,
             "latent_mse": history["latent_mse"][-1],
             "kl": history["kl"][-1],
-            "mu_abs": mu_abs_mean, "sigma_mu": sigma_mu, "sensitivity": sr}
+            "mu_abs": history["mu_abs"][-1]}
 
 
 def run(cfg):
@@ -250,36 +218,21 @@ def run(cfg):
     action_dim = ds.action_dim
     print(f"dataset: len={len(ds)} action_dim={action_dim} proprio_dim={ds.proprio_dim} "
           f"views={ds.view_names}")
-    sigma_a = _sigma_a_from_dataset(ds)
-    print(f"sigma_a (mean per-dim action std) = {sigma_a:.4f}")
+    beta = float(cfg.get("beta", 1.0e-3))
+    print(f"beta = {beta:g}  (single-β flow; no scan, no diagnostic)")
 
     run_root = os.path.join(cfg.save_dir, time.strftime("%Y%m%d-%H%M%S", time.localtime()))
     os.makedirs(run_root, exist_ok=True)
     with open(os.path.join(run_root, "config.yaml"), "w") as f:
         yaml.safe_dump(to_plain(cfg), f, default_flow_style=False)
 
-    summaries = []
-    for beta in cfg.betas:
-        beta_dir = os.path.join(run_root, f"beta_{beta:g}")
-        os.makedirs(beta_dir, exist_ok=True)
-        print(f"\n=== training β={beta:g} ===")
-        s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, sigma_a, device, beta_dir)
-        summaries.append(s)
-        print(f"=== β={beta:g} done | sensitivity={s['sensitivity']:.4f} "
-              f"sigma_mu={s['sigma_mu']:.4f} (sigma_a/sigma_mu={sigma_a/s['sigma_mu']:.4f}) ===")
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot([s["beta"] for s in summaries],
-            [s["sensitivity"] for s in summaries], "o-", linewidth=1.2)
-    ax.axhline(0.3, color="r", linestyle="--", linewidth=0.8, label="~0.3 threshold")
-    ax.set_xscale("log"); ax.set_xlabel("β"); ax.set_ylabel("sensitivity ratio")
-    ax.set_title("VIB life/death: sensitivity vs β"); ax.legend()
-    fig.tight_layout(); fig.savefig(os.path.join(run_root, "sensitivity_vs_beta.png"), dpi=120)
-    plt.close(fig)
+    print(f"\n=== training β={beta:g} ===")
+    s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, device, run_root)
+    print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
+          f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 
     with open(os.path.join(run_root, "summary.yaml"), "w") as f:
-        yaml.safe_dump(to_plain(summaries), f, default_flow_style=False)
-    print(f"\nsummaries:\n{yaml.safe_dump(to_plain(summaries), default_flow_style=False)}")
+        yaml.safe_dump(to_plain(s), f, default_flow_style=False)
     print(f"run_root: {run_root}")
     return run_root
 
