@@ -35,6 +35,11 @@ import torch.nn as nn
 import yaml
 from easydict import EasyDict
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from scout.diagnose import sensitivity_ratio
 from scout.model.encoder import StateEncoder
 from scout.model.scout_vib import ScoutVIB
@@ -164,7 +169,7 @@ def _slice_transition(batch, device, img_transform=None):
 # VIB training (single β; no diagnostic -- stage1_plan.md Step 1)
 # --------------------------------------------------------------------------- #
 def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta,
-                   device, out_dir, img_transform=None):
+                   device, out_dir, img_transform=None, wandb_run=None):
     E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
         action_dim=action_dim,
@@ -203,6 +208,10 @@ def train_one_beta(cfg, loader, ds, E_s_cfg, action_dim, beta,
         history["mu_abs"].append(ep["mu_abs"] / n)
         print(f"  [β={beta:g}] epoch {epoch:4d} | latent_mse {history['latent_mse'][-1]:.4f} "
               f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}")
+        if wandb_run is not None:
+            wandb_run.log({"latent_mse": history["latent_mse"][-1],
+                           "kl": history["kl"][-1],
+                           "mu_abs": history["mu_abs"][-1]}, step=epoch)
 
     # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1)
     torch.save({"state_dict": model.state_dict(), "beta": beta},
@@ -248,14 +257,31 @@ def run(cfg):
     with open(os.path.join(run_root, "config.yaml"), "w") as f:
         yaml.safe_dump(to_plain(cfg), f, default_flow_style=False)
 
+    # wandb (optional). Key isolation: the launch sources baojiachun/.secrets/wandb.env
+    # (WANDB_API_KEY / WANDB_CONFIG_DIR / WANDB_CACHE_DIR); nothing touches /root/.netrc.
+    wandb_run = None
+    if wandb is not None and bool(getattr(cfg, "use_wandb", True)):
+        wcfg = cfg.get("wandb", {}) or {}
+        wandb_run = wandb.init(
+            project=wcfg.get("project", "scout-dynamics"),
+            name=wcfg.get("name"), config=to_plain(cfg),
+            dir=cfg.save_dir, tags=list(wcfg.get("tags", ["step1", "vib"])))
+        print(f"wandb: project={wcfg.get('project', 'scout-dynamics')} name={wcfg.get('name')}")
+    else:
+        print("wandb: disabled")
+
     print(f"\n=== training β={beta:g} ===")
     s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, device, run_root,
-                       img_transform=img_transform)
+                       img_transform=img_transform, wandb_run=wandb_run)
     print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
           f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 
     with open(os.path.join(run_root, "summary.yaml"), "w") as f:
         yaml.safe_dump(to_plain(s), f, default_flow_style=False)
+    if wandb_run is not None:
+        wandb_run.log({"final/latent_mse": s["latent_mse"], "final/kl": s["kl"],
+                       "final/mu_abs": s["mu_abs"]})
+        wandb_run.finish()
     print(f"run_root: {run_root}")
     return run_root
 

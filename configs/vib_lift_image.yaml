@@ -58,3 +58,8 @@ num_epochs: 300             # ~9.4k lift transitions; 300×200×256 ≈ 1.6k pas
 steps_per_epoch: 200
 
 save_dir: /root/workspace/baojiachun/scout/data/outputs/vib_lift
+
+use_wandb: true
+wandb:
+  project: scout-dynamics
+  name: SCOUT-dyn-lift
