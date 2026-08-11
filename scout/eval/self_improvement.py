@@ -431,11 +431,23 @@ def make_lpb_dp_factory(device: Optional[torch.device] = None
         payload = torch.load(ckpt_path, map_location="cpu")
         cfg = payload["cfg"] if isinstance(payload, dict) and "cfg" in payload \
             else payload
-        policy = hydra.utils.instantiate(cfg.policy)
-        # state_dict slot: workspace ckpt uses payload["state_dicts"]["policy"];
-        # fall back to payload["policy"] / payload["state_dict"] for other savers.
-        sd = payload["state_dicts"]["policy"] if "state_dicts" in payload \
-            else payload.get("policy", payload.get("state_dict"))
+        # Build a ScoutPolicy (LPB DP subclass) -- NOT the parent -- so its
+        # guided_conditional_sample override is the one predict_action_dyn_guided
+        # resolves to. Override _target_ on the policy cfg; ScoutPolicy.__init__
+        # forwards all params to the LPB parent (scout_planner defaults None).
+        pcfg = OmegaConf.to_container(cfg.policy, resolve=True)
+        pcfg["_target_"] = "scout.guidance.policy.ScoutPolicy"
+        policy = hydra.utils.instantiate(pcfg)
+
+        # state_dict slot: the LPB workspace stores the policy under the "model"
+        # attribute (TrainDiffusionUnetHybridImageWorkspace: self.model), so
+        # payload["state_dicts"] keys are "model"/"ema_model"/"optimizer" -- NOT
+        # "policy". Fall back to "policy"/"state_dict" for other savers.
+        if "state_dicts" in payload:
+            sds = payload["state_dicts"]
+            sd = sds.get("model", sds.get("policy", sds.get("ema_model")))
+        else:
+            sd = payload.get("model", payload.get("policy", payload.get("state_dict")))
         policy.load_state_dict(sd, strict=False)
 
         # normalizer (sibling normalizer.pth next to the ckpt's checkpoints/ dir)
