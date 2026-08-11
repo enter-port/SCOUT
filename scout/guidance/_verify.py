@@ -115,8 +115,14 @@ def _build_harness(
 
     planner = ScoutPlanner(scout_vib=scout_vib, bridge=IdentityBridge())
 
-    # ScoutPolicy shell (LPB __init__ skipped -- no robomimic).
+    # ScoutPolicy shell (LPB __init__ skipped -- no robomimic). When robomimic
+    # IS present ScoutPolicy is a real nn.Module subclass, so Module.__init__
+    # must run before any Module attribute assignment (else "cannot assign module
+    # before Module.__init__"). On the no-robomimic host ScoutPolicy bases to
+    # `object` and this branch is skipped.
     policy = ScoutPolicy.__new__(ScoutPolicy)
+    if _LPB_AVAILABLE:
+        torch.nn.Module.__init__(policy)
     policy.model = _DummyModel()
     policy.noise_scheduler = DDPMScheduler(
         num_train_timesteps=num_train_timesteps,

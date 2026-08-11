@@ -480,14 +480,23 @@ def make_scout_vib_factory(cfg: EasyDict,
             proprio_emb_dim=int(getattr(vcfg, "proprio_emb_dim", 64)),
         )
         ckpt = torch.load(vcfg.ckpt_path, map_location="cpu")
+        # The VIB encoder was trained on the FLATTENED fs-step action chunk
+        # (train_vib._slice_transition: a_t = first `frameskip` per-step actions
+        # flattened, e.g. 8x10 = 80-dim), NOT the per-step action. So its action
+        # input dim is whatever was saved -- inferred here as (encoder first-
+        # layer width - s_bar_dim), NOT cfg.action_dim (10). Building with the
+        # per-step dim would mismatch the saved Linear weights (1168 vs 1098).
+        sd = ckpt["state_dict"]
+        enc_in = sd["vib_enc.net.encoder.0.weight"].shape[1]
+        action_dim = enc_in - int(E_s.s_bar_dim)
         model = ScoutVIB(
-            action_dim=int(cfg.action_dim),
+            action_dim=action_dim,
             E_s=E_s,
             style_dim=int(vcfg.style_dim),
             hidden_dim=int(getattr(vcfg, "hidden_dim", 128)),
             beta=float(ckpt.get("beta", 1.0e-3)),
         )
-        model.load_state_dict(ckpt["state_dict"])
+        model.load_state_dict(sd)
         return model.to(dev).eval()
 
     return factory
