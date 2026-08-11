@@ -33,6 +33,7 @@ out/
 results/
 wandb/
 runs/
+data/
 
 # ===== 编辑器 / OS =====
 .vscode/
