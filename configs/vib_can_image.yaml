@@ -52,4 +52,4 @@ save_dir: /root/workspace/baojiachun/scout/data/outputs/vib_can
 use_wandb: true
 wandb:
   project: scout-dynamics
-  name: SCOUT-dyn-can
+  name: SCOUT-dyn-can-1

@@ -52,4 +52,4 @@ save_dir: /root/workspace/baojiachun/scout/data/outputs/vib_square
 use_wandb: true
 wandb:
   project: scout-dynamics
-  name: SCOUT-dyn-square
+  name: SCOUT-dyn-square-1
