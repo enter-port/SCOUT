@@ -22,11 +22,11 @@
 # `task.dataset_path` at it. The key is kept here so hydra struct-mode accepts
 # the override; a real-run extension can wire it into the dataset loader.
 
-name: base_dp_lift_image
+name: base_dp_square_image
 _target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
 
 exp_name: "scout_e0"
-task_name: lift
+task_name: square
 dataset_type: ph
 abs_action: true
 train_filter_key: null     # SCOUT mask knob (SOE convention); ignored by LPB dataset
@@ -95,7 +95,7 @@ ema:
 # core_20 = pre-extracted core-only hdf5 (SOE extract_demo.py).
 task:
   name: ${task_name}
-  dataset_path: /root/workspace/baojiachun/data/robomimic/lift/ph/image_v141_abs_core10.hdf5
+  dataset_path: /root/workspace/baojiachun/data/robomimic/square/ph/image_v141_abs_core20.hdf5
   train_filter_key: ${train_filter_key}
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner
@@ -107,7 +107,7 @@ task:
     n_test: 50
     n_test_vis: 4
     test_start_seed: 100000
-    max_steps: 400
+    max_steps: 500
     n_obs_steps: ${n_obs_steps}
     n_action_steps: ${n_action_steps}
     render_obs_key: agentview_image

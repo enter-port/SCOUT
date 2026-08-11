@@ -13,6 +13,12 @@ from robomimic.config import config_factory
 
 
 def get_robomimic_model_file(env_name):
+    # The shipped square/transport/tool_hang xml files contain hardcoded author-local
+    # texture paths (/home/soroushn/...) that don't exist here -> edit_model_xml hangs.
+    # The default robosuite env model from create_env_from_metadata IS the robomimic
+    # v1.4.1 collection model (robomimic collected with robosuite default NutAssembly),
+    # so skip model override -> correct abs-action kinematics. Verified lift/can/square.
+    return None
 
     xml_base_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -96,7 +102,10 @@ class RobomimicAbsoluteActionConverter:
 
         env = self.env
         env.reset()
-        _ = env.reset_to({'states': states[0], 'model': self.model_file})
+        _reset = {'states': states[0]}
+        if self.model_file is not None:
+            _reset['model'] = self.model_file
+        _ = env.reset_to(_reset)
 
         # generate abs actions
         action_goal_pos = np.zeros(
