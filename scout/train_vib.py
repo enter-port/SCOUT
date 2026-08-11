@@ -105,7 +105,7 @@ def make_dataloader(cfg):
         zarr_path=d.zarr_path,
         num_hist=1,
         num_pred=1,
-        frameskip=1,
+        frameskip=int(getattr(d, "frameskip", 1)),
         view_names=list(d.view_names),
         abs_action=bool(getattr(d, "abs_action", False)),
         use_crop=bool(getattr(d, "use_crop", False)),
@@ -128,10 +128,13 @@ def make_dataloader(cfg):
 def _slice_transition(batch, device, img_transform=None):
     """LPD batch ``(obs, act, state)`` -> ``(obs_t, a_t, obs_tp1)`` on `device`.
 
-    Batch shapes (num_hist=num_pred=1, frameskip=1):
-      obs['visual'][v]: (B, 2, 3, H, W)  obs['proprio']: (B, 2, P)
-      act:              (B, 2, action_dim)                (both rows identical)
-    Slices frame 0 -> t, frame 1 -> t+1, keeps the T=1 dim E_s expects.
+    Batch shapes (num_hist=num_pred=1, frameskip=fs):
+      obs['visual'][v]: (B, 2, 3, H, W)  obs['proprio']: (B, 2, P)   # frames t, t+fs
+      act:              (B, 2*fs, step_dim)                          # per-step actions
+    Slices frame 0 -> t, frame 1 -> t+fs. The action fed to VIB_enc is the first
+    ``fs`` per-step actions flattened (B, fs*step_dim) -- the chunk that moves
+    s_t -> s_{t+fs}. frameskip=1 -> single action; frameskip=8 -> 80-dim chunk,
+    matching the base DP's n_action_steps=8 chunk so train/test mu(s,a) agree.
     """
     obs, act, _state = batch
     visual = obs["visual"]
@@ -150,7 +153,10 @@ def _slice_transition(batch, device, img_transform=None):
         "visual": {v: img[:, 1:2].to(device) for v, img in visual.items()},
         "proprio": proprio[:, 1:2].to(device),
     }
-    a_t = act[:, 0].to(device)
+    # action chunk for the transition: first `fs` per-step actions flattened
+    # (fs = frameskip; act is (B, 2*fs, step_dim) since num_hist=num_pred=1).
+    fs = act.shape[1] // 2
+    a_t = act[:, :fs].reshape(act.shape[0], -1).to(device)
     return obs_t, a_t, obs_tp1
 
 

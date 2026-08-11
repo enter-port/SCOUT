@@ -22,7 +22,11 @@ dataset:
                              # both frames of a transition share the crop offset.
   original_img_size: 84
   cropped_img_size: 76
-  action_dim: 10            # abs_6drot: 3 trans + 6 rot_6d + 1 gripper
+  action_dim: 10            # abs_6drot: 3 trans + 6 rot_6d + 1 gripper (per-step)
+  frameskip: 8              # predict s_{t+8}; action chunk = 8 steps (80-dim),
+                            # matching base DP n_action_steps=8. frameskip=1 makes
+                            # next-latent prediction trivial (s_{t+1}~=s_t) and z
+                            # collapses -- LPB uses 8.
   num_workers: 0            # torch shm "Operation not supported" -> 0 (known-good; data in-RAM)
   shape_obs:
     robot0_eef_pos:      {shape: [3]}
