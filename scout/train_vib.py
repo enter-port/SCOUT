@@ -137,8 +137,11 @@ def _slice_transition(batch, device, img_transform=None):
     visual = obs["visual"]
     proprio = obs["proprio"]
     if img_transform is not None:
-        # apply per-view torchvision transform on (B,2,3,H,W) then back
-        visual = {v: img_transform(img) for v, img in visual.items()}
+        # per-sample crop: same random offset across the window's frames
+        # (mirrors LPB dyn_model/train.py:438 and base DP CropRandomizer). Apply
+        # BEFORE slicing t/t+1 so both frames of a sample share the crop offset.
+        visual = {v: torch.stack([img_transform(im) for im in vimg])
+                  for v, vimg in visual.items()}
     obs_t = {
         "visual": {v: img[:, 0:1].to(device) for v, img in visual.items()},
         "proprio": proprio[:, 0:1].to(device),
@@ -221,13 +224,27 @@ def run(cfg):
     beta = float(cfg.get("beta", 1.0e-3))
     print(f"beta = {beta:g}  (single-β flow; no scan, no diagnostic)")
 
+    # per-sample image transform (matches base DP crop). LPB applies it in the
+    # train loop (dyn_model/train.py:438), not the dataset, so SCOUT wires it
+    # here. None => feed full image (ResNet adaptive-pool is size-agnostic).
+    from dyn_model.datasets.img_transforms import get_train_crop_transform_resnet
+    if bool(getattr(cfg.dataset, "use_crop", False)):
+        img_transform = get_train_crop_transform_resnet(
+            int(cfg.dataset.original_img_size), int(cfg.dataset.cropped_img_size))
+        print(f"img_transform: RandomCrop({cfg.dataset.cropped_img_size}) "
+              f"on {cfg.dataset.original_img_size} (per-sample, matches base DP)")
+    else:
+        img_transform = None
+        print("img_transform: none (full image)")
+
     run_root = os.path.join(cfg.save_dir, time.strftime("%Y%m%d-%H%M%S", time.localtime()))
     os.makedirs(run_root, exist_ok=True)
     with open(os.path.join(run_root, "config.yaml"), "w") as f:
         yaml.safe_dump(to_plain(cfg), f, default_flow_style=False)
 
     print(f"\n=== training β={beta:g} ===")
-    s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, device, run_root)
+    s = train_one_beta(cfg, loader, ds, cfg, action_dim, beta, device, run_root,
+                       img_transform=img_transform)
     print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
           f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 

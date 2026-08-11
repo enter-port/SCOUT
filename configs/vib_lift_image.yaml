@@ -1,0 +1,60 @@
+# SCOUT Step 1: VIB dynamics joint training on robomimic `lift` image (FULL data).
+# Single β (1e-3), no diagnostic (stage1_plan.md Step 1).
+# Run: python -m scout.train_vib --config configs/vib_lift_image.yaml
+#
+# E_s reuses the FROZEN base-DP ResNet (ripped from base_dp_ckpt via LPB
+# ResNetEncoder) + a trained proprio Conv1d. Data = FULL lift image_v141_abs.hdf5
+# (all 200 demos, NOT core); the LPB RobomimicImageDynamicsModelDataset auto-caches
+# it to <hdf5>.zarr.zip on first load. target = E_s(S_{t+1}).detach().
+#
+# Obs spec mirrors base_dp_lift_image.yaml (E_s's ResNet came from that base DP,
+# so views/proprio must match): 2× rgb (3,84,84) + 9-dim proprio; abs_6drot action 10.
+
+seed: 233
+
+dataset:
+  zarr_path: /root/workspace/baojiachun/data/robomimic/lift/ph/image_v141_abs.hdf5
+  view_names: ['agentview_image', 'robot0_eye_in_hand_image']
+  abs_action: true
+  use_crop: true            # per-sample RandomCrop(76) on 84, matching base DP's
+                             # crop_shape [76,76]. train_vib wires the transform in
+                             # the train loop (LPB dyn_model/train.py:438 style), so
+                             # both frames of a transition share the crop offset.
+  original_img_size: 84
+  cropped_img_size: 76
+  action_dim: 10            # abs_6drot: 3 trans + 6 rot_6d + 1 gripper
+  num_workers: 0            # torch shm "Operation not supported" -> 0 (known-good; data in-RAM)
+  shape_obs:
+    robot0_eef_pos:      {shape: [3]}
+    robot0_eef_quat:     {shape: [4]}
+    robot0_gripper_qpos: {shape: [2]}
+    agentview_image:          {shape: [3, 84, 84], type: rgb}
+    robot0_eye_in_hand_image: {shape: [3, 84, 84], type: rgb}
+
+model:
+  E_s:
+    # lift base DP ckpt = epoch 580 (last saved; 590/600 don't exist). lift
+    # saturated at test_mean_score=1.0 from epoch 140, so any late ckpt is fine.
+    base_dp_ckpt: /root/workspace/baojiachun/scout/data/outputs/2026.08.11/10.57.00_base_dp_lift_image_lift/checkpoints/580.ckpt
+    view_names: ['agentview_image', 'robot0_eye_in_hand_image']
+    proprio_dim: 9          # eef_pos(3) + eef_quat(4) + gripper_qpos(2)
+    proprio_emb_dim: 64     # -> s_bar_dim = 512*2 + 64 = 1088
+  style_dim: 16             # VIB skill latent z
+  hidden_dim: 128           # EncoderMLP hidden (SOE vqvae_modules default)
+
+beta: 1.0e-3                # single β (make-or-break knob). NO-GO at Step 4 ->
+                            # re-run scout.diagnose.sensitivity_ratio (β too large
+                            # => μ insensitive to a => guidance no-op).
+
+optimizer:
+  name: AdamW
+  params:
+    lr: 1.0e-3              # VIB MLPs; base DP used 1e-4 (its own, frozen here)
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-6
+
+batch_size: 256
+num_epochs: 300             # ~9.4k lift transitions; 300×200×256 ≈ 1.6k passes (tune by loss)
+steps_per_epoch: 200
+
+save_dir: /root/workspace/baojiachun/scout/data/outputs/vib_lift
