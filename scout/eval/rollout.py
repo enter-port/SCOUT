@@ -83,7 +83,11 @@ def make_action_bridge(dp) -> ActionNormalizerBridge:
     fitted normalizer yet, falls back to :class:`IdentityBridge`.
     """
     normalizer = getattr(dp, "normalizer", None)
-    if normalizer is None or "action" not in normalizer:
+    # LinearNormalizer has __getitem__ but no __contains__/__iter__, so
+    # `"action" in normalizer` falls back to integer-indexed iteration and
+    # crashes (ParameterDict rejects int keys). Test params_dict directly.
+    params = getattr(normalizer, "params_dict", None)
+    if normalizer is None or params is None or "action" not in params:
         from scout.normalizer import IdentityBridge
         return IdentityBridge()
     return UnnormalizeOnlyBridge(normalizer["action"])

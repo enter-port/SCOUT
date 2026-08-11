@@ -1,0 +1,51 @@
+# SCOUT stage-1 self-improvement eval config -- SQUARE (image pipeline).
+# Mirrors configs/eval_lift.yaml with square params (horizon 500, core_20).
+# Drives `scout/eval/run_round.py` (one SOE round: baseline + guided exploration
+# + merge + retrain). Run-specific ckpt paths come via CLI (--base-dp-ckpt /
+# --vib-ckpt / --core-hdf5); the <TBD> placeholders below are overridden.
+
+seed: 42
+
+# ---- models -------------------------------------------------------------
+base_dp:
+  initial_ckpt_path: <TBD-e0>          # E0 base DP ckpt (passed via --base-dp-ckpt)
+  config_name: base_dp_square_image
+  config_dir: configs
+
+vib:
+  ckpt_path: <TBD-e1>                  # scout_vib.ckpt (--vib-ckpt)
+  base_dp_ckpt: <TBD-e0>               # same as base_dp.initial_ckpt_path
+  view_names: [agentview_image, robot0_eye_in_hand_image]
+  proprio_dim: 9                       # 3 (eef_pos) + 4 (eef_quat) + 2 (gripper_qpos)
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+
+dataset:
+  path: <TBD-core-hdf5>               # image_v141_abs_core20.hdf5 (--core-hdf5)
+  core_filter_key: core_20            # square base DP trained on core_20
+
+action_dim: 10                         # abs_6drot: 3 trans + 6 rot + 1 gripper
+
+# ---- eval ---------------------------------------------------------------
+eval:
+  n_init_states: 100                   # SOE default (design §5)
+  try_times: 5                         # Pass@5
+  horizon: 500                         # robomimic square default
+  view_names: [agentview_image, robot0_eye_in_hand_image]
+  proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+
+# ---- exploration (SCOUT classifier guidance) ----------------------------
+exploration:
+  guidance_scale: 5.0                  # picked from E2 sweep; tunable per round
+  guidance_start_timestep: 50          # gate (a): guide only the last K steps
+
+# ---- self-improvement loop ----------------------------------------------
+self_improvement:
+  num_rounds: 6                        # SOE default (design §5)
+  scout_aug_mask: scout_aug
+  num_epochs: 1500                     # per-round retrain budget (run_round defaults to 600)
+
+# ---- runtime ------------------------------------------------------------
+device: auto
+log_dir: logs/scout_eval_square_image
