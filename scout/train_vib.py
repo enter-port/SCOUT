@@ -201,7 +201,6 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
 
     steps_per_epoch = int(cfg.steps_per_epoch)
     num_epochs = int(cfg.num_epochs)
-    log_every_batch = max(1, steps_per_epoch // 5)
     history = {"latent_mse": [], "kl": [], "mu_abs": [], "val_mse": []}
 
     model.train()
@@ -212,11 +211,13 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
             out = model(obs_t, A_t, obs_tp1)
             opt.zero_grad(); out["loss"].backward(); opt.step()
 
-            if (it + 1) % log_every_batch == 0 or it == steps_per_epoch - 1:
-                ep["latent_mse"] += out["latent_mse"].item()
-                ep["kl"] += out["kl"].item()
-                ep["mu_abs"] += out["mu"].detach().abs().mean().item()
-                ep["n"] += 1
+            # accumulate over EVERY batch (sampling every-N skipped small-data
+            # epochs entirely -- lift has 27 batches/epoch < old log_every_batch=40,
+            # so it reported a bogus train loss of 0).
+            ep["latent_mse"] += out["latent_mse"].item()
+            ep["kl"] += out["kl"].item()
+            ep["mu_abs"] += out["mu"].detach().abs().mean().item()
+            ep["n"] += 1
             if it + 1 >= steps_per_epoch:
                 break
         n = max(1, ep["n"])
