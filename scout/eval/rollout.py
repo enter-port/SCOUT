@@ -310,15 +310,87 @@ def collect_initial_states(env_factory: Callable[[], Any],
             env.close()
 
 
+def _wandb_log(wandb_run, payload: dict):
+    """No-op when wandb disabled (``wandb_run is None``); else ``wandb_run.log``.
+
+    Mirrors :func:`scout.eval.rollout_vec._wandb_log` (kept local to avoid the
+    rollout_vec -> rollout -> rollout_vec import cycle). Same metric names so the
+    sequential fallback path reports the SAME live dashboard as the vectorized one.
+    """
+    if wandb_run is not None:
+        wandb_run.log(payload)
+
+
 def evaluate_baseline(policy_adapter, env_factory: Callable[[], Any],
-                      init_states: Sequence[dict], horizon: int
-                      ) -> List[Tuple[bool, dict]]:
-    """One try per init state. Returns ``[(success, traj), ...]``."""
+                      init_states: Sequence[dict], horizon: int,
+                      n_tries: int = 1,
+                      record_obs: bool = False,
+                      metric_prefix: str = "eval",
+                      wandb_run=None
+                      ) -> Tuple[List[Tuple[bool, dict]], List[bool], List[dict]]:
+    """Base-DP baseline: ``n_tries`` tries per init state (default 1).
+
+    Returns ``(results, any_success, success_trajs)``:
+      * ``results``      : ``[(first_success, first_traj), ...]`` -- the FIRST
+                           try per init state (single-attempt success rate is
+                           computed from this; exploration's ``only_failed_of``
+                           also keys off the first try).
+      * ``any_success``  : per-init-state bool -- True if the base DP solved
+                           that init state in ANY of its ``n_tries`` tries
+                           (base DP pass@k). Equal to ``first_success`` when
+                           ``n_tries == 1``.
+      * ``success_trajs``: flat list of EVERY successful traj (all tries; only
+                           carries per-frame obs/next_obs when ``record_obs``).
+
+    ``record_obs=True`` stores per-frame obs/next_obs so successful base-DP
+    rollouts can feed the augmented-hdf5 write-back (mode=base collection).
+
+    ``metric_prefix`` namespaces the live progress metrics: "eval" (default)
+    reports ``eval/baseline_*``; "explore" reports the SAME keys as the guided
+    exploration dashboard (``explore/init_done`` / ``explore/tries_done`` /
+    ``explore/collected`` / ``explore/yield``) so direct-DP collection
+    (mode=base) compares side-by-side with guided exploration. Same metric names
+    as the vectorized :func:`scout.eval.rollout_vec.evaluate_baseline_vec`.
+    """
     env = env_factory()
     try:
-        return [rollout_episode(policy_adapter, env, horizon,
-                                initial_state_dict=sd)
-                for sd in init_states]
+        results: List[Tuple[bool, dict]] = []
+        any_success: List[bool] = []
+        success_trajs: List[dict] = []
+        tries_done = 0
+        for sd in init_states:
+            first_success = False
+            first_traj: Optional[dict] = None
+            any_succ = False
+            for j in range(int(n_tries)):
+                success, traj = rollout_episode(policy_adapter, env, horizon,
+                                                initial_state_dict=sd,
+                                                record_obs=record_obs)
+                tries_done += 1
+                if j == 0:
+                    first_success, first_traj = success, traj
+                if success:
+                    any_succ = True
+                    success_trajs.append(traj)            # keep ALL (SOE-style)
+            results.append((first_success, first_traj))   # type: ignore[arg-type]
+            any_success.append(any_succ)
+            done = len(results)
+            succ = sum(1 for s, _ in results if s)
+            if metric_prefix == "explore":
+                _wandb_log(wandb_run, {
+                    "explore/init_done": done,
+                    "explore/tries_done": tries_done,
+                    "explore/collected": len(success_trajs),
+                    "explore/yield": len(success_trajs),
+                })
+            else:
+                _wandb_log(wandb_run, {
+                    "eval/baseline_env_done": done,
+                    "eval/baseline_successes": succ,
+                    "eval/baseline_success_rate": succ / max(done, 1),
+                    "eval/base_pass_at_5": sum(1 for a in any_success if a) / max(done, 1),
+                })
+        return results, any_success, success_trajs
     finally:
         if hasattr(env, "close"):
             env.close()
@@ -328,12 +400,15 @@ def evaluate_exploration(exploration_adapter, env_factory: Callable[[], Any],
                          init_states: Sequence[dict], horizon: int,
                          try_times: int = 5,
                          only_failed_of: Optional[Sequence[Tuple[bool, dict]]] = None,
+                         wandb_run=None,
                          ) -> List[dict]:
     """Exploration tries per init state.
 
-    For each init state, run up to ``try_times`` episodes with
+    For each init state, run **all** ``try_times`` episodes with
     ``exploration_adapter`` (z is resampled *inside* the policy on each chunk,
-    so the same adapter instance is reused). Stop on first success (SOE pattern).
+    so the same adapter instance is reused) and keep **every** successful
+    rollout (SOE pattern: ``run.py:128`` has no break; ``extract_useful_data_v2``
+    keeps all successes). ``n_tries`` records the first-success try (for pass_at_k).
 
     Args:
         exploration_adapter : a :class:`BaseDPAdapter` (typically :class:`GuidedAdapter`).
@@ -349,28 +424,55 @@ def evaluate_exploration(exploration_adapter, env_factory: Callable[[], Any],
     env = env_factory()
     try:
         results: List[dict] = []
+        tries_done = 0
+        collected = 0
         for i, sd in enumerate(init_states):
             if only_failed_of is not None and only_failed_of[i][0]:
                 results.append({"solved": True, "n_tries": 0,
                                 "successful_trajs": [], "all_trajs": [],
                                 "baseline_solved": True})
+                _wandb_log(wandb_run, {
+                    "explore/init_done": i + 1,
+                    "explore/tries_done": tries_done,
+                    "explore/collected": collected,
+                    "explore/yield": collected,
+                })
                 continue
             entry = {"solved": False, "n_tries": 0,
                      "successful_trajs": [], "all_trajs": [],
                      "baseline_solved": False}
-            for _ in range(try_times):
+            first_success_try = None
+            for j in range(try_times):
                 # record obs/next_obs: successful exploration rollouts feed the
-                # augmented-hdf5 write-back (SOE run_full_multi_round pattern).
+                # augmented-hdf5 write-back. SOE runs ALL try_times retries per
+                # failed init (no early stop) and keeps EVERY successful rollout
+                # (run.py:128 has no break; extract_useful_data_v2 keeps all
+                # successes) -- match that here so collection is SOE-aligned.
                 success, traj = rollout_episode(exploration_adapter, env, horizon,
                                                 initial_state_dict=sd,
                                                 record_obs=True)
-                entry["n_tries"] += 1
                 entry["all_trajs"].append(traj)
+                tries_done += 1
                 if success:
+                    if first_success_try is None:
+                        first_success_try = j + 1
                     entry["solved"] = True
-                    entry["successful_trajs"].append(traj)
-                    break
+                    entry["successful_trajs"].append(traj)   # keep ALL (SOE-style)
+                    collected += 1
+                _wandb_log(wandb_run, {
+                    "explore/init_done": i,
+                    "explore/tries_done": tries_done,
+                    "explore/collected": collected,
+                    "explore/yield": collected,
+                })
+            entry["n_tries"] = first_success_try if entry["solved"] else try_times
             results.append(entry)
+            _wandb_log(wandb_run, {
+                "explore/init_done": i + 1,
+                "explore/tries_done": tries_done,
+                "explore/collected": collected,
+                "explore/yield": collected,
+            })
         return results
     finally:
         if hasattr(env, "close"):
@@ -613,12 +715,17 @@ def _smoke():
     init_states = collect_initial_states(env_factory, n_init_states=5)
     print(f"[1] collected {len(init_states)} init states: thresholds="
           f"{[round(s['s'], 2) for s in init_states]}")
-    base = evaluate_baseline(MockDPAdapter(), env_factory, init_states, horizon=20)
+    base, base_pass, base_succ = evaluate_baseline(MockDPAdapter(), env_factory,
+                                                   init_states, horizon=20, n_tries=3)
+    assert all(t["success"] for t in base_succ), "collected trajs must be successful"
+    assert len(base_succ) >= sum(1 for s, _ in base if s), "success_trajs covers first-try"
     n_succ = sum(1 for s, _ in base if s)
-    print(f"[1] baseline: {n_succ}/{len(init_states)} succeeded; "
+    print(f"[1] baseline: {n_succ}/{len(init_states)} succeeded "
+          f"(pass@{3}: {sum(base_pass)}/{len(init_states)}); "
           f"horizons={[t['horizon'] for _, t in base]}")
     assert all(t["horizon"] > 0 for _, t in base), "empty traj"
     assert all(t["actions"].shape[1] == 4 for _, t in base), "wrong action_dim"
+    assert len(base_pass) == len(init_states), "any_success length"
     expl = evaluate_exploration(MockDPAdapter(), env_factory, init_states,
                                 horizon=20, try_times=3, only_failed_of=base)
     print(f"[1] exploration: solved={[r['solved'] for r in expl]}, "

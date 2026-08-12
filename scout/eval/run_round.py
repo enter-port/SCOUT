@@ -1,53 +1,64 @@
-"""SCOUT single-round self-improvement launcher (SOE protocol; real-env entry).
+"""SCOUT multi-round self-improvement launcher (SOE protocol; real-env entry).
 
-One round of (exactly the SOE single-round protocol, with SCOUT guidance):
+The full self-improvement loop: per round, :class:`SelfImprovementLoop` composes
+:class:`EvalPipeline` (base-DP metrics) + :class:`RolloutCollector` (VIB-guided
+collection over ALL init states), then retrains DP_{i+1} on the augmented data.
 
-  1. frozen base DP0 baseline       -- N=100 init states x 1 try  -> success_rate.
-  2. SCOUT classifier-guided        -- up to `try_times`=5 retries per FAILED init
-     exploration                       state; one fresh z~N(0,I) locked PER ROLLOUT
-                                       and held across all its chunks (scout_design
-                                       §1; distinct from SOE's per-chunk resample).
-                                       -> Pass@5.
-  3. collect ALL successful exploration rollouts (SOE: no cap).
-  4. merge (core hdf5 + successes) -> augmented hdf5; retrain a DP with wandb
-     name ``SCOUT-baseDP-{task}-exp1``.
+  1. **eval**      -- EvalPipeline: N init states x try_times -> success_rate,
+                      jerk, base_pass_at_5.
+  2. **collect**   -- RolloutCollector (guided): VIB-guided exploration over ALL
+                      N init states x try_times -> every successful traj kept.
+  3. **retrain**   -- merge (core hdf5 + successes) -> augmented hdf5; retrain
+                      a DP with wandb name ``DP-{task}-SCOUT-1``.
 
-This wires ``SelfImprovementLoop`` with the REAL factories (make_lpb_dp_factory
-/ make_scout_vib_factory / make_default_env_factory). The loop module's own
-``__main__`` only exercises the mock dry-run.
+For standalone eval (metrics only, no collection / retrain) use
+``run_eval.py``. For standalone rollout collection (guided or unguided, no
+metrics / no retrain) use ``run_rollout.py``. This launcher is the ONLY entry
+that does the full eval + collect + retrain cycle.
 
-Note on the round/retrain seam: ``SelfImprovementLoop.run(num_rounds=1)``
-deliberately SKIPS the retrain after the last round (it retrains *between*
-rounds). So this launcher runs the loop for the exploration + metrics only,
-then invokes the retrain_fn itself -- yielding exactly one exploration + one
-retrain (what the SOE single-round protocol wants).
+Note on the round/retrain seam: ``SelfImprovementLoop.run()`` deliberately
+SKIPS the retrain after the last round (it retrains *between* rounds). So this
+launcher runs the loop for the eval + collection, then invokes the retrain_fn
+itself -- yielding exactly the final DP_{n} retrain on all accumulated rollouts.
 
 Server usage (venv active, wandb env sourced, cwd = repo root):
   .venv/bin/python -m scout.eval.run_round \\
-      --config configs/eval_lift.yaml --task lift \\
+      --config configs/eval_square.yaml --task square \\
       --base-dp-ckpt <.../580.ckpt> \\
       --vib-ckpt    <.../scout_vib.ckpt> \\
-      --core-hdf5   <.../image_v141_abs_core10.hdf5> \\
-      --cuda-visible-devices 0
+      --core-hdf5   <.../image_v141_abs_core20.hdf5> \\
+      --num-rounds 1 --cuda-visible-devices 0
+
+Parallelism: ``cfg.eval.n_envs`` (default 50) drives the vectorized rollout. A
+wandb run (project ``scout-eval``, name ``DP-{task}-SCOUT-1``) streams live
+``eval/baseline_*`` + ``explore/*`` + ``round/*``. ``--no-wandb`` disables.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from typing import List
+from typing import Any, List
 
 import torch
 from easydict import EasyDict
 
-from scout.eval.self_improvement import (
-    SelfImprovementLoop,
-    _write_augmented_hdf5,
+from scout.eval.factories import (
     load_cfg,
     make_default_env_factory,
     make_lpb_dp_factory,
     make_scout_vib_factory,
 )
+from scout.eval.self_improvement import SelfImprovementLoop
+
+
+def _to_plain(d: Any) -> Any:
+    """Recursively convert EasyDict -> plain dict/list (wandb-safe config)."""
+    if isinstance(d, dict):
+        return {k: _to_plain(v) for k, v in d.items()}
+    if isinstance(d, (list, tuple)):
+        return [_to_plain(x) for x in d]
+    return d
 
 
 # --------------------------------------------------------------------------- #
@@ -60,19 +71,20 @@ def make_round_retrain_fn(log_root: str, wandb_name: str,
     project ``scout-base-dp``.
 
     Mirrors ``self_improvement.default_retrain_fn_factory`` but injects the
-    wandb-name override (``SCOUT-baseDP-{task}-exp1``) so the exp1 run is
-    distinguishable from the E0 base DP, and pins ``num_epochs`` (default 600 =
-    the base DP budget, for a fair base-vs-explore comparison).
+    wandb-name override (``DP-{task}-SCOUT-1``) so the SCOUT-1 run is
+    distinguishable from the base DP (``DP-{task}-base``), and pins ``num_epochs``
+    (default 600 = the base DP budget, for a fair base-vs-explore comparison).
     """
     def retrain_fn(cfg: EasyDict, round_idx: int,
                    successful_rollouts: List[dict], prev_dp_ckpt: str) -> str:
         from scout.train_base_dp import train
+        from scout.eval.hdf5_writer import write_rollouts_to_hdf5
 
         core_path = cfg.dataset.path
         round_dir = os.path.join(log_root, f"round_{round_idx}")
         os.makedirs(round_dir, exist_ok=True)
         new_path = os.path.join(round_dir, "augmented.hdf5")
-        _write_augmented_hdf5(
+        write_rollouts_to_hdf5(
             core_path, new_path, successful_rollouts,
             core_filter_key=cfg.dataset.core_filter_key,
             aug_mask_key=cfg.self_improvement.scout_aug_mask,
@@ -88,7 +100,7 @@ def make_round_retrain_fn(log_root: str, wandb_name: str,
             num_epochs=num_epochs,
             extra_overrides={
                 "training.resume": False,        # from scratch on augmented data
-                "logging.name": wandb_name,       # SCOUT-baseDP-<task>-exp1
+                "logging.name": wandb_name,       # DP-<task>-SCOUT-1
                 "logging.project": "scout-base-dp",
             },
             cuda_visible_devices=cuda_visible_devices,
@@ -102,35 +114,40 @@ def make_round_retrain_fn(log_root: str, wandb_name: str,
 # main
 # --------------------------------------------------------------------------- #
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True, help="configs/eval_<task>.yaml")
     p.add_argument("--task", required=True, help="lift | can | square (wandb name)")
     p.add_argument("--base-dp-ckpt", required=True, help="E0 base DP ckpt (= DP0)")
-    p.add_argument("--vib-ckpt", required=True, help="scout_vib.ckpt (Step 1)")
+    p.add_argument("--vib-ckpt", required=True,
+                   help="scout_vib.ckpt (Step 1); required for guided exploration")
     p.add_argument("--core-hdf5", required=True,
                    help="core hdf5 (env_meta source + augmented-write base)")
+    p.add_argument("--num-rounds", type=int, default=1,
+                   help="self-improvement rounds (default 1; loop retrains "
+                        "between rounds, this launcher does the final retrain)")
     p.add_argument("--n-init-states", type=int, default=None,
-                   help="override cfg.eval.n_init_states (smoke: 2)")
+                   help="override cfg.eval.n_init_states (default 100)")
     p.add_argument("--try-times", type=int, default=None,
-                   help="override cfg.eval.try_times (smoke: 1)")
+                   help="override cfg.eval.try_times (default 5)")
+    p.add_argument("--n-envs", type=int, default=None,
+                   help="override cfg.eval.n_envs (parallel env count; "
+                        "default 50, 1 -> sequential fallback)")
     p.add_argument("--num-epochs", type=int, default=600,
                    help="retrain epochs (default 600 = base DP, fair compare)")
     p.add_argument("--cuda-visible-devices", default=None,
                    help="GPU id for exploration + retrain (e.g. 0)")
-    p.add_argument("--wandb-name", default=None,
-                   help="default SCOUT-baseDP-{task}-exp1")
+    p.add_argument("--wandb-name", default=None, help="default DP-{task}-SCOUT-1")
+    p.add_argument("--wandb-project", default=None,
+                   help="override cfg.wandb.project (default scout-eval)")
+    p.add_argument("--wandb-dir", default=None, help="wandb run dir (default log_root)")
+    p.add_argument("--no-wandb", action="store_true",
+                   help="disable wandb live logging")
     p.add_argument("--log-root", default=None)
     p.add_argument("--device", default=None)
-    p.add_argument("--force-explore-all", action="store_true",
-                   help="smoke-only: guided exploration on ALL init states "
-                        "(ignores only_failed_of) so a tiny smoke exercises the "
-                        "guided + write-back + retrain path even if baseline "
-                        "solves everything. Real run leaves this off.")
     args = p.parse_args()
 
     cfg = load_cfg(args.config)
-    # resolve run-specific paths (config may still carry <TBD> placeholders).
     cfg.base_dp.initial_ckpt_path = args.base_dp_ckpt
     cfg.vib.ckpt_path = args.vib_ckpt
     cfg.vib.base_dp_ckpt = args.base_dp_ckpt
@@ -139,14 +156,40 @@ def main():
         cfg.eval.n_init_states = int(args.n_init_states)
     if args.try_times is not None:
         cfg.eval.try_times = int(args.try_times)
+    if args.n_envs is not None:
+        cfg.eval.n_envs = int(args.n_envs)
+    cfg.eval.n_envs = int(getattr(cfg.eval, "n_envs", 1))
+
+    # CUDA_VISIBLE_DEVICES MUST be set BEFORE torch.device() -- otherwise the
+    # device would be pinned to physical GPU 0 regardless of the requested id.
+    if args.cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
 
     device = (torch.device(args.device) if args.device
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    wandb_name = args.wandb_name or f"SCOUT-baseDP-{args.task}-exp1"
+    wandb_name = args.wandb_name or f"DP-{args.task}-SCOUT-1"
     log_root = args.log_root or f"data/outputs/scout_round_{args.task}"
 
-    if args.cuda_visible_devices is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    # ---- wandb (live eval + exploration progress) ----------------------- #
+    wcfg = cfg.get("wandb", {}) or {}
+    use_wandb = bool(wcfg.get("use_wandb", True)) and not args.no_wandb
+    wandb_run = None
+    if use_wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project or wcfg.get("project", "scout-eval"),
+                name=wandb_name,
+                config=_to_plain(cfg),
+                dir=args.wandb_dir or log_root,
+                tags=list(wcfg.get("tags", ["step2", "self-improvement"])) + [args.task],
+            )
+            print(f"[run_round] wandb: project={wandb_run.project} name={wandb_name}")
+        except Exception as e:  # wandb optional -- never block the run on it
+            print(f"[run_round] wandb disabled (init failed: {e})")
+            wandb_run = None
+    else:
+        print("[run_round] wandb disabled (--no-wandb / cfg.wandb.use_wandb=false)")
 
     dp_factory = make_lpb_dp_factory(device)
     scout_vib_factory = make_scout_vib_factory(cfg, device)
@@ -155,7 +198,8 @@ def main():
                                        args.cuda_visible_devices)
 
     print(f"[run_round] task={args.task} wandb={wandb_name} "
-          f"n_init={cfg.eval.n_init_states} try_times={cfg.eval.try_times} "
+          f"rounds={args.num_rounds} n_init={cfg.eval.n_init_states} "
+          f"try_times={cfg.eval.try_times} n_envs={cfg.eval.n_envs} "
           f"epochs={args.num_epochs} device={device}")
     print(f"[run_round] DP0 = {args.base_dp_ckpt}")
     print(f"[run_round] VIB = {args.vib_ckpt}")
@@ -164,26 +208,32 @@ def main():
     loop = SelfImprovementLoop(
         cfg=cfg, dp_factory=dp_factory, scout_vib_factory=scout_vib_factory,
         env_factory=env_factory, retrain_fn=retrain_fn, device=device,
-        force_explore_all=args.force_explore_all,
+        wandb_run=wandb_run,
     )
-    # ONE exploration round (loop.run(1) does baseline + guided exploration +
-    # metrics; it skips retrain after the last round -- we run it ourselves).
-    history = loop.run(num_rounds=1)
+    try:
+        # The loop does eval + guided collect per round, retrains BETWEEN rounds
+        # (skips the retrain after the last round). We run the loop, then do the
+        # final retrain ourselves on ALL accumulated rollouts -> DP-<task>-SCOUT-1.
+        history = loop.run(num_rounds=args.num_rounds)
 
-    print("\n=== ROUND METRICS ===")
-    for h in history:
-        print(h)
+        print("\n=== ROUND METRICS ===")
+        for h in history:
+            print(h)
 
-    successful = loop.accumulated_rollouts
-    if not successful:
-        raise RuntimeError(
-            "[run_round] 0 successful exploration rollouts -- nothing to retrain "
-            "on. Guidance likely produced no usable data (check ‖∂μ/∂a‖ liveness "
-            "+ β). Aborting before retrain.")
+        successful = loop.accumulated_rollouts
+        if not successful:
+            raise RuntimeError(
+                "[run_round] 0 successful rollouts -- nothing to retrain on. "
+                "Guidance likely produced no usable data (check ‖∂μ/∂a‖ liveness "
+                "+ β). Aborting before retrain.")
 
-    # the single retrain: merge core + successes, train SCOUT-baseDP-<task>-exp1.
-    new_ckpt = retrain_fn(cfg, 0, successful, cfg.base_dp.initial_ckpt_path)
-    print(f"\n[run_round] DONE. retrained DP -> {new_ckpt}")
+        # the final retrain: merge core + ALL successes, train DP-<task>-SCOUT-1.
+        new_ckpt = retrain_fn(cfg, args.num_rounds - 1, successful,
+                              cfg.base_dp.initial_ckpt_path)
+        print(f"\n[run_round] DONE. retrained DP -> {new_ckpt}")
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":

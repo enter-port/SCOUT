@@ -7,6 +7,9 @@ papers/
 # Claude Code 本地配置与项目指令
 CLAUDE.md
 .claude/
+# ZCode 本地指令文件(从 Claude Code memory 迁移,本地私有,不提交)
+AGENTS.md
+.zcode/
 
 # ===== Python =====
 __pycache__/

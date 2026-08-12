@@ -141,13 +141,21 @@ def jerk_of_exploration(exploration_results: Sequence[dict]) -> float:
 # --------------------------------------------------------------------------- #
 def summarize_round(baseline_results: Sequence[Tuple[bool, dict]],
                     exploration_results: Sequence[dict],
-                    try_times: int = 5) -> dict:
+                    try_times: int = 5,
+                    base_pass5: Optional[Sequence[bool]] = None) -> dict:
     """One-line round summary: all four metrics + counts.
 
     ``try_times`` is the k for pass_at_k. Returns a plain dict (yaml-safe) so
     the self-improvement loop can append it to a per-round log.
+
+    ``base_pass5`` (optional): per-init-state bool -- whether the base DP solved
+    that init state in ANY of its baseline tries (base DP pass@k, distinct from
+    the guided-exploration ``pass_at_k``). When given, the summary carries
+    ``base_pass_at_5`` = fraction of init states solved at least once across the
+    baseline tries. ``success_rate`` still uses the FIRST try only
+    (single-attempt, paper-comparable).
     """
-    return {
+    summary = {
         "n_init_states": len(baseline_results),
         "success_rate": success_rate_per_round(baseline_results),
         "pass_at_k": pass_at_k(exploration_results, baseline_results, k=try_times),
@@ -158,6 +166,11 @@ def summarize_round(baseline_results: Sequence[Tuple[bool, dict]],
         "exploration_solved": int(sum(1 for r in exploration_results if r["solved"]
                                       and not r.get("baseline_solved", False))),
     }
+    if base_pass5 is not None:
+        n = len(base_pass5)
+        summary["base_pass_at_5"] = (
+            float(sum(1 for s in base_pass5 if s) / n) if n else 0.0)
+    return summary
 
 
 # --------------------------------------------------------------------------- #

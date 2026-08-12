@@ -1,49 +1,50 @@
-# SCOUT E0: base Diffusion Policy on robomimic `lift` image (LPB format).
+# SCOUT E0: base Diffusion Policy on robomimic `transport` image (LPB format).
 #
-# Self-contained LPB/TrainDiffusionUnetHybridWorkspace config (inlines
-# `diffusion_policy/config/task/lift_image_abs.yaml` so it can live under
-# `configs/` rather than `diffusion_policy/config/task/`). The base DP is the
-# LPB `DiffusionUnetHybridImagePolicy` -- the class ScoutPolicy subclasses at
-# inference. Run via the repo-root LPB entry:
+# Mirrors configs/base_dp_square_image.yaml with the canonical robomimic
+# transport spec (diffusion_policy/config/task/transport_image_abs.yaml):
+# dual-arm, 4 cameras (shouldercamera0/1 + robot0/1_eye_in_hand), 18-dim
+# proprio (robot0 + robot1), abs_6drot action shape [20] = (3 pos + 6 rot + 1
+# gripper) x 2 arms, max_steps 700.
 #
-#   python train.py --config-path configs --config-name base_dp_lift_image \
-#       task.dataset_path=<core_hdf5>
+# Run via the repo-root LPB entry:
+#   python train.py --config-path configs --config-name base_dp_transport_image \
+#       task.dataset_path=<transport_core_hdf5> \
+#       logging.name=DP-transport-SCOUT-1 logging.project=scout-base-dp
 #
-# Or from SCOUT:
-#   python -m scout.train_base_dp --dataset-path <core_hdf5>
-#
-# round-0 (E0) uses the core_20 hdf5; rounds >=1 reuse this config with
-# `task.dataset_path` overridden to the round's augmented hdf5 and
-# `hydra.run.dir` set per round (see scout/eval/self_improvement.py).
-#
-# NOTE: `train_filter_key` is a SCOUT-side knob (SOE mask convention). The LPB
-# `RobomimicReplayImageDataset` does NOT natively filter by it -- for core_20,
-# pre-extract a core-only hdf5 (SOE `extract_demo.py`) and point
-# `task.dataset_path` at it. The key is kept here so hydra struct-mode accepts
-# the override; a real-run extension can wire it into the dataset loader.
+# round-0 (E0) uses the core_20 hdf5; the self-improvement loop reuses this
+# config with task.dataset_path overridden to a round's augmented hdf5.
 
-name: base_dp_can_image
+name: base_dp_transport_image
 _target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
 
 exp_name: "scout_e0"
-task_name: can
+task_name: transport
 dataset_type: ph
 abs_action: true
 train_filter_key: null     # SCOUT mask knob (SOE convention); ignored by LPB dataset
 
 shape_meta: &shape_meta
   obs:
-    agentview_image:
+    shouldercamera0_image:
       shape: [3, 84, 84]
       type: rgb
     robot0_eye_in_hand_image:
       shape: [3, 84, 84]
       type: rgb
+    shouldercamera1_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot1_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
     robot0_eef_pos:     {shape: [3]}
     robot0_eef_quat:    {shape: [4]}
     robot0_gripper_qpos: {shape: [2]}
+    robot1_eef_pos:     {shape: [3]}
+    robot1_eef_quat:    {shape: [4]}
+    robot1_gripper_qpos: {shape: [2]}
   action:
-    shape: [10]            # abs_6drot: 3 trans + 6 rot + 1 gripper
+    shape: [20]            # abs_6drot dual-arm: (3 trans + 6 rot + 1 gripper) x 2
 
 horizon: 16
 n_obs_steps: 2
@@ -91,11 +92,11 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 
-# robomimic `lift` image dataset (SOE path layout; override per machine).
-# core_20 = pre-extracted core-only hdf5 (SOE extract_demo.py).
+# robomimic `transport` image dataset (SOE path layout; override per machine).
+# core_20 = pre-extracted core-only hdf5 (SOE ind % 10 == 0 convention).
 task:
   name: ${task_name}
-  dataset_path: /root/workspace/baojiachun/data/robomimic/can/ph/image_v141_abs_core20.hdf5
+  dataset_path: /root/workspace/baojiachun/data/robomimic/transport/ph/image_v141_abs_core20.hdf5
   train_filter_key: ${train_filter_key}
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner
@@ -107,10 +108,10 @@ task:
     n_test: 50
     n_test_vis: 4
     test_start_seed: 100000
-    max_steps: 300
+    max_steps: 700                   # robomimic transport default
     n_obs_steps: ${n_obs_steps}
     n_action_steps: ${n_action_steps}
-    render_obs_key: agentview_image
+    render_obs_key: shouldercamera0_image
     fps: 10
     crf: 22
     past_action: ${past_action_visible}
@@ -175,7 +176,7 @@ logging:
   project: diffusion_policy_debug
   resume: true
   mode: online
-  name: DP-${task_name}-base           # e.g. DP-can-base (SCOUT convention)
+  name: DP-${task_name}-base           # e.g. DP-transport-base (SCOUT convention)
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null
   group: null

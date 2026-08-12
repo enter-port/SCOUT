@@ -32,6 +32,10 @@ eval:
   n_init_states: 100                   # SOE default (design §5)
   try_times: 5                         # Pass@5
   horizon: 500                         # robomimic square default
+  n_envs: 50                           # parallel env count (single-process vectorized
+                                       # rollout; lower if GPU memory / EGL render
+                                       # contexts are tight). n_envs==1 -> sequential.
+  log_every: 10                        # wandb progress log period (vec ticks)
   view_names: [agentview_image, robot0_eye_in_hand_image]
   proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
 
@@ -45,6 +49,12 @@ self_improvement:
   num_rounds: 6                        # SOE default (design §5)
   scout_aug_mask: scout_aug
   num_epochs: 1500                     # per-round retrain budget (run_round defaults to 600)
+
+# ---- wandb (eval progress; real-time baseline/exploration collection) ---
+wandb:
+  use_wandb: true                      # set false / pass --no-wandb to disable
+  project: scout-eval
+  tags: [step2, eval]
 
 # ---- runtime ------------------------------------------------------------
 device: auto

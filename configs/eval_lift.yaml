@@ -44,6 +44,11 @@ eval:
   n_init_states: 100                   # SOE default (design §5)
   try_times: 5                         # Pass@5
   horizon: 400                         # robomimic lift default
+  n_envs: 50                           # parallel env count (single-process vectorized
+                                       # rollout; lower this if GPU memory / EGL
+                                       # render-context limits are hit). n_envs==1
+                                       # falls back to the sequential rollout path.
+  log_every: 10                        # wandb progress log period (in vec ticks)
   # LPB obs layout (must match configs/base_dp_lift_image.yaml shape_meta).
   # Used to build (a) the obs-adapter (seam ①: keyed obs -> E_s {"visual","proprio"})
   # and (b) the augmented-hdf5 per-frame obs writer.
@@ -63,6 +68,12 @@ self_improvement:
   # dataset that includes BOTH (core + new rollouts) -- this mask is that union.
   scout_aug_mask: scout_aug
   num_epochs: 1500                     # per-round retrain budget (overrides E0)
+
+# ---- wandb (eval progress; real-time baseline/exploration collection) ---
+wandb:
+  use_wandb: true                      # set false / pass --no-wandb to disable
+  project: scout-eval
+  tags: [step2, eval]
 
 # ---- runtime ------------------------------------------------------------
 device: auto                           # auto -> cuda if available, else cpu
