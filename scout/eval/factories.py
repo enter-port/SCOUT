@@ -126,7 +126,7 @@ def make_scout_vib_factory(cfg: EasyDict,
     """
     dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def factory() -> torch.nn.Module:
+    def factory(vib_ckpt=None) -> torch.nn.Module:
         from scout.model.encoder import StateEncoder
         from scout.model.scout_vib import ScoutVIB
 
@@ -137,7 +137,8 @@ def make_scout_vib_factory(cfg: EasyDict,
             proprio_dim=int(vcfg.proprio_dim),
             proprio_emb_dim=int(getattr(vcfg, "proprio_emb_dim", 64)),
         )
-        ckpt = torch.load(vcfg.ckpt_path, map_location="cpu")
+        ckpt_path = vib_ckpt if vib_ckpt is not None else vcfg.ckpt_path
+        ckpt = torch.load(ckpt_path, map_location="cpu")
         # The VIB encoder was trained on the FLATTENED fs-step action chunk
         # (train_vib._slice_transition: a_t = first `frameskip` per-step actions
         # flattened, e.g. 8x10 = 80-dim), NOT the per-step action. So its action
