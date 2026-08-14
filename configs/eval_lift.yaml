@@ -12,18 +12,18 @@ seed: 42
 
 # ---- models -------------------------------------------------------------
 base_dp:
-  initial_ckpt_path: <TBD-e0>          # E0 output: logs/<ts>/checkpoints/latest.ckpt
+  initial_ckpt_path: /root/workspace/baojiachun/scout/data/lift/train/DP/DP-base/checkpoints/580.ckpt          # E0 output: logs/<ts>/checkpoints/latest.ckpt
   # LPB training entry used by `default_retrain_fn` each round (round overrides
   # dataset_path / num_epochs / log_dir on top of this base config).
   config_name: base_dp_lift_image
   config_dir: configs
 
 vib:
-  ckpt_path: <TBD-e1>                  # train_vib.py run_root/beta_<best>/scout_vib.ckpt
+  ckpt_path: /root/workspace/baojiachun/scout/data/lift/train/dyn/dyn-base/scout_vib.ckpt                  # train_vib.py run_root/beta_<best>/scout_vib.ckpt
   # E_s reconstruction params (MUST match the E1 VIB training config). The loop
   # rebuilds E_s (frozen base-DP ResNet + trained proprio Conv1d) from the base
   # DP ckpt, then loads the chosen-β VIB state_dict.
-  base_dp_ckpt: <TBD-e0>               # same as base_dp.initial_ckpt_path
+  base_dp_ckpt: /root/workspace/baojiachun/scout/data/lift/train/DP/DP-base/checkpoints/580.ckpt               # same as base_dp.initial_ckpt_path
   view_names: [agentview_image, robot0_eye_in_hand_image]
   proprio_dim: 9                       # 3 (eef_pos) + 4 (eef_quat) + 2 (gripper_qpos)
   proprio_emb_dim: 64
@@ -34,7 +34,7 @@ dataset:
   # Core hdf5 (core_20 demos) -- the augmented-hdf5 write-back starts from a
   # copy of this file + appends successful rollouts (SOE run_full_multi_round
   # pattern). MUST carry `mask/core_20` for the core-filter step.
-  path: <TBD-core-hdf5>
+  path: /root/workspace/baojiachun/scout/data/lift/rollout/lift_core.hdf5
   core_filter_key: core_20             # mask selecting the core demos
 
 action_dim: 10                         # abs_6drot: 3 trans + 6 rot + 1 gripper

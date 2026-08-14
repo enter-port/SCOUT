@@ -8,13 +8,13 @@ seed: 42
 
 # ---- models -------------------------------------------------------------
 base_dp:
-  initial_ckpt_path: <TBD-e0>          # E0 base DP ckpt (passed via --base-dp-ckpt)
+  initial_ckpt_path: /root/workspace/baojiachun/scout/data/square/train/DP/DP-base/checkpoints/580.ckpt          # E0 base DP ckpt (passed via --base-dp-ckpt)
   config_name: base_dp_square_image
   config_dir: configs
 
 vib:
-  ckpt_path: <TBD-e1>                  # scout_vib.ckpt (--vib-ckpt)
-  base_dp_ckpt: <TBD-e0>               # same as base_dp.initial_ckpt_path
+  ckpt_path: /root/workspace/baojiachun/scout/data/square/train/dyn/dyn-base/scout_vib.ckpt                  # scout_vib.ckpt (--vib-ckpt)
+  base_dp_ckpt: /root/workspace/baojiachun/scout/data/square/train/DP/DP-base/checkpoints/580.ckpt               # same as base_dp.initial_ckpt_path
   view_names: [agentview_image, robot0_eye_in_hand_image]
   proprio_dim: 9                       # 3 (eef_pos) + 4 (eef_quat) + 2 (gripper_qpos)
   proprio_emb_dim: 64
@@ -22,7 +22,7 @@ vib:
   hidden_dim: 128
 
 dataset:
-  path: <TBD-core-hdf5>               # image_v141_abs_core20.hdf5 (--core-hdf5)
+  path: /root/workspace/baojiachun/scout/data/square/rollout/square_core.hdf5               # image_v141_abs_core20.hdf5 (--core-hdf5)
   core_filter_key: core_20            # square base DP trained on core_20
 
 action_dim: 10                         # abs_6drot: 3 trans + 6 rot + 1 gripper

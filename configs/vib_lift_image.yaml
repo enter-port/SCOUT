@@ -13,9 +13,10 @@
 seed: 233
 
 dataset:
-  zarr_path: /root/workspace/baojiachun/data/robomimic/lift/ph/image_v141_abs.hdf5
+  zarr_path: /root/workspace/baojiachun/scout/data/robomimic/lift/ph/image_v141_abs.hdf5
   view_names: ['agentview_image', 'robot0_eye_in_hand_image']
   abs_action: true
+  feature_cache: true             # frozen-ResNet bank (scout/feat_cache.py; ~90x, verified equal)
   use_crop: true            # per-sample RandomCrop(76) on 84, matching base DP's
                              # crop_shape [76,76]. train_vib wires the transform in
                              # the train loop (LPB dyn_model/train.py:438 style), so
@@ -36,7 +37,7 @@ model:
   E_s:
     # lift base DP ckpt = epoch 580 (last saved; 590/600 don't exist). lift
     # saturated at test_mean_score=1.0 from epoch 140, so any late ckpt is fine.
-    base_dp_ckpt: /root/workspace/baojiachun/scout/data/outputs/2026.08.11/10.57.00_base_dp_lift_image_lift/checkpoints/580.ckpt
+    base_dp_ckpt: /root/workspace/baojiachun/scout/data/lift/train/DP/DP-base/checkpoints/580.ckpt
     view_names: ['agentview_image', 'robot0_eye_in_hand_image']
     proprio_dim: 9          # eef_pos(3) + eef_quat(4) + gripper_qpos(2)
     proprio_emb_dim: 64     # -> s_bar_dim = 512*2 + 64 = 1088
@@ -59,9 +60,9 @@ steps_per_epoch: 200
 val_ratio: 0.1             # hold out last 10% of demos for val (episode-level)
 val_every: 20              # eval val latent_mse every N epochs
 
-save_dir: /root/workspace/baojiachun/scout/data/outputs/vib_lift
+save_dir: /root/workspace/baojiachun/scout/data/lift/train/dyn/dyn-base
 
 use_wandb: true
 wandb:
   project: scout-dynamics
-  name: SCOUT-dyn-lift-1
+  name: dyn-lift-base

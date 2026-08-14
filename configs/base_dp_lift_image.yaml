@@ -95,7 +95,7 @@ ema:
 # core_20 = pre-extracted core-only hdf5 (SOE extract_demo.py).
 task:
   name: ${task_name}
-  dataset_path: /root/workspace/baojiachun/data/robomimic/lift/ph/image_v141_abs_core10.hdf5
+  dataset_path: /root/workspace/baojiachun/scout/data/robomimic/lift/ph/image_v141_abs_core10.hdf5
   train_filter_key: ${train_filter_key}
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner
