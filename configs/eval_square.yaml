@@ -4,7 +4,8 @@
 # + merge + retrain). Run-specific ckpt paths come via CLI (--base-dp-ckpt /
 # --vib-ckpt / --core-hdf5); the <TBD> placeholders below are overridden.
 
-seed: 42
+seed: 42          # default when run standalone; round.sh derives per-round seeds:
+                  # exp N = 4 followed by N '2's (42 / 422 / 4222 / 42222 ...)
 
 # ---- models -------------------------------------------------------------
 base_dp:

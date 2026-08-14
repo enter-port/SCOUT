@@ -20,6 +20,12 @@
 # matched. If dyn-base is missing it is trained first
 # (configs/vib_<task>.yaml, ~15 min with the feature cache).
 #
+# Round seed convention (2026-08-15): round N rolls out with seed = 4 followed
+# by N '2's -- exp1=42, exp2=422, exp3=4222, exp4=42222 ... -- derived from
+# the exp-num below and passed to run_rollout as --seed. Fresh init scenes
+# every round (data diversity); DP-vs-SCOUT within one round share the seed,
+# i.e. the same 100 scenes (controlled comparison).
+#
 # Disk note: retrains write training.checkpoint_every=100 (~6 ckpts = ~28 GB
 # per round) because the shared CPFS runs near quota; change if space allows.
 #
@@ -46,6 +52,10 @@ case "$A" in
 esac
 NUM=$(printf '%d' "$NUM" 2>/dev/null) || { echo "exp-num must be an integer"; exit 1; }
 [ "$NUM" -ge 1 ] || { echo "exp-num must be >= 1"; exit 1; }
+
+# per-round rollout seed: exp N -> 4 followed by N 2s (42, 422, 4222, ...)
+SEED=4
+for _ in $(seq 1 "$NUM"); do SEED="${SEED}2"; done
 
 GPU=${GPU:-0}
 DRY_RUN=${DRY_RUN:-0}
@@ -131,12 +141,12 @@ log "=== ROUND $TASK a=$A exp=$NUM START (GPU$GPU; rollout DP=$DPROLL) ==="
 
 # ---- [1/3] rollout: baseline 100-init + (SCOUT) guided explore on fails --- #
 GUIDE=off; [ "$A" = SCOUT ] && GUIDE=dyn
-log "[1/3] rollout guide=$GUIDE dp=${DPCKPT:-<dry>} vib=${VIBCKPT:-none} -> $RDIR"
+log "[1/3] rollout guide=$GUIDE seed=$SEED dp=${DPCKPT:-<dry>} vib=${VIBCKPT:-none} -> $RDIR"
 RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
   --config configs/eval_${TASK}.yaml --task "$TASK" --exp-num "$NUM" \
   --base-dp-ckpt "${DPCKPT:-$DPROLL/checkpoints/<newest>.ckpt}" \
   --core-hdf5 "$CORE" \
-  --guide "$GUIDE" ${VIBARGS[@]+"${VIBARGS[@]}"} \
+  --guide "$GUIDE" --seed "$SEED" ${VIBARGS[@]+"${VIBARGS[@]}"} \
   --output-dir "$RDIR" \
   --output-success success.hdf5 \
   --output-all all.hdf5 \
