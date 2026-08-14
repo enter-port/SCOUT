@@ -37,6 +37,8 @@
 # Env:
 #   GPU=0        CUDA device for all three stages
 #   DRY_RUN=1    print the commands instead of executing (no dirs created)
+#   SKIP_ROLLOUT=1  crash recovery: if $RDIR/all.hdf5 already exists, skip
+#                   stage [1/3] entirely and replay only retrain [2/3]+[3/3]
 set -u
 
 TASK=${1:?usage: round.sh <task> <DP|SCOUT> <exp-num>}
@@ -62,6 +64,7 @@ for _ in $(seq 1 "$NUM"); do SEED="${SEED}2"; done
 
 GPU=${GPU:-0}
 DRY_RUN=${DRY_RUN:-0}
+SKIP_ROLLOUT=${SKIP_ROLLOUT:-0}
 export MUJOCO_GL=egl
 set -a; . /root/workspace/baojiachun/.secrets/wandb.env; set +a
 export WANDB_DIR=/root/workspace/baojiachun/wandb_runs
@@ -143,21 +146,26 @@ T0=$(date +%s)
 log "=== ROUND $TASK a=$A exp=$NUM START (GPU$GPU; rollout DP=$DPROLL) ==="
 
 # ---- [1/3] rollout: baseline 100-init + (SCOUT) guided explore on fails --- #
-GUIDE=off; [ "$A" = SCOUT ] && GUIDE=dyn
-log "[1/3] rollout guide=$GUIDE seed=$SEED dp=${DPCKPT:-<dry>} vib=${VIBCKPT:-none} -> $RDIR"
-RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
-  --config configs/eval_${TASK}.yaml --task "$TASK" --exp-num "$NUM" \
-  --base-dp-ckpt "${DPCKPT:-$DPROLL/checkpoints/<newest>.ckpt}" \
-  --core-hdf5 "$CORE" \
-  --guide "$GUIDE" --seed "$SEED" ${VIBARGS[@]+"${VIBARGS[@]}"} \
-  --output-dir "$RDIR" \
-  --output-success success.hdf5 \
-  --output-all all.hdf5 \
-  --wandb-name "$A-$TASK-rollout-exp$NUM" \
-  > "$RLOG" 2>&1
-RC=$?; T1=$(date +%s)
-log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
-[ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RLOG"; exit 1; }
+if [ "$SKIP_ROLLOUT" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
+  log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (rollout already done)"
+  T1=$(date +%s)
+else
+  GUIDE=off; [ "$A" = SCOUT ] && GUIDE=dyn
+  log "[1/3] rollout guide=$GUIDE seed=$SEED dp=${DPCKPT:-<dry>} vib=${VIBCKPT:-none} -> $RDIR"
+  RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
+    --config configs/eval_${TASK}.yaml --task "$TASK" --exp-num "$NUM" \
+    --base-dp-ckpt "${DPCKPT:-$DPROLL/checkpoints/<newest>.ckpt}" \
+    --core-hdf5 "$CORE" \
+    --guide "$GUIDE" --seed "$SEED" ${VIBARGS[@]+"${VIBARGS[@]}"} \
+    --output-dir "$RDIR" \
+    --output-success "$RDIR/success.hdf5" \
+    --output-all "$RDIR/all.hdf5" \
+    --wandb-name "$A-$TASK-rollout-exp$NUM" \
+    > "$RLOG" 2>&1
+  RC=$?; T1=$(date +%s)
+  log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
+  [ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RLOG"; exit 1; }
+fi
 
 # ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
 if [ -f "$RDIR/success.hdf5" ]; then
