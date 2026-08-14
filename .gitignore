@@ -37,6 +37,7 @@ results/
 wandb/
 runs/
 data/
+data_backup/
 
 # ===== 编辑器 / OS =====
 .vscode/
