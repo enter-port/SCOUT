@@ -10,8 +10,11 @@
 #   data/<task>/train/dyn/dyn-base            Step-1 VIB dynamics (full-data train)
 #   data/<task>/train/dyn/dyn-{a}-exp{num}    retrained dyn
 #   data/<task>/rollout/{a}-exp{num}/         success.hdf5 + all.hdf5 + log/*.json
-#     success.hdf5 = core + successful EXPLORATION trajs -> DP retrain
-#     all.hdf5     = core + every traj of the round          -> dyn retrain
+#     success.hdf5  = core + successful EXPLORATION trajs    -> DP retrain
+#     all.hdf5      = core + every traj of the round
+#     all_accum.hdf5 = core + every traj of rounds 1..num    -> dyn retrain
+#       (dyn data ACCUMULATES across rounds -- user rule 2026-08-15; the DP
+#        retrains on round-N successes only)
 #
 # Round chaining: exp{num} rolls out with DP-{a}-exp{num-1} (fallback DP-base)
 # and, for a=SCOUT, is guided by dyn-{a}-exp{num-1} (fallback dyn-base). The
@@ -183,18 +186,34 @@ else
   T2=$T1
 fi
 
-# ---- [3/3] dyn retrain on all.hdf5 (core + every traj; E_s from new DP) --- #
+# ---- [3/3] dyn retrain on ACCUMULATED data (core + every traj of rounds
+# 1..N; user rule 2026-08-15: DP retrains on round-N successes only, dyn
+# accumulates EVERY round's trajectories incl. failures; E_s from new DP) --- #
 CFG=$OUTDYN.config.yaml
 NEWDP=$(newest_ckpt "$OUTDP")
 if [ "$DRY_RUN" = 1 ]; then
-  log "[3/3] dyn retrain (dry): ds=$RDIR/all.hdf5 es_base=${NEWDP:-<newest ckpt of $OUTDP>} -> $OUTDYN"
+  log "[3/3] dyn retrain (dry): accum=core+all.hdf5(rounds 1..$NUM) es_base=${NEWDP:-<newest ckpt of $OUTDP>} -> $OUTDYN"
 else
-  $PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TASK" <<'PYEOF'
-import sys, yaml, glob, os
-cfg_path, rdir, outdyn, outdp, a_tag, num, task = sys.argv[1:8]
+  $PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TASK" "$CORE" <<'PYEOF'
+import sys, yaml, glob, os, re
+cfg_path, rdir, outdyn, outdp, a_tag, num, task, core_path = sys.argv[1:9]
+sys.path.insert(0, os.getcwd())
+from scout.eval.hdf5_writer import merge_accumulated_hdf5
+
+def expnum(p):
+    m = re.search(r"-exp(\d+)", p)
+    return int(m.group(1)) if m else 0
+
+rollout_root = os.path.dirname(rdir.rstrip("/"))
+alls = sorted(glob.glob(os.path.join(rollout_root, f"{a_tag}-exp*", "all.hdf5")),
+              key=expnum)
+accum = os.path.join(rdir, "all_accum.hdf5")
+info = merge_accumulated_hdf5(core_path, alls, accum)
+print(f"[dyn-accum] merged {info} -> {accum}")
+
 with open(f"configs/vib_{task}_image.yaml") as f:
     cfg = yaml.safe_load(f)
-cfg["dataset"]["zarr_path"] = f"{rdir}/all.hdf5"
+cfg["dataset"]["zarr_path"] = accum
 cfg["dataset"]["feature_cache"] = True
 ck = sorted(glob.glob(os.path.join(outdp, "checkpoints", "*.ckpt")),
             key=os.path.getmtime)
@@ -205,7 +224,7 @@ cfg.setdefault("wandb", {})["name"] = f"dyn-{task}-{a_tag}-exp{num}"
 with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 PYEOF
-  log "[3/3] dyn retrain: ds=$RDIR/all.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
+  log "[3/3] dyn retrain: ds=$RDIR/all_accum.hdf5 (core+rounds1..$NUM) es_base=${NEWDP:-base-config} -> $OUTDYN"
 fi
 RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.train_vib --config "$CFG" \
   > "$DYNLOG" 2>&1

@@ -207,3 +207,66 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
         aug_grp.create_dataset("mask", data=mask)
         aug_grp.attrs["num"] = int(mask.sum())
         f.attrs["num_demos_added"] = len(new_demo_names)
+
+
+def merge_accumulated_hdf5(core_path: str, round_all_paths: List[str],
+                           out_path: str, aug_mask_key: str = "scout_aug") -> dict:
+    """dyn-retrain ACCUMULATED dataset: core + every round's trajectories.
+
+    User rule (2026-08-15): round-N DP retrains on round-N successes only
+    (``success.hdf5``), but the dyn/VIB retrain accumulates -- core demos plus
+    the appended rollout demos of rounds 1..N (every trajectory, success AND
+    failure). Each round's ``all.hdf5`` is itself a copy of the SAME core with
+    that round's demos appended (ids >= ``n_core``, already in core storage
+    format: HWC uint8 images, 7-dim axis-angle ``abs_actions``), so merging =
+    copy the core once + cross-file-copy each round's appended demo groups
+    (renumbered sequentially) + rebuild the augmented mask over
+    core + all copied demos.
+
+    ``core_path`` is the materialized core-only hdf5 (extract_core_subset.py
+    output), so ALL of its demos count as core (no filter key needed).
+
+    Returns a small dict ``{"rounds_merged", "demos_copied", "total_demos"}``.
+    """
+    import h5py
+    import shutil
+
+    def _did(k: str) -> int:
+        return int(k.split("_")[-1])
+
+    shutil.copyfile(core_path, out_path)
+    with h5py.File(out_path, "r+") as f:
+        core_names = [k for k in f["data"].keys() if k.startswith("demo")]
+        if not core_names:
+            raise RuntimeError(f"no demos in core file {core_path}")
+        core_set = set(core_names)
+        n_core = max(_did(k) for k in f["data"].keys()
+                     if k.startswith("demo_") and k.split("_")[-1].isdigit()) + 1
+        next_id = n_core
+        copied = 0
+        for rp in round_all_paths:
+            with h5py.File(rp, "r") as rf:
+                appended = sorted(
+                    [k for k in rf["data"].keys()
+                     if k.startswith("demo_") and k.split("_")[-1].isdigit()
+                     and _did(k) >= n_core],
+                    key=_did)
+                for src in appended:
+                    rf.copy(f"data/{src}", f["data"], name=f"demo_{next_id}")
+                    next_id += 1
+                    copied += 1
+        all_demos_after = sorted([k for k in f["data"].keys()
+                                  if k.startswith("demo")])
+        mask = np.array(
+            [d in core_set or (d.split("_")[-1].isdigit() and _did(d) >= n_core)
+             for d in all_demos_after],
+            dtype=bool)
+        if f"mask/{aug_mask_key}" in f:
+            del f[f"mask/{aug_mask_key}"]
+        aug_grp = f.create_group(f"mask/{aug_mask_key}")
+        aug_grp.create_dataset("mask", data=mask)
+        aug_grp.attrs["num"] = int(mask.sum())
+        f.attrs["num_demos_added"] = copied
+        return {"rounds_merged": len(round_all_paths),
+                "demos_copied": copied,
+                "total_demos": len(all_demos_after)}
