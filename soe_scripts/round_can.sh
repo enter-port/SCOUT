@@ -52,6 +52,15 @@ TDP=$DATA/$TASK/train/DP
 TDYN=$DATA/$TASK/train/dyn
 CORE=$DATA/$TASK/rollout/${TASK}_core.hdf5
 RDIR=$DATA/$TASK/rollout/$A-exp$NUM
+OUTDP=$TDP/DP-$A-exp$NUM
+OUTDYN=$TDYN/dyn-$A-exp$NUM
+if [ "$DRY_RUN" = 1 ]; then
+  RLOG=/dev/null; DPLOG=/dev/null; DYNLOG=/dev/null; DBLOG=/dev/null
+else
+  mkdir -p "$RDIR"
+  RLOG=$RDIR/rollout.stdout; DPLOG=$OUTDP.train.log
+  DYNLOG=$OUTDYN.train.log;  DBLOG=$TDYN/dyn-base.train.log
+fi
 LOG=$DATA/$TASK/round.log
 cd "$REPO" || exit 1
 
@@ -92,14 +101,13 @@ if [ "$A" = SCOUT ]; then
       mkdir -p "$TDYN/dyn-base"
       RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.train_vib \
         --config configs/vib_${TASK}_image.yaml \
-        > "$TDYN/dyn-base.train.log" 2>&1 || { log "dyn-base FAILED"; exit 1; }
+        > "$DBLOG" 2>&1 || { log "dyn-base FAILED"; exit 1; }
     fi
     VIBCKPT=$(newest_vib "$VIBDIR")   # may stay empty in DRY_RUN
   fi
   [ -n "$VIBCKPT" ] && VIBARGS=(--vib-ckpt "$VIBCKPT")
 fi
 
-if [ "$DRY_RUN" != 1 ]; then mkdir -p "$RDIR"; fi
 T0=$(date +%s)
 log "=== ROUND $TASK a=$A exp=$NUM START (GPU$GPU; rollout DP=$DPROLL) ==="
 
@@ -115,13 +123,12 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
   --output-success success.hdf5 \
   --output-all all.hdf5 \
   --wandb-name "$A-$TASK-rollout-exp$NUM" \
-  > "$RDIR/rollout.stdout" 2>&1
+  > "$RLOG" 2>&1
 RC=$?; T1=$(date +%s)
 log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
 [ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RDIR/rollout.stdout"; exit 1; }
 
 # ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
-OUTDP=$TDP/DP-$A-exp$NUM
 if [ -f "$RDIR/success.hdf5" ]; then
   log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=100 ds=$RDIR/success.hdf5 -> $OUTDP"
   RUN env CUDA_VISIBLE_DEVICES=$GPU $PY train.py \
@@ -139,7 +146,7 @@ if [ -f "$RDIR/success.hdf5" ]; then
     logging.name=DP-${TASK}-${A}-exp${NUM} \
     logging.project=scout-base-dp \
     hydra.run.dir="$OUTDP" \
-    > "$OUTDP.train.log" 2>&1
+    > "$DPLOG" 2>&1
   RC=$?; T2=$(date +%s)
   log "[2/3] DP retrain rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
   [ $RC -ne 0 ] && { log "DP RETRAIN FAILED - see $OUTDP.train.log"; exit 1; }
@@ -149,7 +156,6 @@ else
 fi
 
 # ---- [3/3] dyn retrain on all.hdf5 (core + every traj; E_s from new DP) --- #
-OUTDYN=$TDYN/dyn-$A-exp$NUM
 CFG=$OUTDYN.config.yaml
 NEWDP=$(newest_ckpt "$OUTDP")
 if [ "$DRY_RUN" = 1 ]; then
@@ -174,7 +180,7 @@ PYEOF
   log "[3/3] dyn retrain: ds=$RDIR/all.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
 fi
 RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.train_vib --config "$CFG" \
-  > "$OUTDYN.train.log" 2>&1
+  > "$DYNLOG" 2>&1
 RC=$?; T3=$(date +%s)
 log "[3/3] dyn retrain rc=$RC in $(( (T3-T2)/60 ))m$(( (T3-T2)%60 ))s"
 [ $RC -ne 0 ] && { log "DYN RETRAIN FAILED - see $OUTDYN.train.log"; exit 1; }
