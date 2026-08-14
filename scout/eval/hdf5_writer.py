@@ -53,7 +53,8 @@ def h5py_group_class():
 def write_rollouts_to_hdf5(core_path: str, out_path: str,
                            rollouts: List[dict],
                            core_filter_key: str = "train",
-                           aug_mask_key: str = "scout_aug"):
+                           aug_mask_key: str = "scout_aug",
+                           include_core: bool = True):
     """Write ``core_path``'s filtered demos + ``rollouts`` as a new HDF5.
 
     Starts from a copy of ``core_path`` (preserves env metadata / attrs / mask
@@ -77,6 +78,12 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
     aug_mask_key : str
         Mask key written to ``out_path`` selecting core + new rollouts (default
         ``"scout_aug"``); a retrain reads this key to train on both.
+    include_core : bool
+        True (default) -> core filtered demos + rollouts (the retraining file).
+        False -> drop all core demos from ``data/`` (env metadata / mask groups
+        copied from core are kept so the file stays robomimic-loadable) and
+        write only the rollouts; the mask then selects just those rollouts
+        (the success-only archive, ``{task}_success_exp{N}.hdf5``).
     """
     import h5py
     import shutil
@@ -100,7 +107,15 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
                 rollout_keys |= set(_ro[0].keys())
         obs_keys = sorted((core_obs_keys & rollout_keys) if rollout_keys
                           else core_obs_keys)
-        core_set = set(core_demos)
+        if include_core:
+            core_set = set(core_demos)
+        else:
+            # success-only file: drop all original core demos (env metadata /
+            # mask groups copied from core stay so the file is still
+            # robomimic-loadable); only the rollouts are written below.
+            for d in [k for k in list(f["data"].keys()) if k.startswith("demo")]:
+                del f["data"][d]
+            core_set = set()
 
         # find next free demo id
         existing_ids = [int(d.split("_")[-1]) for d in f["data"].keys()

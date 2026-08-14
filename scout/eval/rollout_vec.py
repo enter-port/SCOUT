@@ -50,6 +50,7 @@ import numpy as np
 import torch
 
 from scout.eval.rollout import _to_device_batched  # reuse for shape parity
+from scout.eval.metrics import jerk as _traj_jerk   # explore-path running avg_jerk
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +330,7 @@ def evaluate_baseline_vec(dp, env_factory: Callable[[], Any],
                           n_tries: int = 1,
                           record_obs: bool = False,
                           metric_prefix: str = "eval",
+                          on_progress: Optional[Callable[[dict], None]] = None,
                           wandb_run=None, log_every: int = 10
                           ) -> Tuple[List[Tuple[bool, dict]], List[bool], List[dict]]:
     """Vectorized base-DP baseline: ``n_tries`` per init state, N envs parallel.
@@ -401,6 +403,8 @@ def evaluate_baseline_vec(dp, env_factory: Callable[[], Any],
                 "eval/baseline_success_rate": succ / max(env_done, 1),
                 "eval/base_pass_at_5": pass5 / max(env_done, 1),
             })
+        if on_progress is not None:
+            on_progress({"completed": env_done, "successes": succ})
 
     runner = _VecRunner(
         dp, env_factory, n_envs, n_action_steps, horizon, device,
@@ -421,6 +425,8 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                              try_times: int, n_envs: int, n_action_steps: int,
                              device,
                              only_failed_of: Optional[Sequence[Tuple[bool, dict]]] = None,
+                             guided: bool = True,
+                             on_progress: Optional[Callable[[dict], None]] = None,
                              wandb_run=None, log_every: int = 10
                              ) -> List[dict]:
     """Vectorized exploration: up to ``try_times`` tries per FAILED init state.
@@ -451,11 +457,20 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
 
     # per-init aggregation state (only for failed inits that have jobs)
     first_success: dict = {}      # init_idx -> first try_idx that succeeded (1-based)
+    # running avg_jerk over EVERY exploration trajectory (success + failure),
+    # SOE 3rd-difference norm (scout.eval.metrics.jerk); T<4 -> 0.0, skipped.
+    jerk_sum = 0.0
+    jerk_n = 0
 
     def on_done(slot: _VecSlot):
+        nonlocal jerk_sum, jerk_n
         _init_state, init_idx, try_idx = slot.job
         entry = results[init_idx]
         entry["all_trajs"].append(slot.traj)
+        j = _traj_jerk(slot.traj["actions"])
+        if j > 0.0:                              # T<4 -> 0.0, skipped
+            jerk_sum += j
+            jerk_n += 1
         if slot.success:
             if init_idx not in first_success:
                 first_success[init_idx] = try_idx + 1     # 1-based first-success try
@@ -469,21 +484,33 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
         # init states fully done = all their try_times tries completed.
         tries_per_init = int(try_times)
         init_done = 0
+        init_done_failed = 0          # failed inits whose try_times tries all ran
+        solved_failed = 0             # failed inits solved by exploration
         for i in range(n):
             if results[i]["baseline_solved"]:
                 init_done += 1
-            elif len(results[i]["all_trajs"]) >= tries_per_init:
+                continue
+            if len(results[i]["all_trajs"]) >= tries_per_init:
                 init_done += 1
+                init_done_failed += 1
+            if results[i]["solved"]:
+                solved_failed += 1
         _wandb_log(wandb_run, {
             "explore/init_done": init_done,
             "explore/tries_done": done,
             "explore/collected": collected,
             "explore/yield": collected,
         })
+        if on_progress is not None:
+            on_progress({
+                "explore_init_done": init_done_failed,
+                "solved_failed": solved_failed,
+                "jerk_sum": jerk_sum, "jerk_n": jerk_n,
+            })
 
     runner = _VecRunner(
         dp, env_factory, n_envs, n_action_steps, horizon, device,
-        guided=True, on_done=on_done, progress_cb=progress_cb,
+        guided=guided, on_done=on_done, progress_cb=progress_cb,
         wandb_run=wandb_run, log_every=log_every,
     )
     try:

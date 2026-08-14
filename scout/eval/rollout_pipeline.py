@@ -1,0 +1,278 @@
+"""SOE rollout pipeline: eval (step 2) -> explore-failed-only (step 3).
+
+A single orchestrator implementing the SOE self-improvement rollout flow for
+SCOUT (scout_design.md / the SOE `run.py` round structure, steps 2-4):
+
+  step 2  :func:`evaluate_baseline_vec` (``n_tries=1``) over N init states
+           -> ``success_rate`` (first-try) + the FAILED init states.
+  step 3  :func:`evaluate_exploration_vec` (``only_failed_of=first_results``,
+           ``try_times=5``) on the FAILED inits only:
+             guided=True  -> VIB-guided denoising (``predict_action_dyn_guided``)
+             guided=False -> plain base-DP retry (``predict_action``; baseline)
+           -> successful trajs (with obs, for hdf5 write-back) + pass@5 +
+           avg_jerk over EVERY exploration trajectory (success + failure, SOE
+           3rd-difference norm).
+  step 4  done by the CLI (:func:`hdf5_writer.write_rollouts_to_hdf5`); this
+           class returns the metrics dict + the successful trajs.
+
+The wandb running view (``eval/success_rate``, ``rollout/pass@5``,
+``rollout/avg_jerk`` vs completed-init-count) is driven by the ``on_progress``
+callback the CLI supplies; the engine's internal wandb logging is disabled
+(``wandb_run=None``) so the custom x-axis (``wandb.define_metric`` step_metric)
+is the sole source.
+"""
+
+from __future__ import annotations
+
+from typing import Callable, List, Optional
+
+import numpy as np
+import torch
+
+from scout.eval.rollout_vec import (
+    evaluate_baseline_vec,
+    evaluate_exploration_vec,
+)
+from scout.eval.rollout import (
+    collect_initial_states,
+    make_action_bridge,
+    make_obs_adapter,
+)
+from scout.eval.metrics import (
+    success_rate_per_round,
+    pass_at_k,
+    jerk,
+    jerk_of_results,
+)
+from scout.eval.factories import DPFactory, VIBFactory, EnvFactory
+
+
+class RolloutPipeline:
+    """SOE step-2 -> step-3 rollout orchestrator (vec engine).
+
+    Args:
+        cfg        : loaded eval config (configs/eval_<task>.yaml). Reads
+                     ``cfg.eval.{horizon, try_times, n_init_states, n_envs,
+                     log_every, view_names, proprio_keys}`` and
+                     ``cfg.exploration.{guidance_scale,
+                     guidance_start_timestep}``.
+        dp_factory / scout_vib_factory / env_factory : from
+                     :mod:`scout.eval.factories`.
+        device     : torch device.
+        guided     : True = VIB-guided exploration (mode=dyn); False = plain
+                     base-DP retry on failed inits (mode=off / baseline).
+        log_every  : tick period for the engine progress callback.
+    """
+
+    def __init__(self, cfg, dp_factory: DPFactory,
+                 scout_vib_factory: Optional[VIBFactory],
+                 env_factory: EnvFactory,
+                 device: Optional[torch.device] = None,
+                 guided: bool = False, log_every: Optional[int] = None):
+        self.cfg = cfg
+        self.dp_factory = dp_factory
+        self.scout_vib_factory = scout_vib_factory
+        self.env_factory = env_factory
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+        self.guided = bool(guided)
+        self.n_envs = int(getattr(cfg.eval, "n_envs", 1))
+        self.log_every = int(log_every if log_every is not None
+                             else getattr(cfg.eval, "log_every", 10))
+        # guidance / obs-adapter config (only used when guided)
+        self.guidance_scale = float(getattr(cfg, "exploration", {})
+                                    .get("guidance_scale", 5.0))
+        self.guidance_start_timestep = int(
+            getattr(cfg, "exploration", {}).get("guidance_start_timestep", 50))
+        self.view_names = list(getattr(cfg.eval, "view_names", []))
+        self.proprio_keys = list(getattr(cfg.eval, "proprio_keys", []))
+        # base seed for reproducible init scenes (42 -> init i uses seed 42+i,
+        # i.e. 42..141) + torch/np seeded for step2 reproducibility. None ->
+        # unseeded (legacy). Same seed across runs -> same 100 scenes -> a
+        # controlled DP-vs-SCOUT comparison (success_rate / failed set match).
+        self.base_seed = getattr(cfg.eval, "seed", None)
+
+    # ------------------------------------------------------------------ #
+    def _attach_planner(self, dp, scout_vib):
+        """Attach the SCOUT planner to ``dp`` (seam ① + ②). Idempotent; skipped
+        for mocks without ``initialize_scout_planner``.
+
+        Per design §4: planner carries the frozen ScoutVIB (``E_s`` +
+        ``vib_enc``) + the unnormalize-only action bridge (from this DP's
+        normalizer) + the obs-adapter (LPB keyed obs -> E_s format). z is
+        sampled fresh per rollout inside the vec runner.
+        """
+        from scout.guidance.planner import ScoutPlanner
+        bridge = make_action_bridge(dp)                                   # seam ②
+        obs_adapter = make_obs_adapter(self.view_names, self.proprio_keys)  # seam ①
+        planner = ScoutPlanner(scout_vib, bridge=bridge,
+                               obs_adapter=obs_adapter, z=None)
+        init = getattr(dp, "initialize_scout_planner", None)
+        if callable(init):
+            init(planner, self.guidance_start_timestep, self.guidance_scale)
+
+    # ------------------------------------------------------------------ #
+    def run(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
+            on_progress: Optional[Callable[..., None]] = None,
+            success_only: bool = False) -> dict:
+        """Run SOE step 2 (eval) + step 3 (explore failed only).
+
+        ``on_progress`` is invoked as
+            ``on_progress("eval",    payload)``                      (step 2)
+            ``on_progress("explore", payload, baseline_solved, N)``  (step 3)
+        where ``payload`` carries the engine's running counters (see
+        :mod:`scout.eval.rollout_vec`). The CLI uses these to plot the three
+        wandb metrics vs completed-init-count.
+
+        Returns ``{"metrics": {...}, "trajs": [successful trajs with obs]}``.
+        """
+        horizon = int(self.cfg.eval.horizon)
+        try_times = int(getattr(self.cfg.eval, "try_times", 5))
+        n_init = int(getattr(self.cfg.eval, "n_init_states", 100))
+        print(f"[rollout] dp_ckpt={dp_ckpt} guided={self.guided} "
+              f"n_init={n_init} try_times={try_times} n_envs={self.n_envs}"
+              + (f" vib_ckpt={vib_ckpt}" if self.guided else ""))
+        if self.base_seed is not None:
+            torch.manual_seed(int(self.base_seed))
+            np.random.seed(int(self.base_seed))
+            print(f"[rollout] base_seed={self.base_seed}: init i seeded "
+                  f"{self.base_seed}+i ({self.base_seed}..{self.base_seed + n_init - 1}); "
+                  "torch/np seeded for step2 reproducibility")
+
+        dp = self.dp_factory(dp_ckpt)
+        n_action_steps = int(getattr(dp, "n_action_steps", 1))
+        init_states = collect_initial_states(self.env_factory, n_init_states=n_init,
+                                             base_seed=self.base_seed)
+        N = len(init_states)
+        print(f"[rollout] collected {N} init states")
+
+        # ---- step 2: baseline eval, 1 try each (pure base path) ----
+        eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
+        first_results, _, _ = evaluate_baseline_vec(
+            dp, self.env_factory, init_states, horizon=horizon,
+            n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
+            n_tries=1, metric_prefix="eval",
+            on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
+        )
+        baseline_solved = int(sum(1 for s, _ in first_results if s))
+        print(f"[rollout] step2 eval: success_rate={baseline_solved}/{N} "
+              f"({baseline_solved / max(N, 1):.3f}); "
+              f"{N - baseline_solved} failed inits")
+        if success_only:
+            # --success-only: skip step3 (explore) + step4 (merge); return step2
+            # metrics only (no VIB / no hdf5 needed). Used to eval an arbitrary
+            # DP ckpt's pure success_rate on the seed-fixed 100-init scene set.
+            print("[rollout] --success-only: skipping explore + merge")
+            return {"metrics": {
+                "success_rate": success_rate_per_round(first_results),
+                "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+                "baseline_solved": baseline_solved,
+                "n_failed": N - baseline_solved,
+                "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
+                                        if not s],
+            }, "trajs": []}
+
+        # ---- step 3: explore FAILED inits only (guided or plain DP retry) ----
+        if self.guided:
+            if self.scout_vib_factory is None:
+                raise ValueError("guided=True requires a scout_vib_factory")
+            scout_vib = (self.scout_vib_factory(vib_ckpt)
+                         if vib_ckpt is not None else self.scout_vib_factory())
+            self._attach_planner(dp, scout_vib)
+        expl_cb = (lambda p: on_progress("explore", p, baseline_solved, N)
+                   ) if on_progress else None
+        expl = evaluate_exploration_vec(
+            dp, self.env_factory, init_states, horizon=horizon,
+            try_times=try_times, n_envs=self.n_envs, n_action_steps=n_action_steps,
+            device=self.device, only_failed_of=first_results, guided=self.guided,
+            on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
+        )
+        trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
+        n_failed = N - baseline_solved
+        exploration_rescued = int(sum(1 for e in expl
+                                      if e["solved"] and not e["baseline_solved"]))
+        print(f"[rollout] step3 explore: rescued {exploration_rescued}/{n_failed} "
+              f"failed inits; collected {len(trajs)} successful trajs")
+
+        metrics = {
+            "success_rate": success_rate_per_round(first_results),
+            "pass_at_5": pass_at_k(expl, first_results, k=try_times),
+            "avg_jerk": _jerk_all_explore_trajs(expl),
+            "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+            "baseline_solved": baseline_solved,
+            "n_failed": n_failed,
+            "exploration_rescued": exploration_rescued,
+            "collected_trajs": len(trajs),
+            "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
+                                    if not s],
+        }
+        return {"metrics": metrics, "trajs": trajs}
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _jerk_all_explore_trajs(exploration_results) -> float:
+    """Mean SOE jerk over EVERY exploration trajectory (``all_trajs``: success
+    + failure), T<4 skipped. Same caliber as the engine's per-tick running
+    ``avg_jerk`` (:func:`scout.eval.rollout_vec` accumulates jerk over every
+    finalized traj). Used for the final JSON value.
+    """
+    jerks: List[float] = []
+    for e in exploration_results:
+        for traj in e.get("all_trajs", []):
+            j = jerk(traj["actions"])
+            if j > 0.0:                               # T<4 -> 0.0, skipped
+                jerks.append(j)
+    return float(np.mean(jerks)) if jerks else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# synthetic wiring check (metrics assembly on dummy first_results + expl)
+# --------------------------------------------------------------------------- #
+def _dry_run():
+    """Verify the metrics assembly + helper wiring on synthetic results (no
+    engine / no env). Run via ``python -m scout.eval.rollout_pipeline``.
+    """
+    rng = np.random.default_rng(0)
+
+    def mk(T=15, A=10, succ=True):
+        return {"actions": rng.standard_normal((T, A)).astype(np.float32),
+                "rewards": np.zeros(T, dtype=np.float32),
+                "dones": np.zeros(T, dtype=bool), "states": [{}] * T,
+                "obs": [], "next_obs": [], "horizon": T, "success": succ,
+                "initial_state_dict": None}
+
+    N = 6
+    # 3 baseline-successful, 3 failed; of the failed, 2 rescued by exploration.
+    first_results = [(True, mk())] * 3 + [(False, mk())] * 3
+    expl = [
+        {"solved": True, "n_tries": 0, "successful_trajs": [], "all_trajs": [],
+         "baseline_solved": True}] * 3 + [
+        {"solved": True, "n_tries": 2,
+         "successful_trajs": [mk()], "all_trajs": [mk(succ=False), mk()],
+         "baseline_solved": False},
+        {"solved": True, "n_tries": 4,
+         "successful_trajs": [mk()], "all_trajs": [mk(succ=False)] * 4 + [mk()],
+         "baseline_solved": False},
+        {"solved": False, "n_tries": 5, "successful_trajs": [],
+         "all_trajs": [mk(succ=False)] * 5, "baseline_solved": False},
+    ]
+    sr = success_rate_per_round(first_results)
+    p5 = pass_at_k(expl, first_results, k=5)
+    aj = _jerk_all_explore_trajs(expl)
+    jb = jerk_of_results(first_results, only_successful=True)
+    print(f"success_rate = {sr:.4f}  (expect 0.5000)")
+    print(f"pass_at_5    = {p5:.4f}  (expect 0.8333 = 5/6)")
+    print(f"avg_jerk     = {aj:.4f}  (expect > 0, over all all_trajs incl fails)")
+    print(f"jerk_baseline= {jb:.4f}  (expect > 0)")
+    assert abs(sr - 0.5) < 1e-6
+    assert abs(p5 - 5.0 / 6.0) < 1e-6
+    assert aj > 0.0
+    # _jerk_all_explore_trajs covers all all_trajs (success + fail) -> nonzero.
+    assert _jerk_all_explore_trajs(expl) > 0.0
+    print("[dry-run] rollout_pipeline metrics assembly OK")
+
+
+if __name__ == "__main__":
+    _dry_run()

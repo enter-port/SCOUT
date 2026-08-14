@@ -9,7 +9,7 @@ Wires SCOUT's eval onto the LPB base DP stack:
     :class:`scout.guidance.policy.ScoutPolicy` (an LPB
     ``DiffusionUnetHybridImagePolicy`` subclass with SCOUT guidance in its
     overridden ``guided_conditional_sample``) and drives its
-    ``predict_action_dyn_guided``; the SCOUT planner (cost ``‖z−μ‖``, seam ②
+    ``predict_action_dyn_guided``; the SCOUT planner (cost ``‖z−z_θ‖``, z_θ=reparam, seam ②
     unnormalize-only bridge, seam ① obs-adapter) is attached once at construction.
 
 Env interface (pluggable; real = :class:`RobomimicScoutEnvAdapter` around the LPB
@@ -50,6 +50,8 @@ from scout.normalizer import ActionNormalizerBridge, UnnormalizeOnlyBridge
 def make_obs_adapter(
     view_names: Sequence[str],
     proprio_keys: Sequence[str],
+    img_scale: Optional[float] = 1.0 / 255.0,
+    crop_size: Optional[int] = 76,
 ) -> Callable[[dict], dict]:
     """seam ①: LPB raw keyed ``obs_dict`` -> E_s format (scout_design.md §2).
 
@@ -59,12 +61,33 @@ def make_obs_adapter(
     threads into ``guided_conditional_sample`` (i.e. the last obs frame,
     per-key ``(B, 1, *shape)`` tensors). RGB keys are already ``CHW`` under the
     LPB shape_meta; proprio keys are concatenated into a single ``(B,1,P)``.
+
+    Preprocessing (must match VIB training inputs exactly):
+      - ``img_scale``: the env returns raw uint8-scale [0,255] images (robomimic
+        ``postprocess_visual_obs=False``), but E_s was trained on [0,1] images
+        (``RobomimicImageDynamicsModelDataset`` applies ``/255``) -- so divide
+        by 255 here.
+      - ``crop_size``: VIB training crops 84x84 -> 76x76 (random crop at train,
+        center crop at val); inference uses the center crop to match the val /
+        base-DP eval_fixed_crop transform. Applied only when the incoming
+        spatial size is larger than ``crop_size`` (no-op for 76 or smaller).
     """
     view_names = list(view_names)
     proprio_keys = list(proprio_keys)
 
     def adapt(current_obs: dict) -> dict:
-        visual = {v: current_obs[v].float() for v in view_names}
+        visual = {}
+        for v in view_names:
+            img = current_obs[v].float()
+            if img_scale is not None and img_scale != 1.0:
+                img = img * img_scale
+            if crop_size is not None:
+                h, w = img.shape[-2], img.shape[-1]
+                if h > crop_size and w > crop_size:
+                    top = (h - crop_size) // 2
+                    left = (w - crop_size) // 2
+                    img = img[..., top:top + crop_size, left:left + crop_size]
+            visual[v] = img
         proprio = torch.cat([current_obs[k].float() for k in proprio_keys],
                             dim=-1)
         return {"visual": visual, "proprio": proprio}
@@ -290,19 +313,29 @@ def rollout_episode(policy_adapter, env, horizon: int,
 
 
 def collect_initial_states(env_factory: Callable[[], Any],
-                           n_init_states: int) -> List[dict]:
+                           n_init_states: int,
+                           base_seed: Optional[int] = None) -> List[dict]:
     """Generate N distinct init state_dicts via repeated ``env.reset()``.
 
     Robomimic ``reset()`` randomises the env; ``get_state()`` captures the
     deterministic-replay handle. ``env_factory`` is called once and the env is
     closed if it has a ``.close()`` method. The N states are fixed across all
     rounds in the self-improvement loop (fair metric comparison).
+
+    ``base_seed`` (int): if given, init ``i`` is seeded with ``base_seed + i``
+    (e.g. base_seed=42 -> seeds 42..141 for N=100) so the N init states are
+    reproducible and SHARED across runs (same seed -> same 100 scenes -> a
+    controlled DP-vs-SCOUT comparison). ``None`` -> unseeded (legacy default).
     """
     env = env_factory()
     try:
         states = []
-        for _ in range(n_init_states):
-            env.reset()
+        for i in range(n_init_states):
+            seed = (int(base_seed) + i) if base_seed is not None else None
+            try:
+                env.reset(seed=seed)
+            except TypeError:
+                env.reset()           # mock adapters without a seed kwarg
             states.append(env.get_state())
         return states
     finally:
@@ -529,10 +562,12 @@ class RobomimicScoutEnvAdapter:
         self._obs_buffer = [obs] * self.n_obs_steps   # pad with the first frame
 
     # -- SCOUT env contract ------------------------------------------------ #
-    def reset(self) -> dict:
-        # random reset (init_state=None, no seed) -- the wrapper caches states.
+    def reset(self, seed: Optional[int] = None) -> dict:
+        # random reset. ``seed`` (int) -> the wrapper seeds the env RNG so the
+        # sampled init state is deterministic for that seed (None -> random,
+        # the default; matches the previous unseeded behaviour).
         self.wrapper.init_state = None
-        self.wrapper._seed = None
+        self.wrapper._seed = seed
         obs = self.wrapper.reset()
         self._seed_buffer(obs)
         return self._stack()
