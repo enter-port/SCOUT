@@ -11,7 +11,7 @@ What changes vs LPB ``guided_conditional_sample``
 
   1. **Cost**: LPB's ``self.planner.compute_loss`` (NN-distance to demo latents)
      -> :meth:`scout.guidance.planner.ScoutPlanner.compute_loss`
-     (``mean_t ‖z − μ(s̄_t, a_t)‖²``).
+     (``mean_t ‖z − z_θ(s̄_t, a_t)‖²``, z_θ = reparam sample = p_θ(s̄_t,a)).
   2. **Gate**: LPB's
      ``if classifier_guidance and t < self.guidance_start_timestep and
      current_cost > self.threshold:``

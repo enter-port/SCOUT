@@ -9,7 +9,7 @@ unit-testable on dummy inputs (see ``_phase4_verify_tmp.py``).
 
 **E2 — guidance three判据** (sweep ``guidance_scale``, fixed init noise + fixed z set):
   1. diversity    -- action std *across z* per scale (scale=0 → ~0; monotone up).
-  2. consistency  -- ``mean_t ‖z − μ(s̄_t, a_guided)‖`` (should *fall* with scale).
+  2. consistency  -- ``mean_t ‖z − z_θ(s̄_t, a_guided)‖`` (z_θ=reparam; should *fall* with scale).
   3. cost-direction -- per-step SCOUT cost over the guided denoise steps
                        (should fall; a rising curve means the guidance sign is
                        flipped -- design §4).

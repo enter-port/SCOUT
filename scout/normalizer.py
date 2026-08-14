@@ -1,6 +1,6 @@
 """Action-space normalizer bridge: base-DP action -> VIB encoder action space.
 
-SCOUT cost (``guidance/cost.py``) evaluates the VIB encoder ``μ(s̄_t, a)`` on the
+SCOUT cost (``guidance/cost.py``) evaluates the VIB encoder ``z_θ(s̄_t, a)`` (= reparam sample p_θ(s̄_t,a), not mean μ) on the
 action predicted by the base Diffusion Policy. The two modules may live in
 **different action spaces**: the base DP (when ported with its full SOE/LPB
 ``normalizer['action']`` stack) predicts *DP-normalised* actions, while the VIB
