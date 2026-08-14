@@ -1,35 +1,45 @@
 #!/bin/bash
-# SCOUT round driver -- CAN (rollout -> retrain DP -> retrain dyn), strictly
-# serial, wall-clock stamped. Clone this file per task (change TASK + core
-# hdf5 name) to extend to square / lift / transport.
+# SCOUT round driver (rollout -> retrain DP -> retrain dyn), strictly serial,
+# wall-clock stamped. Task-generic: `round.sh <task> <DP|SCOUT> <exp-num>`
+# (can and square are wired today; a new task needs configs/eval_<task>.yaml,
+# configs/{base_dp,vib}_<task>_image.yaml and data/<task>/rollout/<task>_core.hdf5).
 #
 # Canonical data layout / naming (2026-08-14):
-#   data/can/train/DP/DP-base              frozen base DP (E0; formerly DP-can-base)
-#   data/can/train/DP/DP-{a}-exp{num}      retrained DP,   a in {DP, SCOUT}, num>=1
-#   data/can/train/dyn/dyn-base            Step-1 VIB dynamics (full-data train)
-#   data/can/train/dyn/dyn-{a}-exp{num}    retrained dyn
-#   data/can/rollout/{a}-exp{num}/         success.hdf5 + all.hdf5 + log/*.json
+#   data/<task>/train/DP/DP-base              frozen base DP (E0; formerly DP-<task>-base)
+#   data/<task>/train/DP/DP-{a}-exp{num}      retrained DP,   a in {DP, SCOUT}, num>=1
+#   data/<task>/train/dyn/dyn-base            Step-1 VIB dynamics (full-data train)
+#   data/<task>/train/dyn/dyn-{a}-exp{num}    retrained dyn
+#   data/<task>/rollout/{a}-exp{num}/         success.hdf5 + all.hdf5 + log/*.json
 #     success.hdf5 = core + successful EXPLORATION trajs -> DP retrain
 #     all.hdf5     = core + every traj of the round          -> dyn retrain
 #
 # Round chaining: exp{num} rolls out with DP-{a}-exp{num-1} (fallback DP-base)
 # and, for a=SCOUT, is guided by dyn-{a}-exp{num-1} (fallback dyn-base). The
-# retrained dyn uses E_s from the NEW DP-{a}-exp{num}, so the next round's
-# (DP, E_s) pair stays matched. If dyn-base is missing it is trained first
-# (configs/vib_can_image.yaml, ~15 min with the feature cache).
+# retrained dyn uses E_s from the NEW DP-{a}-exp{num} (the VIB ckpt also pins
+# E_s since the ModuleDict fix), keeping the next round's (DP, E_s) pair
+# matched. If dyn-base is missing it is trained first
+# (configs/vib_<task>.yaml, ~15 min with the feature cache).
 #
 # Disk note: retrains write training.checkpoint_every=100 (~6 ckpts = ~28 GB
 # per round) because the shared CPFS runs near quota; change if space allows.
 #
 # Usage:
-#   bash soe_scripts/round_can.sh <DP|SCOUT> <exp-num>
+#   bash soe_scripts/round.sh <task> <DP|SCOUT> <exp-num>
 # Env:
 #   GPU=0        CUDA device for all three stages
 #   DRY_RUN=1    print the commands instead of executing (no dirs created)
 set -u
 
-A=${1:?usage: round_can.sh <DP|SCOUT> <exp-num>}
-NUM=${2:?usage: round_can.sh <DP|SCOUT> <exp-num>}
+TASK=${1:?usage: round.sh <task> <DP|SCOUT> <exp-num>}
+A=${2:?usage: round.sh <task> <DP|SCOUT> <exp-num>}
+NUM=${3:?usage: round.sh <task> <DP|SCOUT> <exp-num>}
+case "$TASK" in
+  can|square) ;;
+  *) echo "task must be can or square (got: $TASK)."
+     echo "to add a task: configs/eval_<task>.yaml + configs/base_dp_<task>_image.yaml"
+     echo "                + configs/vib_<task>_image.yaml + data/<task>/rollout/<task>_core.hdf5"
+     exit 1 ;;
+esac
 case "$A" in
   DP|SCOUT) ;;
   *) echo "a must be DP or SCOUT (got: $A)"; exit 1 ;;
@@ -47,7 +57,6 @@ export WANDB_CACHE_DIR=/root/workspace/baojiachun/.cache/wandb
 REPO=/root/workspace/baojiachun/scout
 DATA=$REPO/data
 PY=/root/workspace/baojiachun/.venv/bin/python
-TASK=can
 TDP=$DATA/$TASK/train/DP
 TDYN=$DATA/$TASK/train/dyn
 CORE=$DATA/$TASK/rollout/${TASK}_core.hdf5
@@ -75,6 +84,14 @@ RUN(){
 }
 newest_ckpt(){ ls -t "$1"/checkpoints/*.ckpt 2>/dev/null | head -1; }
 newest_vib(){  ls -t "$1"/*/scout_vib.ckpt  2>/dev/null | head -1; }
+
+# ---- per-task prerequisites (read-only checks; also useful in DRY_RUN) ---- #
+for f in configs/eval_${TASK}.yaml configs/vib_${TASK}_image.yaml \
+         configs/base_dp_${TASK}_image.yaml; do
+  [ -f "$f" ] || { echo "missing $f"; exit 1; }
+done
+[ -f "$CORE" ] || { echo "missing core hdf5: $CORE"; exit 1; }
+[ -n "$(newest_ckpt "$TDP/DP-base")" ] || { echo "no DP-base ckpt under $TDP/DP-base"; exit 1; }
 
 # ---- resolve this round's rollout inputs (chained, fallback to base) ------- #
 PREV=$((NUM - 1))
@@ -127,7 +144,7 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
   > "$RLOG" 2>&1
 RC=$?; T1=$(date +%s)
 log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
-[ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RDIR/rollout.stdout"; exit 1; }
+[ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RLOG"; exit 1; }
 
 # ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
 if [ -f "$RDIR/success.hdf5" ]; then
@@ -150,7 +167,7 @@ if [ -f "$RDIR/success.hdf5" ]; then
     > "$DPLOG" 2>&1
   RC=$?; T2=$(date +%s)
   log "[2/3] DP retrain rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
-  [ $RC -ne 0 ] && { log "DP RETRAIN FAILED - see $OUTDP.train.log"; exit 1; }
+  [ $RC -ne 0 ] && { log "DP RETRAIN FAILED - see $DPLOG"; exit 1; }
 else
   log "[2/3] no success.hdf5 (0 exploration successes) -- DP retrain SKIPPED"
   T2=$T1
@@ -162,10 +179,10 @@ NEWDP=$(newest_ckpt "$OUTDP")
 if [ "$DRY_RUN" = 1 ]; then
   log "[3/3] dyn retrain (dry): ds=$RDIR/all.hdf5 es_base=${NEWDP:-<newest ckpt of $OUTDP>} -> $OUTDYN"
 else
-  $PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" <<'PYEOF'
+  $PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TASK" <<'PYEOF'
 import sys, yaml, glob, os
-cfg_path, rdir, outdyn, outdp, a_tag, num = sys.argv[1:7]
-with open("configs/vib_can_image.yaml") as f:
+cfg_path, rdir, outdyn, outdp, a_tag, num, task = sys.argv[1:8]
+with open(f"configs/vib_{task}_image.yaml") as f:
     cfg = yaml.safe_load(f)
 cfg["dataset"]["zarr_path"] = f"{rdir}/all.hdf5"
 cfg["dataset"]["feature_cache"] = True
@@ -174,7 +191,7 @@ ck = sorted(glob.glob(os.path.join(outdp, "checkpoints", "*.ckpt")),
 if ck:   # E_s from the NEW DP keeps the next round's (DP, E_s) pair matched
     cfg["model"]["E_s"]["base_dp_ckpt"] = ck[-1]
 cfg["save_dir"] = outdyn
-cfg.setdefault("wandb", {})["name"] = f"dyn-can-{a_tag}-exp{num}"
+cfg.setdefault("wandb", {})["name"] = f"dyn-{task}-{a_tag}-exp{num}"
 with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 PYEOF
@@ -184,6 +201,6 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.train_vib --config "$CFG" \
   > "$DYNLOG" 2>&1
 RC=$?; T3=$(date +%s)
 log "[3/3] dyn retrain rc=$RC in $(( (T3-T2)/60 ))m$(( (T3-T2)%60 ))s"
-[ $RC -ne 0 ] && { log "DYN RETRAIN FAILED - see $OUTDYN.train.log"; exit 1; }
+[ $RC -ne 0 ] && { log "DYN RETRAIN FAILED - see $DYNLOG"; exit 1; }
 
 log "=== ROUND $TASK a=$A exp=$NUM TOTAL: $(( (T3-T0)/60 ))m$(( (T3-T0)%60 ))s ==="

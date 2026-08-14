@@ -281,7 +281,12 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         del mse
                 
                 # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0:
+                # epochs are 0-indexed, so `epoch % checkpoint_every == 0`
+                # alone never fires on the final epoch (e.g. 599 with 600
+                # epochs / every=20) and the last weights were lost -- also
+                # save on the last epoch (numbering stays 0,20,...,580,599).
+                if (self.epoch % cfg.training.checkpoint_every) == 0 \
+                        or self.epoch == cfg.training.num_epochs - 1:
                     # checkpointing
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint(tag=str(self.epoch))
