@@ -170,6 +170,9 @@ fi
 # ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
 if [ -f "$RDIR/success.hdf5" ]; then
   log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=100 ds=$RDIR/success.hdf5 -> $OUTDP"
+  # num_workers=0: workers>0 crashes on this server (torch_shm_manager
+  # "Operation not supported" in DataLoader collate, known since base-DP
+  # training -- see AGENTS.md scout-base-dp-training).
   RUN env CUDA_VISIBLE_DEVICES=$GPU $PY train.py \
     --config-path configs --config-name base_dp_${TASK}_image \
     task.dataset_path="$RDIR/success.hdf5" \
@@ -180,8 +183,7 @@ if [ -f "$RDIR/success.hdf5" ]; then
     training.sample_every=100 \
     training.checkpoint_every=100 \
     training.device=cuda:0 \
-    dataloader.num_workers=8 \
-    dataloader.persistent_workers=true \
+    dataloader.num_workers=0 \
     logging.name=DP-${TASK}-${A}-exp${NUM} \
     logging.project=scout-base-dp \
     hydra.run.dir="$OUTDP" \
