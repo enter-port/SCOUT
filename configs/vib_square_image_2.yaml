@@ -1,0 +1,55 @@
+# SCOUT-dyn-square-2: VIB dynamics v2, DP-square-DP-exp1 base + 第一次 DP rollout+core 数据.
+# 配 SCOUT-dyn-square-1（DP₀ base + 全量数据）的对照：base 换 exp1 DP、数据换 augmented。
+# Run: python -m scout.train_vib --config configs/vib_square_image_2.yaml
+
+seed: 233
+
+dataset:
+  zarr_path: /root/workspace/baojiachun/scout/data/square/rollout/square_DP_exp1.hdf5
+  view_names: ['agentview_image', 'robot0_eye_in_hand_image']
+  abs_action: true
+  use_crop: true            # per-sample RandomCrop(76) on 84, matching base DP crop_shape [76,76]
+  original_img_size: 84
+  cropped_img_size: 76
+  action_dim: 10            # abs_6drot: 3 trans + 6 rot_6d + 1 gripper (per-step)
+  frameskip: 8              # predict s_{t+8}; action chunk = 8 steps (80-dim) = base DP n_action_steps
+  num_workers: 0            # torch shm "Operation not supported" -> 0 (known-good; data in-RAM)
+  shape_obs:
+    robot0_eef_pos:      {shape: [3]}
+    robot0_eef_quat:     {shape: [4]}
+    robot0_gripper_qpos: {shape: [2]}
+    agentview_image:          {shape: [3, 84, 84], type: rgb}
+    robot0_eye_in_hand_image: {shape: [3, 84, 84], type: rgb}
+
+model:
+  E_s:
+    # DP-square-DP-exp1（第一次 DP rollout+core 数据训练的 exp1 DP）580.ckpt
+    base_dp_ckpt: /root/workspace/baojiachun/scout/data/square/train/DP-square-DP-exp1/checkpoints/580.ckpt
+    view_names: ['agentview_image', 'robot0_eye_in_hand_image']
+    proprio_dim: 9          # eef_pos(3) + eef_quat(4) + gripper_qpos(2)
+    proprio_emb_dim: 64     # -> s_bar_dim = 512*2 + 64 = 1088
+  style_dim: 16             # VIB skill latent z
+  hidden_dim: 128
+
+beta: 1.0e-3                # single β (KL pulls z -> N(0,I), which is the intended prior
+                            # so test can sample z~N(0,I)).
+
+optimizer:
+  name: AdamW
+  params:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-6
+
+batch_size: 256
+num_epochs: 300
+steps_per_epoch: 200
+val_ratio: 0.1             # hold out last 10% of demos for val (episode-level)
+val_every: 20              # eval val latent_mse every N epochs
+
+save_dir: /root/workspace/baojiachun/scout/data/square/train/SCOUT-dyn-square-2
+
+use_wandb: true
+wandb:
+  project: scout-dynamics
+  name: SCOUT-dyn-square-2

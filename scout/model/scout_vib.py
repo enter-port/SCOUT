@@ -75,6 +75,16 @@ class ScoutVIB(nn.Module):
         s_bar = self.E_s(obs)              # (B, 1, s_bar_dim)
         return s_bar.squeeze(1)
 
+    def encode_from_feats(self, feat_obs: dict) -> torch.Tensor:
+        """``feat_obs = {"visual_feat": {view: (B,T,512)}, "proprio": (B,T,P)}``
+        (precomputed frozen-ResNet features, :mod:`scout.feat_cache`) ->
+        ``s̄`` of shape ``(B, s_bar_dim)``. Identical to :meth:`encode` for the
+        same crops -- only the live proprio branch runs on GPU.
+        """
+        s_bar = self.E_s.forward_from_feats(
+            feat_obs["visual_feat"], feat_obs["proprio"])   # (B, 1, s_bar_dim)
+        return s_bar.squeeze(1)
+
     def forward(
         self,
         obs_t: dict,
@@ -92,6 +102,30 @@ class ScoutVIB(nn.Module):
         """
         s_bar_t = self.encode(obs_t)
         s_bar_tp1 = self.encode(obs_tp1).detach()          # latent target (no grad)
+
+        mu, logvar = self.vib_enc(s_bar_t, a_t)
+        z = reparam(mu, logvar)
+        s_bar_pred = self.D_s(z, s_bar_t)                   # ŝ̄_{t+1}
+
+        latent_mse = F.mse_loss(s_bar_pred, s_bar_tp1)
+        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1).mean()
+
+        loss = latent_mse + self.beta * kl
+        return {"loss": loss, "latent_mse": latent_mse, "kl": kl,
+                "mu": mu, "logvar": logvar}
+
+    def forward_feats(
+        self,
+        feat_obs_t: dict,
+        a_t: torch.Tensor,
+        feat_obs_tp1: dict,
+    ) -> dict:
+        """Identical loss to :meth:`forward` but consuming precomputed
+        frozen-ResNet features (``feat_obs = {"visual_feat": {view: (B,1,512)}},
+        "proprio": (B,1,P)}``) -- the fast path of :mod:`scout.feat_cache`.
+        """
+        s_bar_t = self.encode_from_feats(feat_obs_t)
+        s_bar_tp1 = self.encode_from_feats(feat_obs_tp1).detach()
 
         mu, logvar = self.vib_enc(s_bar_t, a_t)
         z = reparam(mu, logvar)

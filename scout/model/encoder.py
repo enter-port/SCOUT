@@ -130,3 +130,26 @@ class StateEncoder(nn.Module):
 
         s_bar = torch.cat([visual, proprio_emb], dim=-1)    # (B,T,s_bar_dim)
         return s_bar
+
+    def forward_from_feats(
+        self,
+        visual_feats: dict[str, torch.Tensor],
+        proprio: torch.Tensor,
+    ) -> torch.Tensor:
+        """Same fusion as :meth:`forward` but with the frozen-ResNet outputs
+        ALREADY computed (``visual_feats = {view: (B,T,512)}`` -- e.g. from
+        the precomputed feature bank, :mod:`scout.feat_cache`). Identical
+        result to ``forward`` for the same crops (the ResNet is frozen +
+        eval, so its output is a constant per (frame, view, offset)); only
+        the live proprio branch runs.
+
+        ``proprio``: ``(B,T,proprio_dim)`` -- same layout as ``forward``.
+        Returns ``(B,T,s_bar_dim)``.
+        """
+        visual_parts = [visual_feats[v] for v in self.view_names]
+        visual = torch.cat(visual_parts, dim=-1)            # (B,T, 512*n_views)
+
+        proprio_emb = self.proprio_embed(proprio)           # (B,T,proprio_emb_dim)
+
+        s_bar = torch.cat([visual, proprio_emb], dim=-1)    # (B,T,s_bar_dim)
+        return s_bar

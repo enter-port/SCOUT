@@ -165,18 +165,53 @@ def _slice_transition(batch, device, img_transform=None):
     return obs_t, a_t, obs_tp1
 
 
+def _slice_transition_feats(batch, device):
+    """Feature-cache variant of :func:`_slice_transition`.
+
+    ``batch`` comes from
+    :class:`scout.feat_cache.CachedFeatureTransitionDataset` -- ``obs`` carries
+    PRECOMPUTED frozen-ResNet features (``obs["visual_feat"][v]``:
+    (B, T, 512)) instead of raw images, so no crop/transform happens here.
+    Returns ``(feat_obs_t, a_t, feat_obs_tp1)`` in the layout
+    :meth:`ScoutVIB.forward_feats` consumes. Identical anchor/action slicing
+    to the live path.
+    """
+    obs, act, _state = batch
+    vf = obs["visual_feat"]
+    proprio = obs["proprio"]
+    obs_t = {
+        "visual_feat": {v: f[:, 0:1].to(device) for v, f in vf.items()},
+        "proprio": proprio[:, 0:1].to(device),
+    }
+    obs_tp1 = {
+        "visual_feat": {v: f[:, 1:2].to(device) for v, f in vf.items()},
+        "proprio": proprio[:, 1:2].to(device),
+    }
+    fs = act.shape[1] // 2
+    a_t = act[:, :fs].reshape(act.shape[0], -1).to(device)
+    return obs_t, a_t, obs_tp1
+
+
 @torch.no_grad()
-def eval_val_mse(model, val_loader, device, val_img_transform):
+def eval_val_mse(model, val_loader, device, val_img_transform, feats_mode=False):
     """Mean latent_mse over the val split (model.eval; restores train() after).
 
     Held-out demos -> distinguishes trivial-prediction (val~train~0) from
-    overfitting (val >> train). Uses the center-crop val transform (no random aug).
+    overfitting (val >> train). Uses the center-crop val transform (no random aug)
+    -- on the feats path the center offsets are baked into the val dataset.
     """
     if val_loader is None:
         return None
     model.eval()
-    mses = [model(*_slice_transition(b, device, val_img_transform))["latent_mse"].item()
-            for b in val_loader]
+    mses = []
+    for b in val_loader:
+        if feats_mode:
+            obs_t, A_t, obs_tp1 = _slice_transition_feats(b, device)
+            out = model.forward_feats(obs_t, A_t, obs_tp1)
+        else:
+            obs_t, A_t, obs_tp1 = _slice_transition(b, device, val_img_transform)
+            out = model(obs_t, A_t, obs_tp1)
+        mses.append(out["latent_mse"].item())
     model.train()
     return float(np.mean(mses)) if mses else None
 
@@ -186,8 +221,9 @@ def eval_val_mse(model, val_loader, device, val_img_transform):
 # --------------------------------------------------------------------------- #
 def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
                    device, out_dir, train_t=None, val_t=None, val_every=20,
-                   wandb_run=None):
-    E_s = build_E_s(E_s_cfg)
+                   wandb_run=None, E_s=None, feats_mode=False):
+    if E_s is None:
+        E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
         action_dim=action_dim,
         E_s=E_s,
@@ -205,32 +241,43 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
 
     model.train()
     for epoch in range(num_epochs):
-        ep = {"latent_mse": 0.0, "kl": 0.0, "mu_abs": 0.0, "n": 0}
+        # accumulate metrics as GPU tensors; .item() once per EPOCH (3 per-step
+        # GPU syncs were ~half the step time on the cached-features path,
+        # where the compute itself is microseconds).
+        ep = {"latent_mse": None, "kl": None, "mu_abs": None, "n": 0}
         for it, batch in enumerate(train_loader):
-            obs_t, A_t, obs_tp1 = _slice_transition(batch, device, train_t)
-            out = model(obs_t, A_t, obs_tp1)
+            if feats_mode:
+                obs_t, A_t, obs_tp1 = _slice_transition_feats(batch, device)
+                out = model.forward_feats(obs_t, A_t, obs_tp1)
+            else:
+                obs_t, A_t, obs_tp1 = _slice_transition(batch, device, train_t)
+                out = model(obs_t, A_t, obs_tp1)
             opt.zero_grad(); out["loss"].backward(); opt.step()
 
             # accumulate over EVERY batch (sampling every-N skipped small-data
             # epochs entirely -- lift has 27 batches/epoch < old log_every_batch=40,
             # so it reported a bogus train loss of 0).
-            ep["latent_mse"] += out["latent_mse"].item()
-            ep["kl"] += out["kl"].item()
-            ep["mu_abs"] += out["mu"].detach().abs().mean().item()
+            lm = out["latent_mse"].detach()
+            kl = out["kl"].detach()
+            ma = out["mu"].detach().abs().mean()
+            ep["latent_mse"] = lm if ep["latent_mse"] is None else ep["latent_mse"] + lm
+            ep["kl"] = kl if ep["kl"] is None else ep["kl"] + kl
+            ep["mu_abs"] = ma if ep["mu_abs"] is None else ep["mu_abs"] + ma
             ep["n"] += 1
             if it + 1 >= steps_per_epoch:
                 break
         n = max(1, ep["n"])
-        history["latent_mse"].append(ep["latent_mse"] / n)
-        history["kl"].append(ep["kl"] / n)
-        history["mu_abs"].append(ep["mu_abs"] / n)
+        history["latent_mse"].append(ep["latent_mse"].item() / n)
+        history["kl"].append(ep["kl"].item() / n)
+        history["mu_abs"].append(ep["mu_abs"].item() / n)
 
         # val on held-out demos: trivial-prediction (val~train) vs overfit (val>>train)
         val_mse = None
         do_val = val_loader is not None and (
             epoch % max(1, val_every) == 0 or epoch == num_epochs - 1)
         if do_val:
-            val_mse = eval_val_mse(model, val_loader, device, val_t)
+            val_mse = eval_val_mse(model, val_loader, device, val_t,
+                                   feats_mode=feats_mode)
             history["val_mse"].append(val_mse)
         print(f"  [β={beta:g}] epoch {epoch:4d} | latent_mse {history['latent_mse'][-1]:.4f} "
               f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}"
@@ -272,17 +319,41 @@ def run(cfg):
     beta = float(cfg.get("beta", 1.0e-3))
     print(f"beta = {beta:g}  (single-β flow; no scan, no diagnostic)")
 
+    # Build E_s ONCE (train_one_beta reuses it; the feature bank reuses its
+    # frozen ResNet). Costs one base-DP ckpt load either way.
+    E_s = build_E_s(cfg)
+
+    # Optional frozen-ResNet feature cache (scout/feat_cache.py): precompute the
+    # ResNet output for EVERY (frame, view, 76x76-crop offset) once, then train
+    # on cached features. Same objective + same RandomCrop distribution (81
+    # offsets, per-frame draws) -- turns the CPU-bound ~4min/epoch pipeline
+    # into a few-minutes total run. val uses centre offsets (CenterCrop).
+    feats_mode = bool(getattr(cfg.dataset, "feature_cache", False))
+    train_ds, val_ds = ds, ds
+    if feats_mode:
+        from scout.feat_cache import (
+            CachedFeatureTransitionDataset, get_or_build_bank)
+        banks = get_or_build_bank(ds, E_s, cfg, device)
+        ds.imgs = {}   # free raw in-RAM images (states/actions/anchors stay)
+        train_ds = CachedFeatureTransitionDataset(ds, banks, train=True)
+        val_ds = CachedFeatureTransitionDataset(ds, banks, train=False)
+        print(f"feature_cache: ON -- {len(train_ds)} train anchors, "
+              f"train=uniform-81-offsets / val=centre-offset")
+
     # train/val image transforms (random crop train, center crop val).
     from dyn_model.datasets.img_transforms import (
         get_train_crop_transform_resnet, get_eval_crop_transform_resnet)
     train_t = val_t = None
-    if bool(getattr(cfg.dataset, "use_crop", False)):
+    if (not feats_mode) and bool(getattr(cfg.dataset, "use_crop", False)):
         train_t = get_train_crop_transform_resnet(
             int(cfg.dataset.original_img_size), int(cfg.dataset.cropped_img_size))
         val_t = get_eval_crop_transform_resnet(
             int(cfg.dataset.original_img_size), int(cfg.dataset.cropped_img_size))
         print(f"img_transform: RandomCrop({cfg.dataset.cropped_img_size}) train / "
               f"CenterCrop val, on {cfg.dataset.original_img_size}")
+    elif feats_mode:
+        print("img_transform: baked into the feature bank "
+              "(uniform 81 offsets train / centre val)")
     else:
         print("img_transform: none (full image)")
 
@@ -290,20 +361,20 @@ def run(cfg):
     # (anchors whose frame index >= the first val episode's start belong to val).
     from torch.utils.data import DataLoader, Subset
     val_ratio = float(getattr(cfg, "val_ratio", 0.1))
-    n_eps = len(ds.episode_start_indices)
+    n_eps = len(train_ds.episode_start_indices)
     n_val_eps = max(1, int(round(n_eps * val_ratio))) if n_eps > 1 else 0
     if 0 < n_val_eps < n_eps:
-        cutoff = int(ds.episode_start_indices[n_eps - n_val_eps])
-        anchors = ds.valid_anchor_indices
+        cutoff = int(train_ds.episode_start_indices[n_eps - n_val_eps])
+        anchors = train_ds.valid_anchor_indices
         train_idx = np.where(anchors < cutoff)[0]
         val_idx = np.where(anchors >= cutoff)[0]
     else:
-        train_idx = np.arange(len(ds))
+        train_idx = np.arange(len(train_ds))
         val_idx = np.array([], dtype=np.int64)
     nw = int(getattr(cfg.dataset, "num_workers", 0))
-    train_loader = DataLoader(Subset(ds, train_idx), batch_size=int(cfg.batch_size),
+    train_loader = DataLoader(Subset(train_ds, train_idx), batch_size=int(cfg.batch_size),
                               shuffle=True, num_workers=nw, drop_last=True)
-    val_loader = (DataLoader(Subset(ds, val_idx), batch_size=int(cfg.batch_size),
+    val_loader = (DataLoader(Subset(val_ds, val_idx), batch_size=int(cfg.batch_size),
                              shuffle=False, num_workers=nw)
                   if len(val_idx) > 0 else None)
     print(f"split: {len(train_idx)} train / {len(val_idx)} val anchors "
@@ -328,10 +399,10 @@ def run(cfg):
         print("wandb: disabled")
 
     val_every = int(getattr(cfg, "val_every", 20))
-    print(f"\n=== training β={beta:g} ===")
+    print(f"\n=== training β={beta:g} (feats_mode={feats_mode}) ===")
     s = train_one_beta(cfg, train_loader, val_loader, ds, cfg, action_dim, beta, device,
                        run_root, train_t=train_t, val_t=val_t, val_every=val_every,
-                       wandb_run=wandb_run)
+                       wandb_run=wandb_run, E_s=E_s, feats_mode=feats_mode)
     print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
           f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 

@@ -1,0 +1,57 @@
+# SCOUT-dyn-can-fasttest: VIB dynamics FAST path (frozen-ResNet feature cache).
+# Same objective/sampling as vib_can_image_2.yaml; dataset.feature_cache=true
+# precomputes the (frozen) ResNet outputs for all 81 RandomCrop offsets once
+# (scout/feat_cache.py) -> ~19h -> ~minutes. Validation round on can.
+# Run: python -m scout.train_vib --config configs/vib_can_image_fast.yaml
+
+seed: 233
+
+dataset:
+  zarr_path: /root/workspace/baojiachun/scout/data/can/rollout/can_SCOUT_exp1.hdf5
+  view_names: ['agentview_image', 'robot0_eye_in_hand_image']
+  abs_action: true
+  feature_cache: true        # <-- fast path (scout/feat_cache.py)
+  use_crop: true             # crop semantics live in the bank (81 offsets)
+  original_img_size: 84
+  cropped_img_size: 76
+  action_dim: 10
+  frameskip: 8
+  num_workers: 0
+  shape_obs:
+    robot0_eef_pos:      {shape: [3]}
+    robot0_eef_quat:     {shape: [4]}
+    robot0_gripper_qpos: {shape: [2]}
+    agentview_image:          {shape: [3, 84, 84], type: rgb}
+    robot0_eye_in_hand_image: {shape: [3, 84, 84], type: rgb}
+
+model:
+  E_s:
+    # the FAST retrain round's DP (DP-can-SCOUT-exp1-fasttest) 580.ckpt
+    base_dp_ckpt: /root/workspace/baojiachun/scout/data/can/train/DP-can-SCOUT-exp1-fasttest/checkpoints/580.ckpt
+    view_names: ['agentview_image', 'robot0_eye_in_hand_image']
+    proprio_dim: 9
+    proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+
+beta: 1.0e-3
+
+optimizer:
+  name: AdamW
+  params:
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-6
+
+batch_size: 256
+num_epochs: 300
+steps_per_epoch: 200
+val_ratio: 0.1
+val_every: 20
+
+save_dir: /root/workspace/baojiachun/scout/data/can/train/SCOUT-dyn-can-fasttest
+
+use_wandb: true
+wandb:
+  project: scout-dynamics
+  name: SCOUT-dyn-can-fasttest
