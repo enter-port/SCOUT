@@ -12,7 +12,16 @@ sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 import hydra
 from omegaconf import OmegaConf
 import pathlib
+import torch
+import torch.multiprocessing
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
+
+# The server's torch_shm_manager helper binary is unsupported there
+# ("Operation not supported"), which breaks DataLoader worker -> main tensor
+# transfer under the default shared-memory strategy. /dev/shm itself is large
+# and healthy, so switch to the file_system strategy to make
+# dataloader.num_workers > 0 usable (workers only; no effect at num_workers=0).
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 # allows arbitrary python code execution in configs using the ${eval:''} resolver
 OmegaConf.register_new_resolver("eval", eval, replace=True)

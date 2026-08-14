@@ -104,15 +104,23 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 cfg.ema,
                 model=self.ema_model)
 
-        # configure env
-        if "libero" not in cfg.task.name:
-            env_runner: BaseImageRunner
-            env_runner = hydra.utils.instantiate(
-                cfg.task.env_runner,
-                output_dir=self.output_dir)
-            assert isinstance(env_runner, BaseImageRunner)
-        else:
-            env_runner = load_env_runner(cfg, self.output_dir)
+        # configure env runner LAZILY: instantiating the robomimic image runner
+        # builds ~28 MuJoCo+EGL envs (~5-8 min). When mid-training rollouts are
+        # disabled (rollout_every <= 0 / null -- fast self-improvement retrain
+        # rounds), skip it entirely and only build at the first due rollout.
+        _rollout_every_cfg = cfg.training.get('rollout_every', 20)
+        _rollouts_enabled = bool(_rollout_every_cfg) and int(_rollout_every_cfg) > 0
+
+        def _build_env_runner():
+            if "libero" not in cfg.task.name:
+                runner: BaseImageRunner = hydra.utils.instantiate(
+                    cfg.task.env_runner,
+                    output_dir=self.output_dir)
+                assert isinstance(runner, BaseImageRunner)
+                return runner
+            return load_env_runner(cfg, self.output_dir)
+
+        env_runner: BaseImageRunner = _build_env_runner() if _rollouts_enabled else None
 
         # configure logging
         wandb_run = wandb.init(
@@ -218,8 +226,16 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                # run rollout. rollout_every <= 0 (or null) DISABLES the env
+                # eval entirely -- for fast self-improvement retrain rounds
+                # that only consume the last ckpt (env eval never touches the
+                # weights, so training math is unaffected; default configs
+                # keep rollout_every=20).
+                _rollout_every = cfg.training.get('rollout_every', 20)
+                if _rollout_every and int(_rollout_every) > 0 \
+                        and (self.epoch % int(_rollout_every)) == 0:
+                    if env_runner is None:
+                        env_runner = _build_env_runner()
                     if 'libero' not in cfg.task.name:
                         runner_log = env_runner.run(policy)
                     else:
