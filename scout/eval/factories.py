@@ -139,6 +139,23 @@ def make_scout_vib_factory(cfg: EasyDict,
         )
         ckpt_path = vib_ckpt if vib_ckpt is not None else vcfg.ckpt_path
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        # Train/test fusion-order guards (metadata saved by train_vib; older
+        # ckpts without it skip the checks). A same-set-different-order view or
+        # proprio permutation would load weights fine but silently reorder the
+        # s_bar concat blocks -- the cost would run in a permuted latent space.
+        saved_vn = ckpt.get("view_names")
+        if saved_vn is not None and list(saved_vn) != list(vcfg.view_names):
+            raise ValueError(
+                f"VIB ckpt view order {list(saved_vn)} != cfg.vib.view_names "
+                f"{list(vcfg.view_names)} -- E_s visual concat would be "
+                "permuted. Fix the eval config to match training.")
+        saved_pk = ckpt.get("proprio_keys")
+        eval_pk = [str(k) for k in getattr(cfg.eval, "proprio_keys", [])]
+        if saved_pk is not None and eval_pk and list(saved_pk) != eval_pk:
+            raise ValueError(
+                f"VIB ckpt proprio order {list(saved_pk)} != cfg.eval."
+                f"proprio_keys {eval_pk} -- s_bar proprio block would be "
+                "permuted. Fix the eval config to match training.")
         # The VIB encoder was trained on the FLATTENED fs-step action chunk
         # (train_vib._slice_transition: a_t = first `frameskip` per-step actions
         # flattened, e.g. 8x10 = 80-dim), NOT the per-step action. So its action

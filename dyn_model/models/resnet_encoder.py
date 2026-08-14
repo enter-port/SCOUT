@@ -29,7 +29,14 @@ class ResNetEncoder(torch.nn.Module):
         policy.to(device)
         policy.eval()
 
-        self.obs_encoder = {}
+        # ModuleDict (NOT a plain dict) so the frozen backbones are REGISTERED
+        # submodules: they land in ScoutVIB.state_dict() (the VIB ckpt then
+        # pins the exact E_s used at training), and .to()/.eval()/
+        # requires_grad reach them. A plain dict silently hid them from all
+        # three: the ckpt could not carry E_s, and test-time E_s was rebuilt
+        # from whichever DP ckpt the eval config pointed at -> train/test
+        # latent-space mismatch.
+        self.obs_encoder = torch.nn.ModuleDict()
         for view_name in self.view_names:
             self.obs_encoder[view_name] = policy.obs_encoder.obs_nets[view_name].backbone
         self.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))

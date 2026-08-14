@@ -136,9 +136,15 @@ z (B,16) ⊕ s̄_t (B,1088)
 - 用 E_s + VIB 编码器 + 冻结 base DP；动力学解码器测试时不用。
 - z：每条 rollout 采样一次 $z\sim\mathcal N(0,I)$，整段定住（SOE 是每 chunk 重采，
   我们是 per-trajectory）；$\bar s_t$ 在每个 chunk 内定住（整段去噪循环缓存一次 E_s 前向）。
-- **Cost（核心）**：$\text{Cost}(a,z\mid s)=\big\|z-z_\theta(\bar s_t,a)\big\|^2$，
-  其中 **$z_\theta=\text{reparam}(\mu,\sigma)=\mu+\sigma\varepsilon$** 是 VIB 编码器对
-  $(\bar s_t,a)$ 的**采样输出** $p_\theta(\bar s_t,a)$
+- **Cost（核心；2026-08-14 定稿为高斯 NLL）**：
+  $\text{Cost}(a,z\mid s)=-\log q_\theta(z\mid\bar s_t,a)
+  =\tfrac12\sum_i\big[\tfrac{(z_i-\mu_i)^2}{\sigma_i^2}+\log\sigma_i^2\big]$，
+  即 VIB 编码器输出的**分布** $q_\theta=\mathcal N(\mu,\mathrm{diag}\,\sigma^2)$ 对采样
+  skill $z$ 的负对数似然（classifier guidance 的原生形式，$\nabla_a[-\text{Cost}]
+  =\nabla_a\log q_\theta(z\mid\bar s_t,a)$；相比早期 reparam-L2 版少一次 ε 采样、梯度
+  方差更低；梯度双通道 $\tfrac{z_i-\mu_i}{\sigma_i^2}\cdot\partial\mu_i/\partial a
+  +\big[\tfrac{(z_i-\mu_i)^2}{\sigma_i^3}-\tfrac1{\sigma_i}\big]\cdot
+  \partial\sigma_i/\partial a$）。
   这里的 a 是 DP 干净估计 $\hat a_0$ 的前 8 步展平（80 维，与训练时 encoder 输入对齐）。
 - score 分解（概念框架）：
   $$\nabla_a\log p(a\mid s)=\nabla_a\log\bar p_{DP}(a\mid s)+\nabla_a[-\text{Cost}(a,z\mid s)]$$

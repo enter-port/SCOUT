@@ -290,8 +290,15 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
                 log_d["val_mse"] = val_mse
             wandb_run.log(log_d, step=epoch)
 
-    # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1)
-    torch.save({"state_dict": model.state_dict(), "beta": beta},
+    # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1).
+    # view_names + proprio key order ride along so the eval-side factory can
+    # assert the E_s fusion order matches training (state_dict keys alone
+    # cannot catch a same-set-different-order permutation).
+    proprio_keys = [k for k, m in dict(cfg.dataset.shape_obs).items()
+                    if m.get("type") != "rgb" and "image" not in k]
+    torch.save({"state_dict": model.state_dict(), "beta": beta,
+                "view_names": list(ds.view_names),
+                "proprio_keys": proprio_keys},
                os.path.join(out_dir, "scout_vib.ckpt"))
     plot_curves(history, ["latent_mse", "kl"], f"VIB losses (β={beta:g})",
                 os.path.join(out_dir, "losses.png"))
