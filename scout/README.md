@@ -3,7 +3,8 @@
 Implementation of **classifier-guided exploration via a VIB latent dynamics model**:
 a frozen base Diffusion Policy provides the action score at test time, while a
 separately-trained VIB world model supplies skill latents `z ~ N(0,I)` and a
-guidance cost `||z - z_θ(s_t, a)||` (z_θ = reparam sample, not mean μ) injected into the DP denoising loop.
+guidance cost `-log q_θ(z | s_t, a)` (Gaussian NLL of the sampled skill latent z under the
+encoder's diagonal Gaussian) injected into the DP denoising loop.
 
 Stage 1 targets the robomimic `lift` low_dim task.
 

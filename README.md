@@ -84,7 +84,9 @@ $$\nabla_a \log p(a \mid s) = \nabla_a \log \bar{p}_{DP}(a \mid s) + \nabla_a[-C
 - 第一项：base DP 自身的去噪方向；
 - 第二项：Cost 梯度，把动作往「编码回去正好等于 $z$」的方向推。
 
-$$Cost(a, z \mid s) = \big\|\, z - z_\theta(s, a)\,\big\|_2, \quad z_\theta = \mathrm{reparam}(\mathrm{VIBenc}(s,a))\ (\text{非均值}\ \mu;\ \text{双通道}\ \partial\mu/\partial a + \varepsilon\cdot\partial\sigma/\partial a)$$
+$$Cost(a, z \mid s) = -\log q_\theta(z \mid s, a) = \tfrac{1}{2}\sum_i\Big[\tfrac{(z_i - \mu_i(s,a))^2}{\sigma_i(s,a)^2} + \log \sigma_i(s,a)^2\Big]$$
+
+（高斯 NLL：编码分布 $q_\theta$ 对采样 skill $z$ 的负对数似然；梯度双通道 $\tfrac{z_i-\mu_i}{\sigma_i^2}\cdot\partial\mu_i/\partial a + \big[\tfrac{(z_i-\mu_i)^2}{\sigma_i^3}-\tfrac{1}{\sigma_i}\big]\cdot\partial\sigma_i/\partial a$，无 ε 采样、梯度方差低于 reparam-L2）
 
 **去噪循环**（$t = T \to 0$）：每步先取 DP 去噪方向，再算 Cost 对 $a$ 的梯度、乘缩放叠加，沿调整方向走一步（并加随机噪声）。走完得到的动作**既在 DP 支集上、又朝着目标 skill $z$ 走**——这就是受控的探索。
 
@@ -122,7 +124,7 @@ SCOUT/                              # 当前分支:impl/scout-stage1
 ├── dyn_model/                      # 【LPB 复用】E_s 前端：ResNetEncoder + proprio embed + robomimic image dataset
 ├── scout/                          # 【SCOUT 自研】
 │   ├── model/                      #   scout_vib（VIB dynamics）、encoder（StateEncoder）、vib（VIB enc / D_s）
-│   ├── guidance/                   #   policy（ScoutPolicy）、planner（ScoutPlanner）、cost（‖z−z_θ‖，z_θ=reparam 采样非 μ）
+│   ├── guidance/                   #   policy（ScoutPolicy）、planner（ScoutPlanner）、cost（−log q_θ(z|s,a) 高斯 NLL）
 │   └── eval/                       #   rollout、metrics、self_improvement（multi-round 闭环）
 └── idea/                           # 研究构思 + 落地计划 + 组会笔记
     ├── idea.md / idea_notes.md     #   导师原始 idea + 流程梳理

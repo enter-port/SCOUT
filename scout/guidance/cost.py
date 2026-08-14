@@ -1,14 +1,15 @@
-"""SCOUT classifier-guidance cost (scout_design.md §4; idea.md Cost definition).
+"""SCOUT classifier-guidance cost (scout_design.md §4).
 
-Replaces LPB's nearest-neighbour-to-demo latent cost with the VIB re-encoding
-gap. The cost target is the VIB encoder's **reparam-sampled output**
-``z_θ = p_θ(s̄_t, a)`` (= ``reparam(μ, logvar)``), NOT the mean ``μ`` alone —
-matching ``idea.md``'s ``Cost = ‖z − p̄_θ(z|S_t,A_t)‖`` (the earlier design-doc
-draft incorrectly reduced this to ``μ``; corrected here):
+Replaces LPB's nearest-neighbour-to-demo latent cost with the VIB encoder's
+**negative log-likelihood of the sampled skill latent**. The encoder outputs a
+full diagonal Gaussian ``q_θ(z|s̄_t,a) = N(μ, diag(σ²))``; the cost is the
+distribution-vs-sample NLL (user decision 2026-08-14, option A) -- NOT a
+reparam-sampled L2 (the earlier form) and NOT the mean-only gap:
 
-    cost(x0_hat, s_bar_t, z) = mean_B ||z - z_θ(s_bar_t, a_chunk)||^2,
-    a_chunk = bridge(x0_hat[:, :n_steps]).flatten(),
-    z_θ     = reparam( vib_enc(s_bar_t, a_chunk) )      # p_θ(s̄_t, a)
+    cost(x0_hat, s_bar_t, z) = mean_B [ -log q_θ(z | s̄_t, a_chunk) ]
+                             = mean_B ½ Σ_i [ (z_i - μ_i)² / σ_i² + log σ_i² ]
+    a_chunk = bridge(x0_hat[:, :n_steps]).flatten()
+    (the ½·D·log 2π constant is dropped: no gradient, irrelevant for guidance)
 
 where ``x0_hat`` is the base DP's one-step clean-action estimate (the
 ``pred_original_sample`` of the diffusion scheduler step), ``s_bar_t = E_s(S_t)``
@@ -20,14 +21,16 @@ loads the trained weights (the encoder is a chunk-encoder, NOT per-step; buildin
 it per-step mismatches the saved Linear, 1168 vs 1098). The guidance gradient
 pushes the predicted chunk toward actions that re-encode to ``z``.
 
-Why the reparam sample (not μ): the guidance gradient w.r.t. the action is
-``∇_a ‖z − z_θ‖² = −2(z − z_θ)·(∂μ/∂a + ε·∂σ/∂a)`` — TWO conduction channels
-(μ-sensitivity AND σ-sensitivity × ε). Using only μ would leave a single channel
-``∂μ/∂a``, which the KL term drives toward 0 as z→N(0,I) — so a well-trained VIB
-(μ≈0, σ≈1) would silently kill guidance. The σ-channel survives KL (σ can stay
-input-sensitive even at σ̄→1), keeping guidance alive precisely when z~N(0,I)
-sampling is most meaningful. This is the structural reason idea.md defines the
-cost on the sampled encoder output, not the mean.
+Why NLL (vs the previous reparam-sampled L2 ``‖z − (μ+σε)‖²``):
+  * it is the native classifier-guidance form -- the injected gradient is
+    ``∇_a[−log q_θ(z|s̄_t,a)]``, exactly ``∇_a log p_θ(z|s̄_t,a)`` up to sign;
+  * closed form, no ε draw -> lower-variance gradient than the reparam estimator
+    (whose expectation ``‖z−μ‖² + Σσ_i²`` differs from the NLL anyway);
+  * BOTH conduction channels survive: the μ-channel is weighted per-dim by
+    1/σ_i² and the σ-channel carries ``[(z_i−μ_i)²/σ_i³ − 1/σ_i]·∂σ_i/∂a``.
+    A mean-only gap would leave just ``∂μ/∂a``, which the KL term drives to 0
+    as z→N(0,I) -- silently killing guidance; the σ-channel survives KL, keeping
+    guidance alive precisely when z~N(0,I) sampling is most meaningful.
 
 Shapes:
     x0_hat : (B, T, per_step)   -- DP-predicted clean action chunk (T = horizon)
@@ -41,7 +44,6 @@ from __future__ import annotations
 import torch
 
 from scout.normalizer import ActionNormalizerBridge
-from scout.model.vib import reparam
 
 
 def scout_cost(
@@ -51,16 +53,16 @@ def scout_cost(
     vib_enc,
     bridge: ActionNormalizerBridge,
 ) -> torch.Tensor:
-    """``mean over batch of ||z - z_θ(s_bar_t, a_chunk)||^2`` -- scalar,
-    differentiable in ``x0_hat``.
+    """``mean over batch of -log q_θ(z | s_bar_t, a_chunk)`` -- scalar,
+    differentiable in ``x0_hat`` (Gaussian NLL, closed form, no ε sampling).
 
     ``a_chunk`` is the **flattened first ``n_steps`` per-step actions** of the
     DP's clean-action estimate ``x0_hat``, where ``n_steps =
     vib_enc.action_dim // per_step``. This matches ``train_vib._slice_transition``
     (the VIB encoder was trained on the flattened fs-step action chunk, NOT
     per-step) -- so inference feeds the same flattened chunk, else the saved
-    encoder weights won't load (s_bar + per_step != s_bar + chunk). One sampled
-    z_θ per batch element (one skill z per chunk; design §1).
+    encoder weights won't load (s_bar + per_step != s_bar + chunk). One NLL per
+    batch element (one skill z per chunk; design §1).
 
     Args:
         x0_hat  : ``(B, T, per_step)`` -- base DP clean-action estimate (T =
@@ -71,15 +73,15 @@ def scout_cost(
         z       : ``(B, style_dim)`` -- sampled skill latent (fixed across chunk).
         vib_enc : a :class:`scout.model.vib.VIBEncoder` (or compatible) callable
                   ``(s_bar, a) -> (mu, logvar)`` with an ``.action_dim`` attr =
-                  the flattened chunk dim it was trained on. The reparam sample
-                  ``z_θ = reparam(mu, logvar)`` (= ``p_θ(s̄_t, a)``) is used as
-                  the cost target, NOT ``mu`` alone (see module docstring).
+                  the flattened chunk dim it was trained on. The FULL Gaussian
+                  (μ and σ) enters the NLL; neither is sampled here.
         bridge  : :class:`scout.normalizer.ActionNormalizerBridge` mapping
                   ``x0_hat`` (per-step) into the VIB action space.
 
     Returns:
         scalar tensor (mean-reduced over batch). Differentiable w.r.t. ``x0_hat``
-        (the affine bridge + VIB MLP + reparam path preserves gradient).
+        (the affine bridge + VIB MLP path preserves gradient; both the 1/σ²
+        -weighted μ-channel and the σ-channel conduct it).
     """
     if x0_hat.dim() != 3:
         raise ValueError(
@@ -104,11 +106,13 @@ def scout_cost(
     a = bridge(x0_hat[:, :n_steps])                 # (B, n_steps, per_step)
     a_flat = a.reshape(B, chunk_dim)                # (B, chunk_dim)
 
-    # 2. one sampled skill z_θ per batch element from (s̄_t, a_chunk) via the VIB
-    #    encoder + reparam (= p_θ(s̄_t, a), the idea.md cost target); compare to
-    #    the fixed guidance target z. Both μ- and σ-sensitivity conduct the
-    #    gradient (see module docstring).
+    # 2. Gaussian NLL of the fixed guidance target z under the encoder's
+    #    q_θ(z|s̄_t, a_chunk) = N(μ, diag σ²):  ½ Σ_i [(z_i−μ_i)²·e^{−logvar_i}
+    #    + logvar_i]. The ½D·log2π constant is dropped (no gradient). Both the
+    #    1/σ²-weighted μ-gap and the σ-terms conduct the gradient (see module
+    #    docstring).
     mu, logvar = vib_enc(s_bar_t.detach(), a_flat)  # (B, style_dim) each
-    z_enc = reparam(mu, logvar)                      # p_θ(s̄_t, a) = sampled z
-    diff = z.detach() - z_enc
-    return diff.pow(2).sum(dim=-1).mean()
+    diff = z.detach() - mu
+    inv_var = torch.exp(-logvar)
+    nll = 0.5 * (diff.pow(2) * inv_var + logvar).sum(dim=-1)   # (B,)
+    return nll.mean()

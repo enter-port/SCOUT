@@ -9,7 +9,7 @@ Aligns with the LPB ``dyn_model/planner.py:Planner.compute_loss`` interface --
 delegated to :func:`scout.guidance.cost.scout_cost` (NOT duplicated, per task
 step 3):
 
-    cost(x̂_0, s) = mean_t ‖z − z_θ(s̄_t, a_t)‖²,  z_θ = reparam(vib_enc(s̄_t,a)),  a = bridge(x̂_0)
+    cost(x̂_0, s) = mean_t [−log q_θ(z|s̄_t, a_t)] = ½Σ_i[(z_i−μ_i)²/σ_i² + log σ_i²],  a = bridge(x̂_0)
 
 where ``s̄_t = E_s(current_obs)`` is held fixed across the chunk and ``z`` is
 the sampled skill latent held fixed across the whole denoise loop (design §1,
@@ -72,7 +72,7 @@ class ScoutPlanner:
         Args:
             scout_vib    : a :class:`~scout.model.scout_vib.ScoutVIB`. Used for
                            ``E_s`` (encode current obs -> ``s̄_t``) and
-                           ``vib_enc`` (compute z_θ = reparam sample, p_θ(s̄_t,a)); put in ``eval()`` mode.
+                           ``vib_enc`` (compute the full q_θ(z|s̄_t,a) = (μ, logvar); the NLL uses both); put in ``eval()`` mode.
             bridge       : :class:`~scout.normalizer.ActionNormalizerBridge`
                            mapping the DP's ``x̂_0`` into the VIB action space.
                            ``None`` -> :class:`IdentityBridge` (dummy / when the
@@ -132,7 +132,7 @@ class ScoutPlanner:
         x0_hat: torch.Tensor,
         current_obs=None,
     ) -> torch.Tensor:
-        """``mean_t ‖z − z_θ(s̄_t, a_t)‖²`` (z_θ = reparam sample, p_θ(s̄_t,a)) -- scalar, differentiable in ``x0_hat``.
+        """``mean_t [−log q_θ(z|s̄_t, a_t)]`` (Gaussian NLL: ½Σ[(z−μ)²/σ² + log σ²]) -- scalar, differentiable in ``x0_hat``.
 
         Args:
             x0_hat       : ``(B, T, action_dim)`` -- the DP's one-step
