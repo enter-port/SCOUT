@@ -12,10 +12,15 @@ core hdf5, this runs the SOE rollout flow:
           ``avg_jerk`` (over EVERY exploration trajectory, success + failure).
   step 4  merge the successful trajectories with the core hdf5.
 
-Outputs (per the data convention, under ``--output-dir`` = data/{task}/rollout/):
-  * ``{task}_exp{N}.hdf5``        -- core + successful rollouts (retrain input).
-  * ``{task}_success_exp{N}.hdf5``-- successful rollouts only (archive).
-  * ``{task}_rollout_exp{N}.json``-- success_rate / pass@5 / avg_jerk / counts.
+Outputs (per the data convention, under ``--output-dir`` = data/{task}/rollout/;
+``{tag}`` = SCOUT for ``--guide dyn``, DP for ``--guide off``):
+  * ``{task}_{tag}_success_exp{N}.hdf5`` -- core + successful EXPLORATION
+    rollouts (DP-retrain input; baseline first-try successes NOT included).
+  * ``{task}_{tag}_all_exp{N}.hdf5``     -- core + ALL trajectories of the
+    round: every one of the N baseline (step-2) rollouts plus all ``try_times``
+    exploration trajectories per failed init, success AND failure
+    (dyn/VIB-retrain input -- diversified transitions vs z-exploration drift).
+  * ``log/{task}_{tag}_rollout_exp{N}.json`` -- success_rate / pass@5 / counts.
 
 wandb logs three metrics whose x-axis is the completed-init-count of their
 phase (``eval/success_rate`` vs step-2 init count; ``rollout/pass@5`` and
@@ -81,21 +86,24 @@ def main():
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
                         "no hdf5 needed -- pure DP success-rate eval of any ckpt.")
-    # ---- outputs (naming convention: {task}_{exp,success_exp,rollout_exp}{N}) ----
+    # ---- outputs (naming: {task}_{tag}_{success_exp,all_exp,rollout_exp}{N}) ----
     p.add_argument("--exp-num", type=int, default=1,
                    help="exploration round number N for output naming (default 1)")
     p.add_argument("--output-dir", default=None,
                    help="output dir (default data/{task}/rollout/)")
-    p.add_argument("--output-merged", default=None,
-                   help="explicit merged-hdf5 path (overrides {task}_exp{N}.hdf5)")
     p.add_argument("--output-success", default=None,
-                   help="explicit success-only hdf5 path (overrides "
-                        "{task}_success_exp{N}.hdf5)")
+                   help="explicit success hdf5 path (core + successful "
+                        "exploration rollouts; overrides "
+                        "{task}_{tag}_success_exp{N}.hdf5)")
+    p.add_argument("--output-all", default=None,
+                   help="explicit all hdf5 path (core + every trajectory: N "
+                        "baseline + try_times-per-failed-init exploration; "
+                        "overrides {task}_{tag}_all_exp{N}.hdf5)")
     p.add_argument("--output-json", default=None,
                    help="explicit json path (default log/{task}_{tag}_rollout_exp{N}.json; "
                         "for --success-only: log/{wandb_name}.json)")
     p.add_argument("--aug-mask-key", default=None,
-                   help="mask key written to the merged hdf5 selecting core + "
+                   help="mask key written to both output hdf5s selecting core + "
                         "rollouts (default cfg.self_improvement.scout_aug_mask)")
     # ---- overrides ----
     p.add_argument("--n-init-states", type=int, default=None,
@@ -161,10 +169,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     log_dir = os.path.join(out_dir, "log")
     os.makedirs(log_dir, exist_ok=True)
-    merged_path = args.output_merged or os.path.join(
-        out_dir, f"{args.task}_{tag}_exp{args.exp_num}.hdf5")
     success_path = args.output_success or os.path.join(
         out_dir, f"{args.task}_{tag}_success_exp{args.exp_num}.hdf5")
+    all_path = args.output_all or os.path.join(
+        out_dir, f"{args.task}_{tag}_all_exp{args.exp_num}.hdf5")
     if args.success_only:
         json_path = args.output_json or os.path.join(log_dir, f"{wandb_name}.json")
     else:
@@ -232,8 +240,8 @@ def main():
     print(f"[run_rollout] base_dp = {args.base_dp_ckpt}")
     print(f"[run_rollout] VIB     = {args.vib_ckpt}")
     print(f"[run_rollout] core    = {args.core_hdf5}")
-    print(f"[run_rollout] merged  = {merged_path}")
     print(f"[run_rollout] success = {success_path}")
+    print(f"[run_rollout] all     = {all_path}")
     print(f"[run_rollout] json    = {json_path}")
 
     pipeline = RolloutPipeline(
@@ -275,24 +283,31 @@ def main():
             print(f"[run_rollout] json -> {json_path}")
         else:
             trajs = result["trajs"]
+            all_trajs = result.get("all_trajs", [])
 
-            # ---- step 4: merge (core + rollouts) + success-only archive ------- #
+            # ---- step 4: two hdf5 outputs ------------------------------------- #
+            # success = core + successful EXPLORATION trajs  -> DP retrain
+            # all     = core + EVERY traj of the round       -> dyn/VIB retrain
             aug_mask_key = (args.aug_mask_key
                             or cfg.get("self_improvement", {}).get("scout_aug_mask",
                                                                    "scout_aug"))
-            write_rollouts_to_hdf5(
-                cfg.dataset.path, merged_path, trajs,
-                core_filter_key=cfg.dataset.core_filter_key,
-                aug_mask_key=aug_mask_key, include_core=True,
-            )
             if trajs:
                 write_rollouts_to_hdf5(
                     cfg.dataset.path, success_path, trajs,
                     core_filter_key=cfg.dataset.core_filter_key,
-                    aug_mask_key=aug_mask_key, include_core=False,
+                    aug_mask_key=aug_mask_key, include_core=True,
                 )
             else:
-                print("[run_rollout] 0 successful trajs -- skipping success-only hdf5")
+                print("[run_rollout] 0 successful exploration trajs "
+                      "-- skipping success hdf5")
+            if all_trajs:
+                write_rollouts_to_hdf5(
+                    cfg.dataset.path, all_path, all_trajs,
+                    core_filter_key=cfg.dataset.core_filter_key,
+                    aug_mask_key=aug_mask_key, include_core=True,
+                )
+            else:
+                print("[run_rollout] 0 all-trajs -- skipping all hdf5")
 
             # ---- final wandb points (converged values at full init counts) ---- #
             if wandb_run is not None:
@@ -321,8 +336,11 @@ def main():
                 "n_failed": metrics["n_failed"],
                 "exploration_rescued": metrics["exploration_rescued"],
                 "collected_trajs": metrics["collected_trajs"],
+                "n_success_trajs": len(trajs),
+                "n_all_trajs": len(all_trajs),
+                "n_baseline_trajs": int(cfg.eval.n_init_states),
                 "failed_init_indices": metrics["failed_init_indices"],
-                "outputs": {"merged": merged_path, "success_only": success_path},
+                "outputs": {"success": success_path, "all": all_path},
             }
             with open(json_path, "w") as f:
                 json.dump(summary, f, indent=2)
@@ -330,8 +348,8 @@ def main():
             print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
                   f"pass@5={metrics['pass_at_5']:.3f} avg_jerk={metrics['avg_jerk']:.4f} "
                   f"collected={metrics['collected_trajs']}")
-            print(f"[run_rollout] merged  -> {merged_path}")
-            print(f"[run_rollout] success -> {success_path}")
+            print(f"[run_rollout] success -> {success_path} ({len(trajs)} trajs)")
+            print(f"[run_rollout] all     -> {all_path} ({len(all_trajs)} trajs)")
             print(f"[run_rollout] json    -> {json_path}")
     finally:
         if wandb_run is not None:

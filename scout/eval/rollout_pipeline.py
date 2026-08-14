@@ -13,7 +13,15 @@ SCOUT (scout_design.md / the SOE `run.py` round structure, steps 2-4):
            avg_jerk over EVERY exploration trajectory (success + failure, SOE
            3rd-difference norm).
   step 4  done by the CLI (:func:`hdf5_writer.write_rollouts_to_hdf5`); this
-           class returns the metrics dict + the successful trajs.
+          class returns the metrics dict + BOTH trajectory groups:
+            * ``trajs``     -- successful EXPLORATION trajs only (baseline
+              first-try successes NOT included) -> the DP-retrain "success"
+              hdf5 (core + successes);
+            * ``all_trajs`` -- EVERY trajectory of the round: all N baseline
+              (step-2) rollouts + all ``try_times`` exploration trajectories
+              per failed init (success + failure) -> the dyn/VIB-retrain "all"
+              hdf5 (diversified (s,a,s') transitions against z-exploration
+              drift).
 
 The wandb running view (``eval/success_rate``, ``rollout/pass@5``,
 ``rollout/avg_jerk`` vs completed-init-count) is driven by the ``on_progress``
@@ -124,7 +132,9 @@ class RolloutPipeline:
         :mod:`scout.eval.rollout_vec`). The CLI uses these to plot the three
         wandb metrics vs completed-init-count.
 
-        Returns ``{"metrics": {...}, "trajs": [successful trajs with obs]}``.
+        Returns ``{"metrics": {...},
+                   "trajs":     [successful EXPLORATION trajs, with obs],  # DP
+                   "all_trajs": [every traj of the round, with obs]}``.     # dyn
         """
         horizon = int(self.cfg.eval.horizon)
         try_times = int(getattr(self.cfg.eval, "try_times", 5))
@@ -152,6 +162,9 @@ class RolloutPipeline:
             dp, self.env_factory, init_states, horizon=horizon,
             n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
             n_tries=1, metric_prefix="eval",
+            # record frames unless --success-only (the `all` hdf5 needs every
+            # baseline traj with obs; pure-eval mode skips the memory cost)
+            record_obs=not success_only,
             on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
         )
         baseline_solved = int(sum(1 for s, _ in first_results if s))
@@ -170,7 +183,7 @@ class RolloutPipeline:
                 "n_failed": N - baseline_solved,
                 "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
                                         if not s],
-            }, "trajs": []}
+            }, "trajs": [], "all_trajs": []}
 
         # ---- step 3: explore FAILED inits only (guided or plain DP retry) ----
         if self.guided:
@@ -194,6 +207,10 @@ class RolloutPipeline:
         print(f"[rollout] step3 explore: rescued {exploration_rescued}/{n_failed} "
               f"failed inits; collected {len(trajs)} successful trajs")
 
+        all_trajs = _assemble_all_trajs(first_results, expl)
+        print(f"[rollout] all-traj group: {len(all_trajs)} trajs "
+              f"(baseline {N} + explore "
+              f"{len(all_trajs) - N}) -> dyn-retrain hdf5")
         metrics = {
             "success_rate": success_rate_per_round(first_results),
             "pass_at_5": pass_at_k(expl, first_results, k=try_times),
@@ -203,10 +220,12 @@ class RolloutPipeline:
             "n_failed": n_failed,
             "exploration_rescued": exploration_rescued,
             "collected_trajs": len(trajs),
+            "n_all_trajs": len(all_trajs),
+            "n_baseline_trajs": N,
             "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
                                     if not s],
         }
-        return {"metrics": metrics, "trajs": trajs}
+        return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +244,22 @@ def _jerk_all_explore_trajs(exploration_results) -> float:
             if j > 0.0:                               # T<4 -> 0.0, skipped
                 jerks.append(j)
     return float(np.mean(jerks)) if jerks else 0.0
+
+
+def _assemble_all_trajs(first_results, exploration_results) -> List[dict]:
+    """EVERY trajectory of the round, for the dyn-retrain ``all`` hdf5.
+
+    Order: the N baseline (step-2) trajectories first (success AND failure --
+    requires the pipeline's ``record_obs=True`` baseline), then every failed
+    init's exploration trajectories (all ``try_times`` of them, success +
+    failure). Baseline first-try successes are NOT written to the success
+    (DP-retrain) file, but they DO appear here: the dyn/VIB retrain wants the
+    diversified transition pool, not just the curated successes.
+    """
+    all_trajs: List[dict] = [traj for _, traj in first_results]
+    for e in exploration_results:
+        all_trajs.extend(e.get("all_trajs", []))
+    return all_trajs
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +306,10 @@ def _dry_run():
     assert aj > 0.0
     # _jerk_all_explore_trajs covers all all_trajs (success + fail) -> nonzero.
     assert _jerk_all_explore_trajs(expl) > 0.0
+    # all-traj assembly: 6 baseline + (0+0+0 baseline-solved) + (2+5+5 explore).
+    all_t = _assemble_all_trajs(first_results, expl)
+    assert len(all_t) == 18, f"all = 6 baseline + 12 explore; got {len(all_t)}"
+    print(f"all_trajs     = {len(all_t)}  (expect 18 = 6 baseline + 12 explore)")
     print("[dry-run] rollout_pipeline metrics assembly OK")
 
 
