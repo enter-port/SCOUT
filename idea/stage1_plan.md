@@ -51,15 +51,15 @@ $$\mathcal L = \big\|\hat{s̄}_{t+1} - E_s(S_{t+1}).detach()\big\|^2 + \beta\,\m
 
 ### 产物
 - **一个** dynamics ckpt(`VIB_enc` + `D_s` + proprio embed)。
-- **不做** β 扫描、**不做** 生死诊断 `‖∂μ/∂a‖`(用户定:单 β=1e-3 直接进 Step 2)。
+- **不做** β 扫描、**不做** 生死诊断 `‖∂z_θ/∂a‖`(用户定:单 β=1e-3 直接进 Step 2)。
 
 ---
 
 ## Step 2 · 采样 z + classifier guidance → 100 trajectory
 
-- **在线网络**:冻结 base DP(DP₀)+ `VIB_enc` 的 **μ**;`D_s` **下线**。
+- **在线网络**:冻结 base DP(DP₀)+ `VIB_enc` 的 **z_θ**(reparam 采样 = p_θ(s̄_t,a);非均值 μ);`D_s` **下线**。
 - `z ~ N(0,I)`:**每条 rollout 各采一个**,chunk 内定住。
-- **guidance**:LPB `guided_conditional_sample`,cost = $\text{mean}_t\,\big\|z - \mu(\bar s_t, a_t)\big\|_2`(算在 $\hat x_0$ 上,梯度对 $x_t$ 求,改 $x_t$ 不改 ε;缩放 $\eta\sqrt{1-\bar\alpha_t}$;最后 K 步引导。详见 `scout_design.md §4`)。
+- **guidance**:LPB `guided_conditional_sample`,cost = $\text{mean}_t\,\big\|z - z_\theta(\bar s_t, a_t)\big\|_2`(算在 $\hat x_0$ 上,梯度对 $x_t$ 求,改 $x_t$ 不改 ε;缩放 $\eta\sqrt{1-\bar\alpha_t}$;最后 K 步引导。详见 `scout_design.md §4`)。
 - `guidance_scale`(**待定**,先沿用 LPB 默认起,可调)。
 - **rollout**:robomimic sim,**100 初始态 × `try_times=5`**;成功即止(`env.is_success()["task"]`)。
 - **记录**:每条 success/fail、**jerk**(动作三阶差分)、供 Step 4 的 Pass@5 / yield。
@@ -93,7 +93,7 @@ $$\mathcal L = \big\|\hat{s̄}_{t+1} - E_s(S_{t+1}).detach()\big\|^2 + \beta\,\m
 ## 五、go / no-go
 
 - **Step 4 `exploreDP > baseDP`** ⇒ **GO**(机制成立;后续:6 轮 multi-round、scale 到 can/square、β/超参调、可定向探索)。
-- **`exploreDP ≤ baseDP`** ⇒ **NO-GO**,重审;**第一嫌疑 = β=1e-3 太大 → guidance no-op** —— 此时回头补**生死诊断 `‖∂μ/∂a‖`** 确认(本计划 Step 1 跳过了它,NO-GO 时必须补)。
+- **`exploreDP ≤ baseDP`** ⇒ **NO-GO**,重审;**第一嫌疑 = β=1e-3 太大 → guidance no-op** —— 此时回头补**生死诊断 `‖∂z_θ/∂a‖`**(reparam 双通道)确认(本计划 Step 1 跳过了它,NO-GO 时必须补)。
 
 ---
 

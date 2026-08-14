@@ -20,7 +20,7 @@
 **代码来源 + 复用边界(关键,防混淆)**:
 - **LPB 可复用 —— 全是「非动力学」件**:base DP(`DiffusionUnetHybridImagePolicy`)、数据(`RobomimicImageDynamicsModelDataset`)、**E_s 前端编码器**(`ResNetEncoder` + `ProprioceptiveEmbedding`,只做 `obs → s̄_t`)、guidance 注入(`guided_conditional_sample`)。
 - **SCOUT 自研 —— = dynamics 本身,LPB 没有,绝不能 fork**:`VIB_enc → z(变分 skill)→ D_s` + latent/KL loss。**LPB 的 `z` 是确定性 embedding(无 μ,logvar/KL);SCOUT 的 `z` 是采样的变分 skill —— 结构根本不同**。dynamics 必须 SCOUT 自己写(已在 `scout/model/`)。
-- SCOUT cost(`‖z−μ‖`)+ self-improvement loop 同为自研。
+- SCOUT cost(`‖z−z_θ‖`,z_θ=reparam 采样=p_θ(s̄_t,a);**注意非均值 μ**——见 §4)+ self-improvement loop 同为自研。
 - 实现:方案 B —— 在当前 `scout/` 上把 SOE 件逐个换成 LPB 的**非动力学件**;dynamics 保持 SCOUT 自研。
 
 ---
@@ -39,9 +39,9 @@
   E_s = 冻结 base-DP ResNet(image, per-view)+ 训练 proprio embed → concat → s̄_t   (永远两个同时进)
   loss = latent MSE( ŝ̄_{t+1}, E_s(S_{t+1}).detach() ) + β·KL    (latent 级监督 = LPB;无 state decoder)
 
-测试(D_s 下线;只用 μ + 冻结 base DP):
+测试(D_s 下线;只用 z_θ + 冻结 base DP):
   z ~ N(0,I)  整段 chunk 定住
-  → 在 base DP 去噪循环注入 ∇_{x_t}[ −‖z − μ(s̄_t, a)‖ ]   (LPB 范式,详见 §4)
+  → 在 base DP 去噪循环注入 ∇_{x_t}[ −‖z − z_θ(s̄_t, a)‖ ]   (z_θ=reparam 采样=p_θ(s̄_t,a);LPB 范式,详见 §4)
 ```
 
 **永远 image + proprio 同时输入**(LPB 式),无 low_dim/image 模式之分、无 stage 分。**无 state decoder、不解码**;D_s 预测 next-latent(下一帧 ResNet 特征 + proprio,特征空间非像素)→ #1 风险(像素预测)规避。
@@ -112,8 +112,8 @@ for t in scheduler.timesteps:
 - 缩放 $\eta\sqrt{1-\bar\alpha_t}$(Dhariwal & Nichol 标准式)。
 
 **SCOUT 的 cost 函数**(替换 LPB 的 NN 距离):
-$$\text{cost}(\hat{x}_0,\, s) \;=\; \text{mean}_t\,\big\|\,z - \mu(s̄_t,\, a_t)\,\big\|_2,\quad a = \hat{x}_0,\ \ s̄_t = E_s(\{image, proprio\})\ \text{(定住)},\ \ z\ \text{整段定住}$$
-$\mu$ = VIB encoder 的均值(逐 chunk 步)。
+$$\text{cost}(\hat{x}_0,\, s) \;=\; \text{mean}_t\,\big\|\,z - z_\theta(s̄_t,\, a_t)\,\big\|_2,\quad a = \hat{x}_0,\ \ s̄_t = E_s(\{image, proprio\})\ \text{(定住)},\ \ z\ \text{整段定住}$$
+$z_\theta = \text{reparam}(\text{VIB\_enc}(s̄_t,a_t))$ = p_θ(s̄_t,a_t) 即 **reparam 采样的 skill**(逐 chunk 步)。**非均值 μ**——见 §4 注(μ-only 会让 KL 压制 ∂μ/∂a 使 guidance 失效)。
 
 **门控**:
 - (a) `t < guidance_start_timestep`(最后 K 步引导)→ **保留**(标准 CG 做法)。

@@ -41,8 +41,8 @@ scout/
 │   │   ├── crop_randomizer.py
 │   │   └── pytorch_util.py
 │   ├── guidance/
-│   │   └── cost.py                # SCOUT cost ‖z−μ(s̄_t,a)‖ + 归一化桥
-│   ├── diagnose.py                # 生死诊断 ‖∂μ/∂a‖ + 敏感比
+│   │   └── cost.py                # SCOUT cost ‖z−z_θ(s̄_t,a)‖(z_θ=reparam 采样,非 μ)+ 归一化桥
+│   ├── diagnose.py                # 生死诊断 ‖∂z_θ/∂a‖(reparam 双通道)+ 敏感比
 │   ├── train_base_dp.py           # E0:训 base DP(调移植来的 DP)
 │   ├── train_vib.py               # E1:VIB 联合训练 + β 扫描
 │   ├── eval/
@@ -193,7 +193,7 @@ return {"loss": loss, "ae": ae_loss, "dyn": dyn_loss, "kl": kl, "mu": mu, "logva
 
 ### Task 3.4:E1 训练 + β 扫描 + 生死诊断
 **Files:** Create `scout/train_vib.py`、`scout/diagnose.py`、`configs/vib_lift_lowdim.yaml`。
-- [ ] `diagnose.py`:`sensitivity_ratio(model, batch)` —— `A_t.requires_grad_(True)`;`mu,_ = model.vib_enc(model.ae.encode(S_t), A_t)`;`g = autograd.grad(mu.sum(), A_t)`;`σ_a,σ_μ` 从 `buffer.stats()`;返回 `‖g‖·σ_a/σ_μ`。
+- [ ] `diagnose.py`:`sensitivity_ratio(model, batch)` —— `A_t.requires_grad_(True)`;`mu,logvar = model.vib_enc(model.ae.encode(S_t), A_t)`;`z_θ = reparam(mu,logvar)`;`g = autograd.grad(z_θ.sum(), A_t)`(双通道 ∂μ/∂a+ε·∂σ/∂a);`σ_a,σ_z` 从 `buffer.stats()`;返回 `‖g‖·σ_a/σ_z`。
 - [ ] `train_vib.py`:对 β ∈ {1e-4,1e-3,1e-2,1e-1} 各训一个 `ScoutVIB`(`TransitionSource.sample` 喂 transitions,AdamW,存 ckpt + 逐 loss PNG);每个 ckpt 跑 `sensitivity_ratio`,记录 AE/dyn/KL/μ 的 mean·std。
 - [ ] **β 选择**:画 敏感比 vs β;取敏感比 ≥ ~0.3 的最大 β(且 dyn/KL 未爆、μ≈N(0,I))。
 - [ ] **验证/过线**:存在合格 β;否则 NO-GO。提交 `feat: E1 VIB training + beta scan + sensitivity`。
@@ -209,8 +209,9 @@ return {"loss": loss, "ae": ae_loss, "dyn": dyn_loss, "kl": kl, "mu": mu, "logva
 ```python
 def scout_cost(x0_hat, s_bar_t, z, vib_enc, action_normalizer_bridge):
     a = action_normalizer_bridge(x0_hat)        # DP 动作 -> VIB 动作空间
-    mu = vib_enc(s_bar_t.unsqueeze(...), a)[0]  # 逐 chunk 步;广播 s_bar_t、z
-    return ((z - mu)**2).sum(-1).mean()         # mean_t ‖z-μ‖²
+    mu, logvar = vib_enc(s_bar_t.unsqueeze(...), a)  # 逐 chunk 步;广播 s_bar_t、z
+    z_enc = reparam(mu, logvar)                 # = p_θ(s̄_t,a),reparam 采样的 skill(非均值 μ)
+    return ((z - z_enc)**2).sum(-1).mean()      # mean_t ‖z - z_θ‖²
 ```
 - [ ] **验证**:dummy `x0_hat`,cost 标量、对 `x0_hat` 可微。
 - [ ] 提交 `feat: SCOUT guidance cost + normalizer bridge`。
@@ -233,7 +234,7 @@ def scout_cost(x0_hat, s_bar_t, z, vib_enc, action_normalizer_bridge):
 
 ### Task 4.3:E2 guidance 三判据 + E3 on-manifold
 **Files:** Create `scout/eval/guidance_checks.py`(或在 `diagnose.py` 扩展)。
-- [ ] **E2**:选定 β 的 VIB + E0 base DP;sweep `guidance_scale`∈{0,1,5,10,20};固定初始噪声 + 一组 z。算:① 多样性(跨 z 动作 std);② 一致性 `‖z-μ(s̄_t,a_guided)‖`;③ Cost 方向(去噪步曲线)。过线:scale=0 ≈0、单调升;一致性降;Cost 降(升则翻符号)。
+- [ ] **E2**:选定 β 的 VIB + E0 base DP;sweep `guidance_scale`∈{0,1,5,10,20};固定初始噪声 + 一组 z。算:① 多样性(跨 z 动作 std);② 一致性 `‖z-z_θ(s̄_t,a_guided)‖`(z_θ=reparam);③ Cost 方向(去噪步曲线)。过线:scale=0 ≈0、单调升;一致性降;Cost 降(升则翻符号)。
 - [ ] **E3**:最大 scale 的引导 chunk 的 jerk + 到 demo 分布 Mahalanobis vs base DP → 同量级。
 - [ ] 提交 `feat: E2/E3 guidance + on-manifold checks`。
 

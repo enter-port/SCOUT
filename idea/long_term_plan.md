@@ -23,7 +23,7 @@
 > 详细实验计划见 [`stage1_plan.md`](stage1_plan.md)（数据 / 解码器形式 / E0–E4 实验 + metric + 过线）。
 - [ ] 定状态空间：先用 robomimic **low_dim**
 - [ ] 定解码器形式：确定性回归 vs 扩散式 next-state 去噪
-- [ ] 推 guidance 可实现性：$Cost=\|z-\mu(s,a)\|$ 对**带噪** $a$ 求梯度是否稳定、每步反传开销预估
+- [ ] 推 guidance 可实现性：$Cost=\|z-z_\theta(s,a)\|$（$z_\theta$=reparam）对**带噪** $a$ 求梯度是否稳定、每步反传开销预估
 - [ ] 🚩 **硬里程碑**：单任务（如 `lift`）低维 toy demo——证明 classifier guidance 能把动作推向不同 skill、产生有意义的探索（而非噪声）
 > 此里程碑是 **go/no-go 节点**。跑通才值得往下走。
 
