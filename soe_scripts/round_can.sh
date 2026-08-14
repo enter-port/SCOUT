@@ -63,11 +63,12 @@ else
 fi
 LOG=$DATA/$TASK/round.log
 cd "$REPO" || exit 1
+exec 3>&1   # dry-run command echo escapes stage-log redirects via fd 3
 
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 RUN(){
   if [ "$DRY_RUN" = 1 ]; then
-    printf 'DRY_RUN:'; printf ' %q' "$@"; echo
+    printf 'DRY_RUN:' >&3; printf ' %q' "$@" >&3; echo >&3
   else
     "$@"
   fi
