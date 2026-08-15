@@ -213,6 +213,7 @@ PYEOF
     training.rollout_every=0 \
     training.sample_every=100 \
     training.checkpoint_every=200 \
+    training.cudnn_benchmark=true \
     training.device=cuda:0 \
     dataloader.num_workers=8 dataloader.persistent_workers=true \
     logging.name=DP-${TASK}-${A}-exp${NUM} \
@@ -232,6 +233,7 @@ PYEOF
       training.rollout_every=0 \
       training.sample_every=100 \
       training.checkpoint_every=200 \
+    training.cudnn_benchmark=true \
       training.device=cuda:0 \
       dataloader.num_workers=0 \
       logging.name=DP-${TASK}-${A}-exp${NUM} \

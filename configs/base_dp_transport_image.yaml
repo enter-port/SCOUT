@@ -166,7 +166,7 @@ training:
   use_ema: true
   use_amp: false             # bench: no gain on H20 (kernel-launch-bound, not FLOP-bound)
   compile_model: false       # torch.compile opt-in (inductor BROKEN on this server; use compile_backend: cudagraphs)
-  cudnn_benchmark: false     # cudnn autotuner (fixed shapes; bench +7%%)
+  cudnn_benchmark: false     # cudnn autotuner (fixed shapes; bench +7%)
   compile_backend: inductor   # inductor needs triton toolchain (broken here)/cudagraphs
   rollout_every: 20
   checkpoint_every: 100
