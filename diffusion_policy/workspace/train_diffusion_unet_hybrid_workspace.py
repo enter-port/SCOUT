@@ -180,8 +180,12 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         _orig_unet, _orig_enc = self.model.model, self.model.obs_encoder
         _compiled = {}
         if bool(getattr(cfg.training, 'compile_model', False)) and str(device).startswith('cuda'):
-            _compiled['model'] = torch.compile(_orig_unet)
-            _compiled['obs_encoder'] = torch.compile(_orig_enc)
+            # backend configurable: 'inductor' needs a working triton toolchain
+            # (BROKEN in this container -- BackendCompilerFailed on driver.c);
+            # 'cudagraphs' needs no compiler and targets the launch-bound cost.
+            _backend = str(getattr(cfg.training, 'compile_backend', 'inductor'))
+            _compiled['model'] = torch.compile(_orig_unet, backend=_backend)
+            _compiled['obs_encoder'] = torch.compile(_orig_enc, backend=_backend)
             self.model.model = _compiled['model']
             self.model.obs_encoder = _compiled['obs_encoder']
 
