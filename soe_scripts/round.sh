@@ -169,7 +169,7 @@ fi
 
 # ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
 if [ -f "$RDIR/success.hdf5" ]; then
-  log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=100 ds=$RDIR/success.hdf5 -> $OUTDP"
+  log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=200 ds=$RDIR/success.hdf5 -> $OUTDP"
   # dataloader workers: 8 is ~3x faster (13-15 it/s vs 4.6, verified 08-15 on
   # GPU4, train.py sets sharing strategy file_system) but torch shm crashes
   # INTERMITTENTLY on this server -- so try 8 first; on failure fall back to
