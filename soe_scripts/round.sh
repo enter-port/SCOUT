@@ -66,6 +66,12 @@ GPU=${GPU:-0}
 DRY_RUN=${DRY_RUN:-0}
 SKIP_ROLLOUT=${SKIP_ROLLOUT:-0}
 export MUJOCO_GL=egl
+# TMPDIR MUST be a LOCAL filesystem. The inherited DSW container env sets
+# TMPDIR=/mnt/workspace/zimo/.tmp (CPFS network mount): AF_UNIX bind there
+# fails with EOPNOTSUPP, killing torch_shm_manager and thus every
+# num_workers>0 DataLoader (2x2 experiment verified 2026-08-15). It also
+# routes all tempfile IO (e.g. robosuite get_xml) over the network mount.
+export TMPDIR=/tmp
 set -a; . /root/workspace/baojiachun/.secrets/wandb.env; set +a
 export WANDB_DIR=/root/workspace/baojiachun/wandb_runs
 export WANDB_CACHE_DIR=/root/workspace/baojiachun/.cache/wandb
