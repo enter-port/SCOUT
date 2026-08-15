@@ -169,6 +169,27 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # several times fp32; master weights/grads stay fp32, bf16 needs no
         # GradScaler. Default off: numerically identical to the old path.
         use_amp = bool(getattr(cfg.training, 'use_amp', False)) and str(device).startswith('cuda')
+        if bool(getattr(cfg.training, 'cudnn_benchmark', False)):
+            torch.backends.cudnn.benchmark = True
+        # torch.compile opt-in (training.compile_model): the DDPM step is
+        # kernel-launch-bound on this net (96% "util" at ~280W), so fusing the
+        # many small convs is the lever. Params are SHARED with the original
+        # modules (optimizer/EMA see the same tensors), but OptimizedModule
+        # state_dicts gain an _orig_mod. prefix -- swap originals back around
+        # every checkpoint save to keep ckpts byte-compatible with eval loaders.
+        _orig_unet, _orig_enc = self.model.model, self.model.obs_encoder
+        _compiled = {}
+        if bool(getattr(cfg.training, 'compile_model', False)) and str(device).startswith('cuda'):
+            _compiled['model'] = torch.compile(_orig_unet)
+            _compiled['obs_encoder'] = torch.compile(_orig_enc)
+            self.model.model = _compiled['model']
+            self.model.obs_encoder = _compiled['obs_encoder']
+
+        def _use_compiled(flag: bool):
+            if _compiled:
+                self.model.model = _compiled['model'] if flag else _orig_unet
+                self.model.obs_encoder = _compiled['obs_encoder'] if flag else _orig_enc
+
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
@@ -294,11 +315,13 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 # one epoch in, then every 20 -- and never on the final epoch.)
                 if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0 \
                         or self.epoch == cfg.training.num_epochs - 1:
-                    # checkpointing
+                    # checkpointing (original modules so ckpt keys stay clean)
+                    _use_compiled(False)
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint(tag=str(self.epoch))
                     if cfg.checkpoint.save_last_snapshot:
                         self.save_snapshot()
+                    _use_compiled(True)
 
                     # # sanitize metric names
                     # metric_dict = dict()
