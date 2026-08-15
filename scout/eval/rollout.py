@@ -601,7 +601,15 @@ class RobomimicScoutEnvAdapter:
         return {"task": bool(self.wrapper.get_success_label())}
 
     def get_state(self):
-        return self.env.get_state()["states"]
+        # Fast path: flattened sim state ONLY. robomimic's
+        # EnvRobosuite.get_state() also serializes the whole model to XML via
+        # temp files (get_xml -> mkdtemp) on EVERY call -- profiling showed
+        # that dominates rollout wall time when called per env step. Nothing
+        # downstream consumes the model (reset_to replays from the flattened
+        # states array), so bypass it. Value-identical to
+        # ``self.env.get_state()["states"]`` (robomimic does exactly this
+        # flatten() internally before attaching the xml).
+        return np.array(self.env.env.sim.get_state().flatten())
 
     def close(self):
         if hasattr(self.env, "close"):

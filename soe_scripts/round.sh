@@ -170,9 +170,10 @@ fi
 # ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
 if [ -f "$RDIR/success.hdf5" ]; then
   log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=100 ds=$RDIR/success.hdf5 -> $OUTDP"
-  # num_workers=0: workers>0 crashes on this server (torch_shm_manager
-  # "Operation not supported" in DataLoader collate, known since base-DP
-  # training -- see AGENTS.md scout-base-dp-training).
+  # dataloader workers: 8 is ~3x faster (13-15 it/s vs 4.6, verified 08-15 on
+  # GPU4, train.py sets sharing strategy file_system) but torch shm crashes
+  # INTERMITTENTLY on this server -- so try 8 first; on failure fall back to
+  # the always-safe 0 instead of losing the round (see AGENTS.md 坑5).
   RUN env CUDA_VISIBLE_DEVICES=$GPU $PY train.py \
     --config-path configs --config-name base_dp_${TASK}_image \
     task.dataset_path="$RDIR/success.hdf5" \
@@ -183,13 +184,33 @@ if [ -f "$RDIR/success.hdf5" ]; then
     training.sample_every=100 \
     training.checkpoint_every=100 \
     training.device=cuda:0 \
-    dataloader.num_workers=0 \
+    dataloader.num_workers=8 dataloader.persistent_workers=true \
     logging.name=DP-${TASK}-${A}-exp${NUM} \
     logging.project=scout-base-dp \
     hydra.run.dir="$OUTDP" \
     > "$DPLOG" 2>&1
   RC=$?; T2=$(date +%s)
-  log "[2/3] DP retrain rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
+  log "[2/3] DP retrain (workers=8) rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
+  if [ $RC -ne 0 ]; then
+    log "[2/3] workers=8 failed (known intermittent torch shm) -- retry with num_workers=0"
+    RUN env CUDA_VISIBLE_DEVICES=$GPU $PY train.py \
+      --config-path configs --config-name base_dp_${TASK}_image \
+      task.dataset_path="$RDIR/success.hdf5" \
+      task.train_filter_key=scout_aug \
+      training.num_epochs=600 \
+      training.resume=False \
+      training.rollout_every=0 \
+      training.sample_every=100 \
+      training.checkpoint_every=100 \
+      training.device=cuda:0 \
+      dataloader.num_workers=0 \
+      logging.name=DP-${TASK}-${A}-exp${NUM} \
+      logging.project=scout-base-dp \
+      hydra.run.dir="$OUTDP" \
+      > "$DPLOG" 2>&1
+    RC=$?; T2=$(date +%s)
+    log "[2/3] DP retrain (workers=0 fallback) rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
+  fi
   [ $RC -ne 0 ] && { log "DP RETRAIN FAILED - see $DPLOG"; exit 1; }
 else
   log "[2/3] no success.hdf5 (0 exploration successes) -- DP retrain SKIPPED"
