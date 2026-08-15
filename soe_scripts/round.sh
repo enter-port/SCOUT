@@ -29,7 +29,7 @@
 # every round (data diversity); DP-vs-SCOUT within one round share the seed,
 # i.e. the same 100 scenes (controlled comparison).
 #
-# Disk note: retrains write training.checkpoint_every=100 (~6 ckpts = ~28 GB
+# Disk note: retrains write training.checkpoint_every=200 (~6 ckpts = ~28 GB
 # per round) because the shared CPFS runs near quota; change if space allows.
 #
 # Usage:
@@ -182,7 +182,7 @@ if [ -f "$RDIR/success.hdf5" ]; then
     training.resume=False \
     training.rollout_every=0 \
     training.sample_every=100 \
-    training.checkpoint_every=100 \
+    training.checkpoint_every=200 \
     training.device=cuda:0 \
     dataloader.num_workers=8 dataloader.persistent_workers=true \
     logging.name=DP-${TASK}-${A}-exp${NUM} \
@@ -201,7 +201,7 @@ if [ -f "$RDIR/success.hdf5" ]; then
       training.resume=False \
       training.rollout_every=0 \
       training.sample_every=100 \
-      training.checkpoint_every=100 \
+      training.checkpoint_every=200 \
       training.device=cuda:0 \
       dataloader.num_workers=0 \
       logging.name=DP-${TASK}-${A}-exp${NUM} \
