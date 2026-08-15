@@ -165,12 +165,16 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
+        # bf16 autocast opt-in (training.use_amp) -- H20 bf16 throughput is
+        # several times fp32; master weights/grads stay fp32, bf16 needs no
+        # GradScaler. Default off: numerically identical to the old path.
+        use_amp = bool(getattr(cfg.training, 'use_amp', False)) and str(device).startswith('cuda')
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 train_losses = list()
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
+                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
@@ -179,7 +183,9 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
+                                            enabled=use_amp):
+                            raw_loss = self.model.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 

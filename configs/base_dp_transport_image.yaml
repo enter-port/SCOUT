@@ -164,6 +164,7 @@ training:
   num_epochs: 600
   gradient_accumulate_every: 1
   use_ema: true
+  use_amp: false             # bf16 autocast opt-in (bench: see experiment log); off = bit-identical legacy path
   rollout_every: 20
   checkpoint_every: 100
   val_every: 1
