@@ -88,9 +88,10 @@ OUTDYN=$TDYN/dyn-$A-exp$NUM
 if [ "$DRY_RUN" = 1 ]; then
   RLOG=/dev/null; DPLOG=/dev/null; DYNLOG=/dev/null; DBLOG=/dev/null
 else
-  mkdir -p "$RDIR"
-  RLOG=$RDIR/rollout.stdout; DPLOG=$OUTDP.train.log
-  DYNLOG=$OUTDYN.train.log;  DBLOG=$TDYN/dyn-base.train.log
+  # every artifact (train.log / config.yaml / wandb) lives INSIDE its run dir
+  mkdir -p "$RDIR" "$OUTDP" "$OUTDYN" "$TDYN/dyn-base"
+  RLOG=$RDIR/rollout.stdout; DPLOG=$OUTDP/train.log
+  DYNLOG=$OUTDYN/train.log;  DBLOG=$TDYN/dyn-base/train.log
 fi
 LOG=$DATA/$TASK/round.log
 cd "$REPO" || exit 1
@@ -173,16 +174,39 @@ else
   [ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RLOG"; exit 1; }
 fi
 
-# ---- [2/3] DP retrain on success.hdf5 (core + exploration successes) ------ #
+# ---- [2/3] DP retrain on ACCUMULATED successes (user rule 2026-08-15: like
+# dyn's all_accum, the DP trains on core + EVERY round's exploration successes
+# 1..N, not just the current round's) --------------------------------------- #
 if [ -f "$RDIR/success.hdf5" ]; then
-  log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=200 ds=$RDIR/success.hdf5 -> $OUTDP"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "[2/3] success-accum (dry): core+success.hdf5(rounds 1..$NUM) -> $RDIR/success_accum.hdf5"
+  else
+    $PY - "$RDIR" "$A" "$CORE" <<'PYEOF'
+import sys, glob, os, re
+rdir, a_tag, core_path = sys.argv[1:4]
+sys.path.insert(0, os.getcwd())
+from scout.eval.hdf5_writer import merge_accumulated_hdf5
+
+def expnum(p):
+    m = re.search(r"-exp(\d+)", p)
+    return int(m.group(1)) if m else 0
+
+rollout_root = os.path.dirname(rdir.rstrip("/"))
+succs = sorted(glob.glob(os.path.join(rollout_root, f"{a_tag}-exp*", "success.hdf5")),
+               key=expnum)
+accum = os.path.join(rdir, "success_accum.hdf5")
+info = merge_accumulated_hdf5(core_path, succs, accum)
+print(f"[dp-accum] merged {info} -> {accum}")
+PYEOF
+    log "[2/3] DP retrain: 600ep no mid-eval ckpt_every=200 ds=$RDIR/success_accum.hdf5 (core+rounds1..$NUM successes) -> $OUTDP"
+  fi
   # dataloader workers: 8 is ~3x faster (13-15 it/s vs 4.6, verified 08-15 on
   # GPU4, train.py sets sharing strategy file_system) but torch shm crashes
   # INTERMITTENTLY on this server -- so try 8 first; on failure fall back to
   # the always-safe 0 instead of losing the round (see AGENTS.md 坑5).
   RUN env CUDA_VISIBLE_DEVICES=$GPU $PY train.py \
     --config-path configs --config-name base_dp_${TASK}_image \
-    task.dataset_path="$RDIR/success.hdf5" \
+    task.dataset_path="$RDIR/success_accum.hdf5" \
     task.train_filter_key=scout_aug \
     training.num_epochs=600 \
     training.resume=False \
@@ -201,7 +225,7 @@ if [ -f "$RDIR/success.hdf5" ]; then
     log "[2/3] workers=8 failed (known intermittent torch shm) -- retry with num_workers=0"
     RUN env CUDA_VISIBLE_DEVICES=$GPU $PY train.py \
       --config-path configs --config-name base_dp_${TASK}_image \
-      task.dataset_path="$RDIR/success.hdf5" \
+      task.dataset_path="$RDIR/success_accum.hdf5" \
       task.train_filter_key=scout_aug \
       training.num_epochs=600 \
       training.resume=False \
@@ -224,9 +248,10 @@ else
 fi
 
 # ---- [3/3] dyn retrain on ACCUMULATED data (core + every traj of rounds
-# 1..N; user rule 2026-08-15: DP retrains on round-N successes only, dyn
-# accumulates EVERY round's trajectories incl. failures; E_s from new DP) --- #
-CFG=$OUTDYN.config.yaml
+# 1..N; user rule 2026-08-15 updated: BOTH DP and dyn accumulate every
+# round -- DP on exploration SUCCESSES, dyn on EVERY trajectory incl.
+# failures; E_s from new DP) ---------------------------------------------- #
+CFG=$OUTDYN/config.yaml
 NEWDP=$(newest_ckpt "$OUTDP")
 if [ "$DRY_RUN" = 1 ]; then
   log "[3/3] dyn retrain (dry): accum=core+all.hdf5(rounds 1..$NUM) es_base=${NEWDP:-<newest ckpt of $OUTDP>} -> $OUTDYN"
