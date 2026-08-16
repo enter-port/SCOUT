@@ -179,7 +179,14 @@ fi
 # ---- [2/3] DP retrain on ACCUMULATED successes (user rule 2026-08-15: like
 # dyn's all_accum, the DP trains on core + EVERY round's exploration successes
 # 1..N, not just the current round's) --------------------------------------- #
-if [ -f "$RDIR/success.hdf5" ]; then
+# ALWAYS retrain the DP, even with 0 new successes this round: reuse the
+# SAME accumulated success data (fresh init => a genuinely new training
+# run). Skipping would deadlock the chain -- same DP -> same failures ->
+# 0 rescued forever (user 2026-08-16).
+if [ ! -f "$RDIR/success.hdf5" ]; then
+  log "[2/3] 0 exploration successes this round -- retrain on the SAME accumulated data (anti-deadlock)"
+fi
+if true; then
   if [ "$DRY_RUN" = 1 ]; then
     log "[2/3] success-accum (dry): core+success.hdf5(rounds 1..$NUM) -> $RDIR/success_accum.hdf5"
   else
@@ -246,9 +253,6 @@ PYEOF
     log "[2/3] DP retrain (workers=0 fallback) rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
   fi
   [ $RC -ne 0 ] && { log "DP RETRAIN FAILED - see $DPLOG"; exit 1; }
-else
-  log "[2/3] no success.hdf5 (0 exploration successes) -- DP retrain SKIPPED"
-  T2=$T1
 fi
 
 # [3/3] dyn retrain serves ONLY the SCOUT chain (its VIB feeds the next
