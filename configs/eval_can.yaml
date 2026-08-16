@@ -3,8 +3,9 @@
 # Drives `scout/eval/run_round.py` (one SOE round: baseline + guided exploration
 # + merge + retrain). Run-specific ckpt paths come via CLI.
 
-seed: 42          # default when run standalone; round.sh derives per-round seeds:
-                  # exp N = 4 followed by N '2's (42 / 422 / 4222 / 42222 ...)
+seed: 42          # SOE protocol (2026-08-16): FIXED seed for EVERY round -- init
+                  # scenes 42..141 stay identical across rounds, so per-round success
+                  # rates are directly comparable
 
 base_dp:
   initial_ckpt_path: /root/workspace/baojiachun/scout/data/can/train/DP/DP-base/checkpoints/580.ckpt

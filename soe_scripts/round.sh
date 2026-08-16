@@ -23,11 +23,11 @@
 # matched. If dyn-base is missing it is trained first
 # (configs/vib_<task>.yaml, ~15 min with the feature cache).
 #
-# Round seed convention (2026-08-15): round N rolls out with seed = 4 followed
-# by N '2's -- exp1=42, exp2=422, exp3=4222, exp4=42222 ... -- derived from
-# the exp-num below and passed to run_rollout as --seed. Fresh init scenes
-# every round (data diversity); DP-vs-SCOUT within one round share the seed,
-# i.e. the same 100 scenes (controlled comparison).
+# Round seed convention (2026-08-16, SOE protocol): EVERY round rolls out
+# with the SAME fixed seed 42 (init scenes 42..141), so success rates are
+# directly comparable round over round. (Replaced the earlier per-round
+# derivation exp1=42 / exp2=422 / exp3=4222 ... which gave each round fresh
+# scenes and made cross-round numbers incomparable.)
 #
 # Disk note: retrains write training.checkpoint_every=200 (~6 ckpts = ~28 GB
 # per round) because the shared CPFS runs near quota; change if space allows.
@@ -58,9 +58,8 @@ esac
 NUM=$(printf '%d' "$NUM" 2>/dev/null) || { echo "exp-num must be an integer"; exit 1; }
 [ "$NUM" -ge 1 ] || { echo "exp-num must be >= 1"; exit 1; }
 
-# per-round rollout seed: exp N -> 4 followed by N 2s (42, 422, 4222, ...)
-SEED=4
-for _ in $(seq 1 "$NUM"); do SEED="${SEED}2"; done
+# SOE protocol: fixed seed every round
+SEED=42
 
 GPU=${GPU:-0}
 DRY_RUN=${DRY_RUN:-0}
