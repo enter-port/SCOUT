@@ -251,6 +251,10 @@ else
   T2=$T1
 fi
 
+# [3/3] dyn retrain serves ONLY the SCOUT chain (its VIB feeds the next
+# round guided rollout). The DP baseline never loads any VIB, so training
+# its dyn is dead compute -- skipped entirely (user 2026-08-16).
+if [ "$A" != "DP" ]; then
 # ---- [3/3] dyn retrain on ACCUMULATED data (core + every traj of rounds
 # 1..N; user rule 2026-08-15 updated: BOTH DP and dyn accumulate every
 # round -- DP on exploration SUCCESSES, dyn on EVERY trajectory incl.
@@ -297,5 +301,10 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.train_vib --config "$CFG" \
 RC=$?; T3=$(date +%s)
 log "[3/3] dyn retrain rc=$RC in $(( (T3-T2)/60 ))m$(( (T3-T2)%60 ))s"
 [ $RC -ne 0 ] && { log "DYN RETRAIN FAILED - see $DYNLOG"; exit 1; }
+
+else
+  log "[3/3] dyn retrain SKIPPED for a=DP (baseline never consumes the VIB)"
+  T3=$T2
+fi
 
 log "=== ROUND $TASK a=$A exp=$NUM TOTAL: $(( (T3-T0)/60 ))m$(( (T3-T0)%60 ))s ==="
