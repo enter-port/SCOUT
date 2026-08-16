@@ -117,11 +117,14 @@ done
 
 # ---- resolve this round's rollout inputs (chained, fallback to base) ------- #
 PREV=$((NUM - 1))
-if [ "$PREV" -ge 1 ] && [ -n "$(newest_ckpt "$TDP/DP-$A-exp$PREV")" ]; then
-  DPROLL=$TDP/DP-$A-exp$PREV
-else
-  DPROLL=$TDP/DP-base
-fi
+# walk back from PREV to 1 and use the chain's newest EXISTING retrained DP.
+# A round with 0 exploration successes SKIPS [2/3] entirely (no success.hdf5,
+# no DP dir) -- the chain must then carry FORWARD the last real DP, not reset
+# to DP-base (silent chain reset otherwise).
+DPROLL=$TDP/DP-base
+for e in $(seq "$PREV" -1 1); do
+  if [ -n "$(newest_ckpt "$TDP/DP-$A-exp$e")" ]; then DPROLL=$TDP/DP-$A-exp$e; break; fi
+done
 DPCKPT=$(newest_ckpt "$DPROLL")
 if [ -z "$DPCKPT" ] && [ "$DRY_RUN" != 1 ]; then
   log "FATAL: no DP ckpt under $DPROLL"; exit 1
