@@ -320,22 +320,18 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
         history["kl"].append(ep["kl"].item() / n)
         history["mu_abs"].append(ep["mu_abs"].item() / n)
 
-        # liveness guard (2026-08-17 postmortem): a dead encoder must FAIL the
-        # run loudly, not log kl=0.0000 for 300 epochs.
+        # liveness DIAGNOSTICS (2026-08-17 postmortem). User 2026-08-18:
+        # sentinels CANCELLED -- the aborts fired on fb=0.005 explore-data
+        # retrains (can r1: alive 0.0079) and would kill legitimate sparse
+        # solutions; free_bits alone now carries the collapse support. The
+        # numbers are still printed every epoch so degradation is visible.
         alive, kl_probe = _liveness(*probe)
         if alive < 0.01:
-            raise RuntimeError(
-                f"[liveness] first-layer ReLU alive fraction {alive:.4f} < 0.01 "
-                "on REAL data -- encoder input distribution is in the dead zone "
-                "(see vib.py in_norm note). Aborting instead of training a "
-                "constant function.")
+            print(f"  [liveness] relu_alive {alive:.3f} < 0.01 (was: ABORT; now: observe-only)")
         elif alive < 0.10:
             print(f"  [liveness] WARNING: relu_alive {alive:.3f} is low (sparse)")
         if epoch >= 10 and history["kl"][-1] < 0.01:
-            raise RuntimeError(
-                f"[liveness] posterior KL {history['kl'][-1]:.4f} nats still "
-                f"< 0.01 at epoch {epoch} -- z carries no (s,a) information; "
-                "guidance would be vacuous. Check beta / decoder path.")
+            print(f"  [liveness] kl {history['kl'][-1]:.4f} < 0.01 (was: ABORT; now: observe-only)")
         if epoch % 10 == 0:
             print(f"  [liveness] relu_alive {alive:.2f} kl_probe {kl_probe:.3f}")
 
@@ -402,8 +398,8 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
     g_norm = grad_g.norm().item()
     print(f"[guidance-check] |dNLL/da| on a real batch = {g_norm:.3e}")
     if not (g_norm > 0.0):
-        raise RuntimeError("[guidance-check] d NLL/d a is exactly zero -- "
-                           "guidance would be a no-op; refusing this ckpt.")
+        print("[guidance-check] WARNING: d NLL/d a is exactly zero -- "
+              "guidance would be a no-op (was: ABORT; now: observe-only, user 2026-08-18)")
 
     return {"beta": beta,
             "latent_mse": history["latent_mse"][-1],
