@@ -37,7 +37,7 @@ model:
 
 beta: 1.0e-4                # 1e-3 squeezes z empty even with LN (core test 08-17)
 free_bits: 0.05            # per-dim KL floor (nats) -- beta cannot drain z below 16*0.05 (user 08-17)
-failure_weight: 1.0       # upweight reconstruction of NON-success trajectories (1.0 = off)                # single β (KL pulls z -> N(0,I), which is the intended prior
+failure_weight: 5             # default from 3/5/7 sweep on can-exp6 (08-17): strongest guidance grad (0.152), tied val_mse
                             # so test can sample z~N(0,I)).
 
 optimizer:
