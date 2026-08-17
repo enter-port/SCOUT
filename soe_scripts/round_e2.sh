@@ -121,7 +121,14 @@ T0=$(date +%s)
 log "=== ROUND(e2) $TASK a=$A round=$NUM START (GPU$GPU; rollout DP=$DPROLL; eval_seed=$SEED explore_seed=$ESEED) ==="
 
 # ---- [1/3] rollout: SPLIT protocol (eval fixed scenes + explore fresh) --- #
+# SKIP_ROLLOUT=1: crash recovery -- if all.hdf5 already exists (rollout done,
+# e.g. a later stage failed), replay only [2/3]+[3/3]; the shared wandb run
+# id is re-read from the existing rollout json.
 GUIDE=off; [ "$A" = SCOUT ] && GUIDE=dyn
+if [ "${SKIP_ROLLOUT:-0}" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
+  log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (rollout already done)"
+  T1=$(date +%s)
+else
 log "[1/3] rollout guide=$GUIDE eval=$SEED(100) explore=$ESEED($NEXPLORE x$ETRIES) dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
 RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
   --config configs/eval_${TASK}_e2.yaml --task "$TASK" --exp-num "$NUM" \
@@ -140,6 +147,7 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
 RC=$?; T1=$(date +%s)
 log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
 [ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RLOG"; exit 1; }
+fi   # end SKIP_ROLLOUT else-branch
 
 # the rollout json carries the shared wandb run id for the retrains
 RID=$($PY - "$RDIR/log" <<'PYEOF'
@@ -185,16 +193,22 @@ print(f"[dp-accum] merged {info} -> {accum}")
 PYEOF
 # adaptive epochs: keep gradient-step budget near the 600ep-on-20-demos
 # convention now that the explore pool is much larger (see header).
+# NOTE: f["data"].keys() yields DIRECT children ("demo_0", "total") -- no
+# "/" inside, so the old k.split("/")[1] fallback raised IndexError (fixed
+# 2026-08-17 after it emptied $EP -> num_epochs="" -> str//int TypeError).
 EP=$($PY - "$RDIR/success_accum.hdf5" <<'PYEOF'
 import sys, h5py
 with h5py.File(sys.argv[1], "r") as f:
     n = f["data"].attrs.get("n_episodes")
     if n is None:
-        n = len({k.split("/")[1] for k in f["data"].keys()
-                 if k.startswith("demo")})
+        n = sum(1 for k in f["data"].keys() if str(k).startswith("demo"))
 print(max(100, min(600, round(12000 / max(int(n), 1)))))
 PYEOF
 )
+if ! [[ "$EP" =~ ^[0-9]+$ ]]; then
+  log "[2/3] WARN: adaptive-epoch probe failed (EP='$EP') -- defaulting to 100"
+  EP=100
+fi
 CKE=$(( EP < 200 ? EP : 200 ))
 log "[2/3] DP retrain: ${EP}ep (adaptive, clamp 100..600) ckpt_every=$CKE ds=$RDIR/success_accum.hdf5 -> $OUTDP (wandb resume $WPROJ/$WNAME)"
 RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=always $PY train.py \
