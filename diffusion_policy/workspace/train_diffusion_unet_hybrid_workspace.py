@@ -142,8 +142,15 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
         def _wandb_log(payload, step):
             if _metric_prefix:
+                # round-run mode: drop the explicit step (the rollout stage
+                # already pushed the run's global counter; explicit small
+                # steps get dropped by wandb 0.28's monotonic guard -- only
+                # the first ~500 warmup rows were lost, but auto-increment
+                # avoids even that). Charts use DP/epoch via define_metric.
                 payload = {_metric_prefix + k: v for k, v in payload.items()}
-            wandb_run.log(payload, step=step)
+                wandb_run.log(payload)
+            else:
+                wandb_run.log(payload, step=step)
         wandb.config.update(
             {
                 "output_dir": self.output_dir,

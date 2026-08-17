@@ -352,18 +352,25 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
               + (f" | val_mse {val_mse:.4f}" if val_mse is not None else ""))
         if wandb_run is not None:
             if metric_prefix:
-                # experiment2 round-run section: dyn/{latent_mse,kl,lr,epoch}
+                # experiment2 round-run section: dyn/{latent_mse,kl,lr,epoch}.
+                # NO explicit step=epoch here: the resumed round-run's global
+                # counter sits at the DP stage's ~5x10^4 steps and wandb 0.28
+                # drops any explicit step below it (observed 2026-08-18:
+                # every dyn/* row discarded with "monotonically increasing"
+                # warnings). Auto-increment keeps the counter monotonic; the
+                # charts' x-axis is dyn/epoch via define_metric(step_metric).
                 log_d = {metric_prefix + "latent_mse": history["latent_mse"][-1],
                          metric_prefix + "kl": history["kl"][-1],
                          metric_prefix + "lr": opt.param_groups[0]["lr"],
                          metric_prefix + "epoch": epoch}
+                wandb_run.log(log_d)
             else:
                 log_d = {"latent_mse": history["latent_mse"][-1],
                          "kl": history["kl"][-1],
                          "mu_abs": history["mu_abs"][-1]}
                 if val_mse is not None:
                     log_d["val_mse"] = val_mse
-            wandb_run.log(log_d, step=epoch)
+                wandb_run.log(log_d, step=epoch)
 
     # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1).
     # view_names + proprio key order ride along so the eval-side factory can
