@@ -122,12 +122,28 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
         env_runner: BaseImageRunner = _build_env_runner() if _rollouts_enabled else None
 
-        # configure logging
+        # configure logging. `metric_prefix` (opt-in, e.g. "DP/") is popped
+        # BEFORE wandb.init -- it namespaces every step_log key (DP/train_loss,
+        # DP/lr, DP/epoch) and gives them their own epoch x-axis, so a retrain
+        # resumed into a shared round-run (experiment2: one wandb run per
+        # round, rollout+DP+dyn) charts in its own section. Default None keeps
+        # the legacy flat keys byte-identical.
+        _logging_kwargs = OmegaConf.to_container(cfg.logging, resolve=True)
+        _metric_prefix = _logging_kwargs.pop('metric_prefix', '') or ''
         wandb_run = wandb.init(
             dir=str(self.output_dir),
             config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
+            **_logging_kwargs
         )
+        if _metric_prefix:
+            wandb.define_metric(_metric_prefix + 'epoch', hidden=True)
+            wandb.define_metric(_metric_prefix + '*',
+                                step_metric=_metric_prefix + 'epoch')
+
+        def _wandb_log(payload, step):
+            if _metric_prefix:
+                payload = {_metric_prefix + k: v for k, v in payload.items()}
+            wandb_run.log(payload, step=step)
         wandb.config.update(
             {
                 "output_dir": self.output_dir,
@@ -238,7 +254,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
-                            wandb_run.log(step_log, step=self.global_step)
+                            _wandb_log(step_log, self.global_step)
                             json_logger.log(step_log)
                             self.global_step += 1
 
@@ -345,7 +361,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
                 # end of epoch
                 # log of last step is combined with validation and rollout
-                wandb_run.log(step_log, step=self.global_step)
+                _wandb_log(step_log, self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1

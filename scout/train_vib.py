@@ -224,7 +224,8 @@ def eval_val_mse(model, val_loader, device, val_img_transform, feats_mode=False)
 # --------------------------------------------------------------------------- #
 def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
                    device, out_dir, train_t=None, val_t=None, val_every=20,
-                   wandb_run=None, E_s=None, feats_mode=False):
+                   wandb_run=None, E_s=None, feats_mode=False,
+                   metric_prefix=""):
     if E_s is None:
         E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
@@ -350,11 +351,18 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
               f"kl {history['kl'][-1]:.4f} |μ| {history['mu_abs'][-1]:.4f}"
               + (f" | val_mse {val_mse:.4f}" if val_mse is not None else ""))
         if wandb_run is not None:
-            log_d = {"latent_mse": history["latent_mse"][-1],
-                     "kl": history["kl"][-1],
-                     "mu_abs": history["mu_abs"][-1]}
-            if val_mse is not None:
-                log_d["val_mse"] = val_mse
+            if metric_prefix:
+                # experiment2 round-run section: dyn/{latent_mse,kl,lr,epoch}
+                log_d = {metric_prefix + "latent_mse": history["latent_mse"][-1],
+                         metric_prefix + "kl": history["kl"][-1],
+                         metric_prefix + "lr": opt.param_groups[0]["lr"],
+                         metric_prefix + "epoch": epoch}
+            else:
+                log_d = {"latent_mse": history["latent_mse"][-1],
+                         "kl": history["kl"][-1],
+                         "mu_abs": history["mu_abs"][-1]}
+                if val_mse is not None:
+                    log_d["val_mse"] = val_mse
             wandb_run.log(log_d, step=epoch)
 
     # save ckpt (single-β flow; no diagnostic -- stage1_plan.md Step 1).
@@ -513,15 +521,25 @@ def run(cfg):
             project=wcfg.get("project", "scout-dynamics"),
             name=wcfg.get("name"), config=to_plain(cfg),
             dir=cfg.save_dir, tags=list(wcfg.get("tags", ["step1", "vib"])))
-        print(f"wandb: project={wcfg.get('project', 'scout-dynamics')} name={wcfg.get('name')}")
+        # opt-in metric prefix (experiment2: dyn/* section of a shared
+        # round-run; also honors WANDB_RUN_ID resume from the driver)
+        metric_prefix = str(wcfg.get("metric_prefix", "") or "")
+        if metric_prefix:
+            wandb.define_metric(metric_prefix + "epoch", hidden=True)
+            wandb.define_metric(metric_prefix + "*",
+                                step_metric=metric_prefix + "epoch")
+        print(f"wandb: project={wcfg.get('project', 'scout-dynamics')} "
+              f"name={wcfg.get('name')} prefix={metric_prefix or None}")
     else:
         print("wandb: disabled")
+        metric_prefix = ""
 
     val_every = int(getattr(cfg, "val_every", 20))
     print(f"\n=== training β={beta:g} (feats_mode={feats_mode}) ===")
     s = train_one_beta(cfg, train_loader, val_loader, ds, cfg, action_dim, beta, device,
                        run_root, train_t=train_t, val_t=val_t, val_every=val_every,
-                       wandb_run=wandb_run, E_s=E_s, feats_mode=feats_mode)
+                       wandb_run=wandb_run, E_s=E_s, feats_mode=feats_mode,
+                       metric_prefix=metric_prefix)
     print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
           f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 

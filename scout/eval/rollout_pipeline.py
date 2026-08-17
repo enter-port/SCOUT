@@ -122,7 +122,10 @@ class RolloutPipeline:
     # ------------------------------------------------------------------ #
     def run(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
             on_progress: Optional[Callable[..., None]] = None,
-            success_only: bool = False) -> dict:
+            success_only: bool = False,
+            explore_seed: Optional[int] = None,
+            n_explore: Optional[int] = None,
+            explore_try_times: int = 1) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -132,10 +135,25 @@ class RolloutPipeline:
         :mod:`scout.eval.rollout_vec`). The CLI uses these to plot the three
         wandb metrics vs completed-init-count.
 
+        Split mode (experiment2, user 2026-08-17): pass ``explore_seed`` (and
+        optionally ``n_explore`` / ``explore_try_times``) to DECOUPLE the two
+        phases: eval measures the seed-fixed scene set (same every round),
+        explore rolls FRESH scenes from ``explore_seed`` (driver passes
+        ``round*1000+42``; scenes differ every round). Explore is no longer
+        gated on eval failures -- every explore scene gets ``try_times``
+        rollouts; successes -> DP retrain data, ALL trajs -> dyn retrain data
+        (eval-phase trajs are measurement only and are NOT collected).
+
         Returns ``{"metrics": {...},
                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
                    "all_trajs": [every traj of the round, with obs]}``.     # dyn
         """
+        if explore_seed is not None:
+            return self._run_split(
+                dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
+                explore_seed=int(explore_seed),
+                n_explore=int(n_explore) if n_explore is not None else 500,
+                explore_try_times=int(explore_try_times))
         horizon = int(self.cfg.eval.horizon)
         try_times = int(getattr(self.cfg.eval, "try_times", 5))
         n_init = int(getattr(self.cfg.eval, "n_init_states", 100))
@@ -224,6 +242,94 @@ class RolloutPipeline:
             "n_baseline_trajs": N,
             "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
                                     if not s],
+        }
+        return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
+
+    # ------------------------------------------------------------------ #
+    def _run_split(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
+                   on_progress: Optional[Callable[..., None]] = None,
+                   explore_seed: int = 1042, n_explore: int = 500,
+                   explore_try_times: int = 1) -> dict:
+        """experiment2 split protocol (user 2026-08-17).
+
+        eval   : the seed-fixed measurement set (``cfg.eval.seed`` ->
+                 seeds seed..seed+n_eval-1, default 42..141, 100 scenes),
+                 1 try each, NO data collection (record_obs=False).
+        explore: FRESH scenes every round -- ``explore_seed`` ->
+                 seeds explore_seed..explore_seed+n_explore-1 (driver passes
+                 round*1000+42; default here round1 = 1042..1541, 500 scenes),
+                 ``try_times`` rollouts per scene (default 1). Guided or plain
+                 per ``self.guided``.
+                 successes -> ``trajs`` (DP retrain data);
+                 ALL explore trajs -> ``all_trajs`` (dyn retrain data).
+        """
+        horizon = int(self.cfg.eval.horizon)
+        n_eval = int(self.cfg.eval.n_init_states)
+        print(f"[rollout:split] dp_ckpt={dp_ckpt} guided={self.guided} "
+              f"eval: n={n_eval} seed={self.base_seed} | "
+              f"explore: n={n_explore} seed={explore_seed} "
+              f"try_times={explore_try_times} n_envs={self.n_envs}"
+              + (f" vib_ckpt={vib_ckpt}" if self.guided else ""))
+        if self.base_seed is not None:
+            torch.manual_seed(int(self.base_seed))
+            np.random.seed(int(self.base_seed))
+
+        dp = self.dp_factory(dp_ckpt)
+        n_action_steps = int(getattr(dp, "n_action_steps", 1))
+
+        # ---- phase 1: eval on the seed-fixed scene set (measurement only) -- #
+        eval_states = collect_initial_states(
+            self.env_factory, n_init_states=n_eval, base_seed=self.base_seed)
+        eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
+        first_results, _, _ = evaluate_baseline_vec(
+            dp, self.env_factory, eval_states, horizon=horizon,
+            n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
+            n_tries=1, metric_prefix="eval",
+            record_obs=False,                      # eval trajs are NOT data
+            on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
+        )
+        baseline_solved = int(sum(1 for s, _ in first_results if s))
+        print(f"[rollout:split] eval: success_rate={baseline_solved}/{n_eval} "
+              f"({baseline_solved / max(n_eval, 1):.3f})")
+
+        # ---- phase 2: explore on FRESH scenes (data collection) ------------ #
+        if self.guided:
+            if self.scout_vib_factory is None:
+                raise ValueError("guided=True requires a scout_vib_factory")
+            scout_vib = (self.scout_vib_factory(vib_ckpt)
+                         if vib_ckpt is not None else self.scout_vib_factory())
+            self._attach_planner(dp, scout_vib)
+        explore_states = collect_initial_states(
+            self.env_factory, n_init_states=n_explore, base_seed=explore_seed)
+        expl_cb = (lambda p: on_progress("explore", p, 0, len(explore_states))
+                   ) if on_progress else None
+        expl = evaluate_exploration_vec(
+            dp, self.env_factory, explore_states, horizon=horizon,
+            try_times=explore_try_times, n_envs=self.n_envs,
+            n_action_steps=n_action_steps, device=self.device,
+            only_failed_of=None,                    # EVERY scene explored
+            guided=self.guided,
+            on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
+        )
+        trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
+        all_trajs: List[dict] = [t for e in expl for t in e.get("all_trajs", [])]
+        explore_solved = int(sum(1 for e in expl if e["solved"]))
+        print(f"[rollout:split] explore: solved {explore_solved}/{n_explore} "
+              f"scenes; collected {len(trajs)} successful trajs "
+              f"({len(all_trajs)} total explore trajs -> dyn)")
+        metrics = {
+            "success_rate": success_rate_per_round(first_results),
+            "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+            "baseline_solved": baseline_solved,
+            "n_failed": n_eval - baseline_solved,
+            "explore_seed": explore_seed,
+            "n_explore": n_explore,
+            "explore_try_times": explore_try_times,
+            "explore_solved": explore_solved,
+            "explore_total": n_explore,
+            "avg_jerk": _jerk_all_explore_trajs(expl),
+            "collected_trajs": len(trajs),
+            "n_all_trajs": len(all_trajs),
         }
         return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
 

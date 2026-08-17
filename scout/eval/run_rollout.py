@@ -116,6 +116,19 @@ def main():
                    help="base seed for the N init scenes (init i uses seed+i; "
                         "default 42 -> seeds 42..141). Same seed across runs -> "
                         "same 100 scenes -> controlled DP-vs-SCOUT comparison.")
+    # ---- experiment2 split protocol (user 2026-08-17) --------------------- #
+    p.add_argument("--eval-seed", type=int, default=None,
+                   help="split mode: seed of the FIXED eval scene set "
+                        "(default --seed, i.e. 42 -> 42..141, 100 scenes)")
+    p.add_argument("--explore-seed", type=int, default=None,
+                   help="split mode: base seed of the explore scene set; round i "
+                        "uses i*1000+42 (seeds ..+499 -> 500 scenes). Passing "
+                        "this switches the pipeline to the split protocol; "
+                        "omitting it keeps the legacy retry-failed-inits mode.")
+    p.add_argument("--n-explore", type=int, default=500,
+                   help="split mode: number of explore scenes (default 500)")
+    p.add_argument("--explore-try-times", type=int, default=1,
+                   help="split mode: rollouts per explore scene (default 1)")
     p.add_argument("--cuda-visible-devices", default=None, help="GPU id (e.g. 0)")
     p.add_argument("--wandb-name", default=None,
                    help="default DP-{task}-{SCOUT|base}-rollout-exp{N}")
@@ -142,6 +155,20 @@ def main():
         cfg.eval.n_envs = int(args.n_envs)
     cfg.eval.n_envs = int(getattr(cfg.eval, "n_envs", 1))
     cfg.eval.seed = args.seed          # base seed for init scenes (pipeline reads it)
+    # split-protocol defaults may live in the config (cfg.explore.*); explicit
+    # CLI --explore-seed wins. Absent section -> legacy retry-failed mode.
+    _exp = getattr(cfg, "explore", None)
+    if args.explore_seed is None and _exp is not None \
+            and getattr(_exp, "base_seed_round1", None) is not None:
+        args.explore_seed = int(_exp.base_seed_round1)
+    if _exp is not None:
+        if getattr(_exp, "n_scenes", None) is not None and args.n_explore == 500:
+            args.n_explore = int(_exp.n_scenes)
+        if getattr(_exp, "try_times", None) is not None \
+                and args.explore_try_times == 1:
+            args.explore_try_times = int(_exp.try_times)
+    split_mode = args.explore_seed is not None
+    eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = (args.guide == "dyn") and not args.success_only
     if guided and (args.vib_ckpt is None
@@ -192,13 +219,25 @@ def main():
                 dir=args.wandb_dir or out_dir,
                 tags=list(wcfg.get("tags", ["step2", "rollout"])) + [args.task],
             )
-            # x-axis = completed-init-count of each phase.
-            wandb.define_metric("eval_init_done")
-            wandb.define_metric("explore_init_done")
-            wandb.define_metric("eval/success_rate", step_metric="eval_init_done")
-            wandb.define_metric("rollout/pass@5", step_metric="explore_init_done")
-            wandb.define_metric("rollout/avg_jerk", step_metric="explore_init_done")
-            print(f"[run_rollout] wandb: project={wandb_run.project} name={wandb_name}")
+            if split_mode:
+                # experiment2 layout: one wandb run per ROUND (this run is later
+                # resumed by the DP / dyn retrain stages via WANDB_RUN_ID) --
+                # eval/* and explore/* are sections of the same run, each on its
+                # own completed-scene-count x-axis.
+                wandb.define_metric("eval/env_done")
+                wandb.define_metric("explore/env_done")
+                wandb.define_metric("eval/success_rate", step_metric="eval/env_done")
+                wandb.define_metric("explore/success_count", step_metric="explore/env_done")
+                wandb.define_metric("explore/avg_jerk", step_metric="explore/env_done")
+            else:
+                # x-axis = completed-init-count of each phase.
+                wandb.define_metric("eval_init_done")
+                wandb.define_metric("explore_init_done")
+                wandb.define_metric("eval/success_rate", step_metric="eval_init_done")
+                wandb.define_metric("rollout/pass@5", step_metric="explore_init_done")
+                wandb.define_metric("rollout/avg_jerk", step_metric="explore_init_done")
+            print(f"[run_rollout] wandb: project={wandb_run.project} name={wandb_name} "
+                  f"run_id={wandb_run.id}")
         except Exception as e:  # wandb optional -- never block the run on it
             print(f"[run_rollout] wandb disabled (init failed: {e})")
             wandb_run = None
@@ -207,28 +246,41 @@ def main():
 
     def on_progress(phase: str, payload: dict,
                     baseline_solved: int = 0, n_total: int = 0):
-        """Engine -> wandb: log the three metrics vs their phase's init count."""
+        """Engine -> wandb: log the metrics vs their phase's scene count."""
         if wandb_run is None:
             return
         if phase == "eval":
             completed = int(payload.get("completed", 0))
             succ = int(payload.get("successes", 0))
-            wandb_run.log({
-                "eval/success_rate": succ / max(completed, 1),
-                "eval_init_done": completed,
-            })
+            if split_mode:
+                wandb_run.log({
+                    "eval/env_done": completed,
+                    "eval/success_rate": succ / max(completed, 1),
+                })
+            else:
+                wandb_run.log({
+                    "eval/success_rate": succ / max(completed, 1),
+                    "eval_init_done": completed,
+                })
         elif phase == "explore":
             eid = int(payload.get("explore_init_done", 0))
             solved_failed = int(payload.get("solved_failed", 0))
-            pass5 = (baseline_solved + solved_failed) / max(n_total, 1)
             jn = int(payload.get("jerk_n", 0))
             js = float(payload.get("jerk_sum", 0.0))
             avg_jerk = js / jn if jn > 0 else 0.0
-            wandb_run.log({
-                "rollout/pass@5": pass5,
-                "rollout/avg_jerk": avg_jerk,
-                "explore_init_done": eid,
-            })
+            if split_mode:
+                wandb_run.log({
+                    "explore/env_done": eid,
+                    "explore/success_count": solved_failed,
+                    "explore/avg_jerk": avg_jerk,
+                })
+            else:
+                pass5 = (baseline_solved + solved_failed) / max(n_total, 1)
+                wandb_run.log({
+                    "rollout/pass@5": pass5,
+                    "rollout/avg_jerk": avg_jerk,
+                    "explore_init_done": eid,
+                })
 
     dp_factory = make_lpb_dp_factory(device)
     scout_vib_factory = make_scout_vib_factory(cfg, device) if guided else None
@@ -254,6 +306,9 @@ def main():
             vib_ckpt=args.vib_ckpt if guided else None,
             on_progress=on_progress if wandb_run is not None else None,
             success_only=args.success_only,
+            explore_seed=args.explore_seed,
+            n_explore=args.n_explore,
+            explore_try_times=args.explore_try_times,
         )
         metrics = result["metrics"]
 
@@ -309,14 +364,26 @@ def main():
             else:
                 print("[run_rollout] 0 all-trajs -- skipping all hdf5")
 
-            # ---- final wandb points (converged values at full init counts) ---- #
+            # ---- final wandb points (converged values at full scene counts) -- #
             if wandb_run is not None:
-                N = int(cfg.eval.n_init_states)
-                wandb_run.log({"eval/success_rate": metrics["success_rate"],
-                               "eval_init_done": N})
-                wandb_run.log({"rollout/pass@5": metrics["pass_at_5"],
-                               "rollout/avg_jerk": metrics["avg_jerk"],
-                               "explore_init_done": metrics["n_failed"]})
+                if split_mode:
+                    wandb_run.log({
+                        "eval/env_done": int(cfg.eval.n_init_states),
+                        "eval/success_rate": metrics["success_rate"],
+                    })
+                    wandb_run.log({
+                        "explore/env_done": metrics["explore_total"],
+                        "explore/success_count": metrics["explore_solved"],
+                        "explore/total": metrics["explore_total"],   # final only
+                        "explore/avg_jerk": metrics["avg_jerk"],
+                    })
+                else:
+                    N = int(cfg.eval.n_init_states)
+                    wandb_run.log({"eval/success_rate": metrics["success_rate"],
+                                   "eval_init_done": N})
+                    wandb_run.log({"rollout/pass@5": metrics["pass_at_5"],
+                                   "rollout/avg_jerk": metrics["avg_jerk"],
+                                   "explore_init_done": metrics["n_failed"]})
 
             # ---- JSON summary ------------------------------------------------- #
             summary = {
@@ -328,26 +395,47 @@ def main():
                 "try_times": int(cfg.eval.try_times),
                 "seed": args.seed,
                 "guided": int(guided),
+                "wandb_run_id": (wandb_run.id if wandb_run is not None else None),
                 "success_rate": metrics["success_rate"],
-                "pass_at_5": metrics["pass_at_5"],
                 "avg_jerk": metrics["avg_jerk"],
                 "jerk_baseline": metrics["jerk_baseline"],
                 "baseline_solved": metrics["baseline_solved"],
                 "n_failed": metrics["n_failed"],
-                "exploration_rescued": metrics["exploration_rescued"],
                 "collected_trajs": metrics["collected_trajs"],
                 "n_success_trajs": len(trajs),
                 "n_all_trajs": len(all_trajs),
-                "n_baseline_trajs": int(cfg.eval.n_init_states),
-                "failed_init_indices": metrics["failed_init_indices"],
+                "failed_init_indices": metrics.get("failed_init_indices"),
                 "outputs": {"success": success_path, "all": all_path},
             }
+            if split_mode:
+                summary.update({
+                    "protocol": "split",
+                    "eval_seed": eval_seed,
+                    "explore_seed": metrics["explore_seed"],
+                    "n_explore": metrics["n_explore"],
+                    "explore_try_times": metrics["explore_try_times"],
+                    "explore_solved": metrics["explore_solved"],
+                    "explore_total": metrics["explore_total"],
+                })
+            else:
+                summary.update({
+                    "protocol": "legacy",
+                    "pass_at_5": metrics["pass_at_5"],
+                    "exploration_rescued": metrics["exploration_rescued"],
+                    "n_baseline_trajs": int(cfg.eval.n_init_states),
+                })
             with open(json_path, "w") as f:
                 json.dump(summary, f, indent=2)
 
-            print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
-                  f"pass@5={metrics['pass_at_5']:.3f} avg_jerk={metrics['avg_jerk']:.4f} "
-                  f"collected={metrics['collected_trajs']}")
+            if split_mode:
+                print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
+                      f"explore {metrics['explore_solved']}/{metrics['explore_total']} "
+                      f"avg_jerk={metrics['avg_jerk']:.4f} "
+                      f"collected={metrics['collected_trajs']}")
+            else:
+                print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
+                      f"pass@5={metrics['pass_at_5']:.3f} avg_jerk={metrics['avg_jerk']:.4f} "
+                      f"collected={metrics['collected_trajs']}")
             print(f"[run_rollout] success -> {success_path} ({len(trajs)} trajs)")
             print(f"[run_rollout] all     -> {all_path} ({len(all_trajs)} trajs)")
             print(f"[run_rollout] json    -> {json_path}")
