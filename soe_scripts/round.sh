@@ -169,7 +169,8 @@ else
     --output-dir "$RDIR" \
     --output-success "$RDIR/success.hdf5" \
     --output-all "$RDIR/all.hdf5" \
-    --wandb-name "$A-$TASK-rollout-exp$NUM" \
+    --wandb-name "${TASK}-${A}-rollout-exp${NUM}" \
+    --wandb-project "1-${TASK}-eval" \
     > "$RLOG" 2>&1
   RC=$?; T1=$(date +%s)
   log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
@@ -225,8 +226,8 @@ PYEOF
     training.cudnn_benchmark=true \
     training.device=cuda:0 \
     dataloader.num_workers=8 dataloader.persistent_workers=true \
-    logging.name=DP-${TASK}-${A}-exp${NUM} \
-    logging.project=scout-base-dp \
+    logging.name=${TASK}-DP-${A}-exp${NUM} \
+    logging.project=1-${TASK}-DP \
     hydra.run.dir="$OUTDP" \
     > "$DPLOG" 2>&1
   RC=$?; T2=$(date +%s)
@@ -245,8 +246,8 @@ PYEOF
     training.cudnn_benchmark=true \
       training.device=cuda:0 \
       dataloader.num_workers=0 \
-      logging.name=DP-${TASK}-${A}-exp${NUM} \
-      logging.project=scout-base-dp \
+      logging.name=${TASK}-DP-${A}-exp${NUM} \
+      logging.project=1-${TASK}-DP \
       hydra.run.dir="$OUTDP" \
       > "$DPLOG" 2>&1
     RC=$?; T2=$(date +%s)
@@ -294,7 +295,8 @@ ck = sorted(glob.glob(os.path.join(outdp, "checkpoints", "*.ckpt")),
 if ck:   # E_s from the NEW DP keeps the next round's (DP, E_s) pair matched
     cfg["model"]["E_s"]["base_dp_ckpt"] = ck[-1]
 cfg["save_dir"] = outdyn
-cfg.setdefault("wandb", {})["name"] = f"dyn-{task}-{a_tag}-exp{num}"
+cfg.setdefault("wandb", {})["name"] = f"{task}-dyn-{a_tag}-exp{num}"
+cfg["wandb"]["project"] = f"1-{task}-dyn"
 with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 PYEOF
