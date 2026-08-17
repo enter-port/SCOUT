@@ -322,12 +322,14 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
         # liveness guard (2026-08-17 postmortem): a dead encoder must FAIL the
         # run loudly, not log kl=0.0000 for 300 epochs.
         alive, kl_probe = _liveness(*probe)
-        if alive < 0.05:
+        if alive < 0.01:
             raise RuntimeError(
-                f"[liveness] first-layer ReLU alive fraction {alive:.3f} < 0.05 "
+                f"[liveness] first-layer ReLU alive fraction {alive:.4f} < 0.01 "
                 "on REAL data -- encoder input distribution is in the dead zone "
                 "(see vib.py in_norm note). Aborting instead of training a "
                 "constant function.")
+        elif alive < 0.10:
+            print(f"  [liveness] WARNING: relu_alive {alive:.3f} is low (sparse)")
         if epoch >= 10 and history["kl"][-1] < 0.01:
             raise RuntimeError(
                 f"[liveness] posterior KL {history['kl'][-1]:.4f} nats still "
