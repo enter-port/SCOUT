@@ -28,7 +28,7 @@ model:
   E_s:
     # LAST square base-DP ckpt (convention: dyn training + rollout default to
     # the newest ckpt; 580 is the last one saved by the old naming scheme).
-    base_dp_ckpt: /root/workspace/baojiachun/scout/data/square/train/DP/DP-base/checkpoints/580.ckpt
+    base_dp_ckpt: /root/workspace/baojiachun/scout/data/experiment1/square/train/DP/DP-base/checkpoints/580.ckpt
     view_names: ['agentview_image', 'robot0_eye_in_hand_image']
     proprio_dim: 9          # eef_pos(3) + eef_quat(4) + gripper_qpos(2)
     proprio_emb_dim: 64     # -> s_bar_dim = 512*2 + 64 = 1088
@@ -55,7 +55,7 @@ steps_per_epoch: 100           # 100 steps/epoch (user 2026-08-17)
 val_ratio: 0.1             # hold out last 10% of demos for val (episode-level)
 val_every: 20              # eval val latent_mse every N epochs
 
-save_dir: /root/workspace/baojiachun/scout/data/square/train/dyn/dyn-base
+save_dir: /root/workspace/baojiachun/scout/data/experiment1/square/train/dyn/dyn-base
 
 use_wandb: true
 wandb:

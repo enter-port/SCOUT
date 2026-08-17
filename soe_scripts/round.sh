@@ -76,7 +76,10 @@ export WANDB_DIR=/root/workspace/baojiachun/wandb_runs
 export WANDB_CACHE_DIR=/root/workspace/baojiachun/.cache/wandb
 
 REPO=/root/workspace/baojiachun/scout
-DATA=$REPO/data
+# ALL experiment outputs live under data/experiment1 (user 2026-08-17) --
+# one directory per experiment, matching the 1-* wandb project prefix.
+# Source pipeline data (cores) stays in data/robomimic untouched.
+DATA=$REPO/data/experiment1
 PY=/root/workspace/baojiachun/.venv/bin/python
 TDP=$DATA/$TASK/train/DP
 TDYN=$DATA/$TASK/train/dyn
