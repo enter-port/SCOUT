@@ -16,7 +16,7 @@
 #       project <TASK>-experiment2 (CAN-experiment2 / SQUARE-experiment2),
 #       run name <A>-round<i> (SCOUT-round1, DP-round3, ...). The rollout
 #       process creates the run (id saved to the rollout json); DP / dyn
-#       retrains RESUME it via WANDB_RUN_ID + WANDB_RESUME=always and log
+#       retrains RESUME it via WANDB_RUN_ID + WANDB_RESUME=must and log
 #       under their own section keys (DP/* with DP/epoch x-axis, dyn/* with
 #       dyn/epoch x-axis; eval/* + explore/* come from the rollout stage).
 #       dyn-base prereq is its own run: SCOUT-round0.
@@ -211,7 +211,7 @@ if ! [[ "$EP" =~ ^[0-9]+$ ]]; then
 fi
 CKE=$(( EP < 200 ? EP : 200 ))
 log "[2/3] DP retrain: ${EP}ep (adaptive, clamp 100..600) ckpt_every=$CKE ds=$RDIR/success_accum.hdf5 -> $OUTDP (wandb resume $WPROJ/$WNAME)"
-RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=always $PY train.py \
+RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY train.py \
   --config-path configs --config-name base_dp_${TASK}_image \
   task.dataset_path="$RDIR/success_accum.hdf5" \
   task.train_filter_key=scout_aug \
@@ -232,7 +232,7 @@ RC=$?; T2=$(date +%s)
 log "[2/3] DP retrain (workers=8) rc=$RC in $(( (T2-T1)/60 ))m$(( (T2-T1)%60 ))s"
 if [ $RC -ne 0 ]; then
   log "[2/3] workers=8 failed (known intermittent torch shm) -- retry with num_workers=0"
-  RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=always $PY train.py \
+  RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY train.py \
     --config-path configs --config-name base_dp_${TASK}_image \
     task.dataset_path="$RDIR/success_accum.hdf5" \
     task.train_filter_key=scout_aug \
@@ -290,7 +290,7 @@ with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 PYEOF
 log "[3/3] dyn retrain: ds=$RDIR/all_accum.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN (wandb resume)"
-RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=always $PY -m scout.train_vib \
+RUN env CUDA_VISIBLE_DEVICES=$GPU WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY -m scout.train_vib \
   --config "$CFG" \
   > "$DYNLOG" 2>&1
 RC=$?; T3=$(date +%s)
