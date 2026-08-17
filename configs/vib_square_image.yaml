@@ -44,10 +44,12 @@ optimizer:
     lr: 1.0e-3
     betas: [0.9, 0.999]
     weight_decay: 1.0e-6
+  lr_scheduler: cosine     # warmup -> cosine to 5% peak (user 2026-08-17)
+  warmup_epochs: 5
 
 batch_size: 256
 num_epochs: 300
-steps_per_epoch: 200
+steps_per_epoch: 100           # 100 steps/epoch (user 2026-08-17)
 val_ratio: 0.1             # hold out last 10% of demos for val (episode-level)
 val_every: 20              # eval val latent_mse every N epochs
 

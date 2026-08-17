@@ -23,6 +23,7 @@ For an environment-agnostic forward/backward smoke test (no dataset, no ckpt):
 """
 
 import argparse
+import math
 import os
 import time
 
@@ -237,7 +238,36 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
 
     steps_per_epoch = int(cfg.steps_per_epoch)
     num_epochs = int(cfg.num_epochs)
+    # LR schedule (user 2026-08-17): linear warmup -> cosine decay to 5% peak.
+    total_steps = steps_per_epoch * num_epochs
+    _ocfg = cfg.get("optimizer", {}) or {}
+    warmup_steps = max(1, int(_ocfg.get("warmup_epochs", 5)) * steps_per_epoch)
+    scheduler = None
+    if str(_ocfg.get("lr_scheduler", "cosine")) == "cosine":
+        def _lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * t))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, _lr_lambda)
+
+    def _liveness(s_bar_p, a_p):
+        """First-layer ReLU alive fraction + posterior KL on a REAL batch.
+
+        2026-08-17 postmortem: the dead-ReLU encoder was a silent constant
+        function for an entire run (kl 3e-6 nats, guidance gradient exactly
+        0). These two numbers make that failure loud instead of silent.
+        """
+        with torch.no_grad():
+            x = model.vib_enc.in_norm(torch.cat([s_bar_p, a_p], dim=-1))
+            pre = model.vib_enc.net.encoder[0](x)
+            alive = (pre > 0).float().mean().item()
+            mu, logvar = model.vib_enc(s_bar_p, a_p)
+            kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(1).mean().item()
+        return alive, kl
+
     history = {"latent_mse": [], "kl": [], "mu_abs": [], "val_mse": []}
+    probe = None   # (s_bar, A) of the first real batch, for liveness checks
 
     model.train()
     for epoch in range(num_epochs):
@@ -252,7 +282,14 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
             else:
                 obs_t, A_t, obs_tp1 = _slice_transition(batch, device, train_t)
                 out = model(obs_t, A_t, obs_tp1)
+            if probe is None:
+                with torch.no_grad():
+                    s_p = (model.encode_from_feats(obs_t) if feats_mode
+                           else model.encode(obs_t))
+                    probe = (s_p.detach(), A_t.detach())
             opt.zero_grad(); out["loss"].backward(); opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
             # accumulate over EVERY batch (sampling every-N skipped small-data
             # epochs entirely -- lift has 27 batches/epoch < old log_every_batch=40,
@@ -270,6 +307,23 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
         history["latent_mse"].append(ep["latent_mse"].item() / n)
         history["kl"].append(ep["kl"].item() / n)
         history["mu_abs"].append(ep["mu_abs"].item() / n)
+
+        # liveness guard (2026-08-17 postmortem): a dead encoder must FAIL the
+        # run loudly, not log kl=0.0000 for 300 epochs.
+        alive, kl_probe = _liveness(*probe)
+        if alive < 0.05:
+            raise RuntimeError(
+                f"[liveness] first-layer ReLU alive fraction {alive:.3f} < 0.05 "
+                "on REAL data -- encoder input distribution is in the dead zone "
+                "(see vib.py in_norm note). Aborting instead of training a "
+                "constant function.")
+        if epoch >= 10 and history["kl"][-1] < 0.01:
+            raise RuntimeError(
+                f"[liveness] posterior KL {history['kl'][-1]:.4f} nats still "
+                f"< 0.01 at epoch {epoch} -- z carries no (s,a) information; "
+                "guidance would be vacuous. Check beta / decoder path.")
+        if epoch % 10 == 0:
+            print(f"  [liveness] relu_alive {alive:.2f} kl_probe {kl_probe:.3f}")
 
         # val on held-out demos: trivial-prediction (val~train) vs overfit (val>>train)
         val_mse = None
@@ -306,6 +360,22 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
                 os.path.join(out_dir, "val_mse.png"))
     plot_curves(history, ["mu_abs"], f"|μ| (β={beta:g})",
                 os.path.join(out_dir, "mu.png"))
+
+    # guidance-gradient liveness on a REAL batch (2026-08-17 postmortem): the
+    # rollout guidance was silently an exact no-op when the encoder was a
+    # dead-ReLU constant. The bridge used at rollout is affine, so nonzero
+    # here <=> nonzero through the real guidance path.
+    s_p, a_p = probe
+    a_g = a_p.clone().requires_grad_(True)
+    mu_g, logvar_g = model.vib_enc(s_p, a_g)
+    z_g = torch.randn_like(mu_g)
+    nll_g = 0.5 * ((z_g - mu_g).pow(2) / logvar_g.exp() + logvar_g).sum(1).mean()
+    grad_g, = torch.autograd.grad(nll_g, a_g)
+    g_norm = grad_g.norm().item()
+    print(f"[guidance-check] |dNLL/da| on a real batch = {g_norm:.3e}")
+    if not (g_norm > 0.0):
+        raise RuntimeError("[guidance-check] d NLL/d a is exactly zero -- "
+                           "guidance would be a no-op; refusing this ckpt.")
 
     return {"beta": beta,
             "latent_mse": history["latent_mse"][-1],

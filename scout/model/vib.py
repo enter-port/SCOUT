@@ -46,6 +46,13 @@ class VIBEncoder(nn.Module):
         self.action_dim = int(action_dim)
         self.s_bar_dim = int(s_bar_dim)
         self.style_dim = int(style_dim)
+        # Input LayerNorm (2026-08-17 postmortem): E_s outputs are post-ReLU
+        # features -- non-negative with a large positive mean (||s_bar||~33).
+        # At init that put EVERY real input in the first layer's ReLU dead
+        # zone (measured 0/128 units alive) -> constant encoder -> zero
+        # gradient -> weights never trained -> guidance exactly 0. LayerNorm
+        # centers/scales per sample, so the dead zone cannot happen.
+        self.in_norm = nn.LayerNorm(self.s_bar_dim + self.action_dim)
         self.net = EncoderMLP(
             input_dim=self.s_bar_dim + self.action_dim,
             output_dim=2 * self.style_dim,
@@ -53,7 +60,7 @@ class VIBEncoder(nn.Module):
         )
 
     def forward(self, s_bar, a):
-        x = torch.cat([s_bar, a], dim=-1)
+        x = self.in_norm(torch.cat([s_bar, a], dim=-1))
         mu, logvar = self.net(x).chunk(2, dim=-1)
         return mu, logvar
 
