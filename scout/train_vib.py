@@ -142,7 +142,8 @@ def _slice_transition(batch, device, img_transform=None):
     s_t -> s_{t+fs}. frameskip=1 -> single action; frameskip=8 -> 80-dim chunk,
     matching the base DP's n_action_steps=8 chunk so train/test mu(s,a) agree.
     """
-    obs, act, _state = batch
+    obs, act, _state = batch[:3]
+    w = batch[3] if len(batch) > 3 else None   # failure weight (train only)
     visual = obs["visual"]
     proprio = obs["proprio"]
     if img_transform is not None:
@@ -163,7 +164,7 @@ def _slice_transition(batch, device, img_transform=None):
     # (fs = frameskip; act is (B, 2*fs, step_dim) since num_hist=num_pred=1).
     fs = act.shape[1] // 2
     a_t = act[:, :fs].reshape(act.shape[0], -1).to(device)
-    return obs_t, a_t, obs_tp1
+    return obs_t, a_t, obs_tp1, w
 
 
 def _slice_transition_feats(batch, device):
@@ -177,7 +178,8 @@ def _slice_transition_feats(batch, device):
     :meth:`ScoutVIB.forward_feats` consumes. Identical anchor/action slicing
     to the live path.
     """
-    obs, act, _state = batch
+    obs, act, _state = batch[:3]
+    w = batch[3] if len(batch) > 3 else None   # failure weight (train only)
     vf = obs["visual_feat"]
     proprio = obs["proprio"]
     obs_t = {
@@ -190,7 +192,7 @@ def _slice_transition_feats(batch, device):
     }
     fs = act.shape[1] // 2
     a_t = act[:, :fs].reshape(act.shape[0], -1).to(device)
-    return obs_t, a_t, obs_tp1
+    return obs_t, a_t, obs_tp1, w
 
 
 @torch.no_grad()
@@ -207,10 +209,10 @@ def eval_val_mse(model, val_loader, device, val_img_transform, feats_mode=False)
     mses = []
     for b in val_loader:
         if feats_mode:
-            obs_t, A_t, obs_tp1 = _slice_transition_feats(b, device)
+            obs_t, A_t, obs_tp1, _w = _slice_transition_feats(b, device)
             out = model.forward_feats(obs_t, A_t, obs_tp1)
         else:
-            obs_t, A_t, obs_tp1 = _slice_transition(b, device, val_img_transform)
+            obs_t, A_t, obs_tp1, _w = _slice_transition(b, device, val_img_transform)
             out = model(obs_t, A_t, obs_tp1)
         mses.append(out["latent_mse"].item())
     model.train()
@@ -231,6 +233,7 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
         style_dim=cfg.model.style_dim,
         hidden_dim=cfg.model.hidden_dim,
         beta=beta,
+        free_bits=float(cfg.get("free_bits", 0.0)),
     ).to(device)
     # only trainable params: vib_enc / D_s / proprio_embed (ResNet frozen).
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -277,17 +280,25 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
         ep = {"latent_mse": None, "kl": None, "mu_abs": None, "n": 0}
         for it, batch in enumerate(train_loader):
             if feats_mode:
-                obs_t, A_t, obs_tp1 = _slice_transition_feats(batch, device)
+                obs_t, A_t, obs_tp1, w = _slice_transition_feats(batch, device)
                 out = model.forward_feats(obs_t, A_t, obs_tp1)
             else:
-                obs_t, A_t, obs_tp1 = _slice_transition(batch, device, train_t)
+                obs_t, A_t, obs_tp1, w = _slice_transition(batch, device, train_t)
                 out = model(obs_t, A_t, obs_tp1)
             if probe is None:
                 with torch.no_grad():
                     s_p = (model.encode_from_feats(obs_t) if feats_mode
                            else model.encode(obs_t))
                     probe = (s_p.detach(), A_t.detach())
-            opt.zero_grad(); out["loss"].backward(); opt.step()
+            # weighted reconstruction + free-bits KL (failure_weight / free_bits;
+            # w=None or fw=1 or fb=0 reproduces the old objective exactly)
+            if w is not None:
+                w = w.to(device)
+                mse_loss = (w * out["latent_mse_per"]).sum() / w.sum()
+            else:
+                mse_loss = out["latent_mse"]
+            loss = mse_loss + beta * out["kl_fb"]
+            opt.zero_grad(); loss.backward(); opt.step()
             if scheduler is not None:
                 scheduler.step()
 
@@ -448,8 +459,37 @@ def run(cfg):
     else:
         train_idx = np.arange(len(train_ds))
         val_idx = np.array([], dtype=np.int64)
+    # failure up-weighting (user 2026-08-17): weight the reconstruction of
+    # every anchor from a NON-success trajectory by cfg.failure_weight
+    # (success/core stay 1.0; val stays unweighted -- honest generalization).
+    fw = float(cfg.get("failure_weight", 1.0))
+    train_view = train_ds
+    if fw != 1.0:
+        import h5py
+        def _dn(k):
+            import re as _re
+            m = _re.search(r"(\d+)$", k)
+            return int(m.group(1)) if m else 0
+        with h5py.File(cfg.dataset.zarr_path, "r") as f:
+            demos = sorted([k for k in f["data"].keys() if k.startswith("demo")], key=_dn)
+            succ = [bool(np.asarray(f["data"][k]["success"]).ravel()[0])
+                    if "success" in f["data"][k] else True for k in demos]
+        ep_w = np.array([fw if not sc else 1.0 for sc in succ], dtype=np.float32)
+        anchors_ep = np.searchsorted(ds.episode_ends, train_ds.valid_anchor_indices, side="right")
+        w_all = ep_w[anchors_ep]
+        n_fail = int((~np.array(succ)).sum())
+        class _WeightedView(torch.utils.data.Dataset):
+            def __init__(self, base, w):
+                self.base, self.w = base, w
+            def __len__(self):
+                return len(self.base)
+            def __getitem__(self, i):
+                return (*self.base[i], self.w[i])
+        train_view = _WeightedView(train_ds, w_all)
+        print(f"failure_weight: {fw:g} -- {n_fail}/{len(succ)} failure episodes upweighted "
+              f"(mean anchor weight {w_all.mean():.2f})")
     nw = int(getattr(cfg.dataset, "num_workers", 0))
-    train_loader = DataLoader(Subset(train_ds, train_idx), batch_size=int(cfg.batch_size),
+    train_loader = DataLoader(Subset(train_view, train_idx), batch_size=int(cfg.batch_size),
                               shuffle=True, num_workers=nw, drop_last=True)
     val_loader = (DataLoader(Subset(val_ds, val_idx), batch_size=int(cfg.batch_size),
                              shuffle=False, num_workers=nw)

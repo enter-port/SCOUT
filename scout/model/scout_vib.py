@@ -42,12 +42,14 @@ class ScoutVIB(nn.Module):
         style_dim: int = 16,
         hidden_dim: int = 128,
         beta: float = 1.0e-3,
+        free_bits: float = 0.0,
     ):
         super().__init__()
         self.action_dim = int(action_dim)
         self.style_dim = int(style_dim)
         self.hidden_dim = int(hidden_dim)
         self.beta = float(beta)
+        self.free_bits = float(free_bits)
 
         # E_s is injected already-constructed (caller picks base-DP ckpt vs mock).
         # s_bar_dim follows whatever E_s reports (512*n_views + proprio_emb_dim).
@@ -107,11 +109,18 @@ class ScoutVIB(nn.Module):
         z = reparam(mu, logvar)
         s_bar_pred = self.D_s(z, s_bar_t)                   # ŝ̄_{t+1}
 
-        latent_mse = F.mse_loss(s_bar_pred, s_bar_tp1)
-        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1).mean()
+        mse_per = (s_bar_pred - s_bar_tp1).pow(2).mean(dim=-1)      # (B,)
+        kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+        latent_mse = mse_per.mean()
+        kl = kl_per_dim.sum(dim=-1).mean()                          # true KL
+        # free-bits (user 2026-08-17): clamp each latent dim's KL at a floor --
+        # info up to that level is free, so beta cannot squeeze the encoder
+        # empty (postmortem: true KL decayed below 0.01 nats on rollout data).
+        kl_fb = torch.clamp(kl_per_dim, min=self.free_bits).sum(dim=-1).mean()
 
-        loss = latent_mse + self.beta * kl
+        loss = latent_mse + self.beta * kl_fb
         return {"loss": loss, "latent_mse": latent_mse, "kl": kl,
+                "latent_mse_per": mse_per, "kl_fb": kl_fb,
                 "mu": mu, "logvar": logvar}
 
     def forward_feats(
@@ -131,9 +140,16 @@ class ScoutVIB(nn.Module):
         z = reparam(mu, logvar)
         s_bar_pred = self.D_s(z, s_bar_t)                   # ŝ̄_{t+1}
 
-        latent_mse = F.mse_loss(s_bar_pred, s_bar_tp1)
-        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1).mean()
+        mse_per = (s_bar_pred - s_bar_tp1).pow(2).mean(dim=-1)      # (B,)
+        kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+        latent_mse = mse_per.mean()
+        kl = kl_per_dim.sum(dim=-1).mean()                          # true KL
+        # free-bits (user 2026-08-17): clamp each latent dim's KL at a floor --
+        # info up to that level is free, so beta cannot squeeze the encoder
+        # empty (postmortem: true KL decayed below 0.01 nats on rollout data).
+        kl_fb = torch.clamp(kl_per_dim, min=self.free_bits).sum(dim=-1).mean()
 
-        loss = latent_mse + self.beta * kl
+        loss = latent_mse + self.beta * kl_fb
         return {"loss": loss, "latent_mse": latent_mse, "kl": kl,
+                "latent_mse_per": mse_per, "kl_fb": kl_fb,
                 "mu": mu, "logvar": logvar}
