@@ -550,10 +550,8 @@ def run(cfg):
         yaml.safe_dump(to_plain(s), f, default_flow_style=False)
     if wandb_run is not None:
         # /final = cross-stage summary of the shared round-run (rollout adds
-        # eval/explore, DP retrain adds dp_train_loss); mu_abs/val_mse stay as
-        # dyn-only collapse/overfit diagnostics alongside the renamed pair
-        wandb_run.log({"final/dyn_mse_loss": s["latent_mse"], "final/dyn_kl_loss": s["kl"],
-                       "final/mu_abs": s["mu_abs"], "final/val_mse": s.get("val_mse")})
+        # eval/explore, DP retrain adds dp_train_loss)
+        wandb_run.log({"final/dyn_mse_loss": s["latent_mse"], "final/dyn_kl_loss": s["kl"]})
         wandb_run.finish()
     print(f"run_root: {run_root}")
     return run_root
