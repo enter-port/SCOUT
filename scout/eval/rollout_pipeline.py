@@ -125,7 +125,8 @@ class RolloutPipeline:
             success_only: bool = False,
             explore_seed: Optional[int] = None,
             n_explore: Optional[int] = None,
-            explore_try_times: int = 1) -> dict:
+            explore_try_times: int = 1,
+            eval_only: bool = False) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -148,12 +149,13 @@ class RolloutPipeline:
                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
                    "all_trajs": [every traj of the round, with obs]}``.     # dyn
         """
-        if explore_seed is not None:
+        if explore_seed is not None or eval_only:
             return self._run_split(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
-                explore_seed=int(explore_seed),
+                explore_seed=int(explore_seed) if explore_seed is not None else 0,
                 n_explore=int(n_explore) if n_explore is not None else 500,
-                explore_try_times=int(explore_try_times))
+                explore_try_times=int(explore_try_times),
+                eval_only=eval_only)
         horizon = int(self.cfg.eval.horizon)
         try_times = int(getattr(self.cfg.eval, "try_times", 5))
         n_init = int(getattr(self.cfg.eval, "n_init_states", 100))
@@ -249,7 +251,8 @@ class RolloutPipeline:
     def _run_split(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
                    on_progress: Optional[Callable[..., None]] = None,
                    explore_seed: int = 1042, n_explore: int = 500,
-                   explore_try_times: int = 1) -> dict:
+                   explore_try_times: int = 1,
+                   eval_only: bool = False) -> dict:
         """experiment2 split protocol (user 2026-08-17).
 
         eval   : the seed-fixed measurement set (``cfg.eval.seed`` ->
@@ -293,6 +296,18 @@ class RolloutPipeline:
               f"({baseline_solved / max(n_eval, 1):.3f})")
 
         # ---- phase 2: explore on FRESH scenes (data collection) ------------ #
+        if eval_only:
+            # user 2026-08-18: eval-only round (final round of a chain) --
+            # measurement only; no explore, no hdf5, no retrains downstream.
+            metrics = {
+                "success_rate": success_rate_per_round(first_results),
+                "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+                "baseline_solved": baseline_solved,
+                "n_failed": n_eval - baseline_solved,
+                "eval_only": True,
+            }
+            print("[rollout:split] eval-only round -- skipping explore phase")
+            return {"metrics": metrics, "trajs": [], "all_trajs": []}
         if self.guided:
             if self.scout_vib_factory is None:
                 raise ValueError("guided=True requires a scout_vib_factory")

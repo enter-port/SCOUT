@@ -129,6 +129,10 @@ def main():
                    help="split mode: number of explore scenes (default 500)")
     p.add_argument("--explore-try-times", type=int, default=1,
                    help="split mode: rollouts per explore scene (default 1)")
+    p.add_argument("--eval-only", action="store_true",
+                   help="split protocol but SKIP the explore phase: run the "
+                        "seed-fixed eval set once, report success_rate/jerk, "
+                        "write no hdf5 (final round of a chain)")
     p.add_argument("--cuda-visible-devices", default=None, help="GPU id (e.g. 0)")
     p.add_argument("--wandb-name", default=None,
                    help="default DP-{task}-{SCOUT|base}-rollout-exp{N}")
@@ -167,7 +171,7 @@ def main():
         if getattr(_exp, "try_times", None) is not None \
                 and args.explore_try_times == 1:
             args.explore_try_times = int(_exp.try_times)
-    split_mode = args.explore_seed is not None
+    split_mode = args.explore_seed is not None or args.eval_only
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = (args.guide == "dyn") and not args.success_only
@@ -332,6 +336,7 @@ def main():
             explore_seed=args.explore_seed,
             n_explore=args.n_explore,
             explore_try_times=args.explore_try_times,
+            eval_only=args.eval_only,
         )
         metrics = result["metrics"]
 
@@ -394,18 +399,19 @@ def main():
                         "eval/env_done": int(cfg.eval.n_init_states),
                         "eval/success_rate": metrics["success_rate"],
                     })
-                    wandb_run.log({
-                        "explore/env_done": metrics["explore_total"],
-                        "explore/success_count": metrics["explore_solved"],
-                        "explore/total": metrics["explore_total"],   # final only
-                        "explore/avg_jerk": metrics["avg_jerk"],
-                    })
+                    if not args.eval_only:
+                        wandb_run.log({
+                            "explore/env_done": metrics["explore_total"],
+                            "explore/success_count": metrics["explore_solved"],
+                            "explore/total": metrics["explore_total"],   # final only
+                            "explore/avg_jerk": metrics["avg_jerk"],
+                        })
                     # /final = cross-stage summary of the shared round-run;
                     # DP retrain adds dp_train_loss, dyn retrain adds the rest
-                    wandb_run.log({
-                        "final/eval_success_rate": metrics["success_rate"],
-                        "final/explore_success_num": metrics["explore_solved"],
-                    })
+                    final_pts = {"final/eval_success_rate": metrics["success_rate"]}
+                    if not args.eval_only:
+                        final_pts["final/explore_success_num"] = metrics["explore_solved"]
+                    wandb_run.log(final_pts)
                 else:
                     N = int(cfg.eval.n_init_states)
                     wandb_run.log({"eval/success_rate": metrics["success_rate"],
@@ -416,7 +422,8 @@ def main():
 
             # ---- JSON summary ------------------------------------------------- #
             summary = {
-                "task": args.task, "mode": args.guide,
+                "task": args.task,
+                "mode": args.guide + (":eval-only" if args.eval_only else ""),
                 "exp_num": args.exp_num,
                 "dp_ckpt": args.base_dp_ckpt, "vib_ckpt": args.vib_ckpt,
                 "core_hdf5": args.core_hdf5,
@@ -426,17 +433,19 @@ def main():
                 "guided": int(guided),
                 "wandb_run_id": (wandb_run.id if wandb_run is not None else None),
                 "success_rate": metrics["success_rate"],
-                "avg_jerk": metrics["avg_jerk"],
+                "avg_jerk": metrics.get("avg_jerk"),
                 "jerk_baseline": metrics["jerk_baseline"],
                 "baseline_solved": metrics["baseline_solved"],
                 "n_failed": metrics["n_failed"],
-                "collected_trajs": metrics["collected_trajs"],
+                "collected_trajs": metrics.get("collected_trajs", 0),
                 "n_success_trajs": len(trajs),
                 "n_all_trajs": len(all_trajs),
                 "failed_init_indices": metrics.get("failed_init_indices"),
                 "outputs": {"success": success_path, "all": all_path},
             }
-            if split_mode:
+            if args.eval_only:
+                summary.update({"protocol": "eval_only", "eval_seed": eval_seed})
+            elif split_mode:
                 summary.update({
                     "protocol": "split",
                     "eval_seed": eval_seed,
