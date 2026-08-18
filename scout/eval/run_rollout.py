@@ -228,9 +228,25 @@ def main():
                 # dyn/* panels plotted against the global _step ~2e4 instead
                 # of dyn/epoch). eval/*,explore/* below; DP/*,dyn/* for the
                 # retrain stages that resume this run via WANDB_RUN_ID.
-                for sec in ("DP", "dyn"):
+                # NOTE: the retrain defs must be EXPLICIT per-name, not globs.
+                # In wandb 0.28 a glob def (f"{sec}/*") is kept client-side
+                # (handler._metric_globs) and only uploaded when a matching
+                # key is LOGGED in the same process -- the creator never logs
+                # DP/dyn rows, so a glob pre-registration never reaches the
+                # backend (why the earlier f"{sec}/*" attempt didn't work).
+                # Explicit defs dispatch immediately (handler.
+                # _handle_defined_metric -> _dispatch_record). Names = exactly
+                # the keys the retrains log (verified via historyKeys).
+                _retrain_axes = {
+                    "DP": ("train_loss", "lr", "global_step",
+                           "train_action_mse_error"),
+                    "dyn": ("latent_mse", "kl", "lr"),
+                }
+                for sec, names in _retrain_axes.items():
                     wandb.define_metric(f"{sec}/epoch", hidden=True)
-                    wandb.define_metric(f"{sec}/*", step_metric=f"{sec}/epoch")
+                    for n in names:
+                        wandb.define_metric(f"{sec}/{n}",
+                                            step_metric=f"{sec}/epoch")
                 wandb.define_metric("eval/env_done")
                 wandb.define_metric("explore/env_done")
                 wandb.define_metric("eval/success_rate", step_metric="eval/env_done")
