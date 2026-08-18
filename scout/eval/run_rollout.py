@@ -384,6 +384,12 @@ def main():
                         "explore/total": metrics["explore_total"],   # final only
                         "explore/avg_jerk": metrics["avg_jerk"],
                     })
+                    # /final = cross-stage summary of the shared round-run;
+                    # DP retrain adds dp_train_loss, dyn retrain adds the rest
+                    wandb_run.log({
+                        "final/eval_success_rate": metrics["success_rate"],
+                        "final/explore_success_num": metrics["explore_solved"],
+                    })
                 else:
                     N = int(cfg.eval.n_init_states)
                     wandb_run.log({"eval/success_rate": metrics["success_rate"],

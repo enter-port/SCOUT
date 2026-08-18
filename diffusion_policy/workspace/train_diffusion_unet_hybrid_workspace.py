@@ -373,6 +373,13 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 self.global_step += 1
                 self.epoch += 1
 
+        # round-run summary point: /final holds one value per stage of the
+        # shared round-run (rollout logs eval/explore, train_vib logs dyn) --
+        # direct wandb_run.log so the key lands in final/, not DP/. Legacy
+        # standalone runs (no metric_prefix) stay byte-identical.
+        if _metric_prefix:
+            wandb_run.log({'final/dp_train_loss': train_loss})
+
 @hydra.main(
     version_base=None,
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
