@@ -220,10 +220,17 @@ def main():
                 tags=list(wcfg.get("tags", ["step2", "rollout"])) + [args.task],
             )
             if split_mode:
-                # experiment2 layout: one wandb run per ROUND (this run is later
-                # resumed by the DP / dyn retrain stages via WANDB_RUN_ID) --
-                # eval/* and explore/* are sections of the same run, each on its
-                # own completed-scene-count x-axis.
+                # experiment2+ layout: one wandb run per ROUND. THIS process
+                # CREATES the run, so it must pre-register the metric axes of
+                # EVERY section here -- define_metric calls from the later
+                # DP/dyn processes (which resume this run) do NOT override the
+                # panel config of an already-created run (observed 2026-08-18:
+                # dyn/* panels plotted against the global _step ~2e4 instead
+                # of dyn/epoch). eval/*,explore/* below; DP/*,dyn/* for the
+                # retrain stages that resume this run via WANDB_RUN_ID.
+                for sec in ("DP", "dyn"):
+                    wandb.define_metric(f"{sec}/epoch", hidden=True)
+                    wandb.define_metric(f"{sec}/*", step_metric=f"{sec}/epoch")
                 wandb.define_metric("eval/env_done")
                 wandb.define_metric("explore/env_done")
                 wandb.define_metric("eval/success_rate", step_metric="eval/env_done")
