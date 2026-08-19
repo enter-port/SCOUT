@@ -171,13 +171,19 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
                     next_grp.create_dataset(
                         k, data=np.stack([_to_storage(k, _last_frame(o[k]))
                                           for o in next_obs_list[:ep_len]], axis=0))
-            # actions: 10-dim rot_6d -> 7-dim axis-angle (matches core storage).
-            acts = np.asarray(rollout["actions"], dtype=np.float32)   # (T,10)
-            if acts.shape[-1] == 10:
-                pos = acts[..., :3]
-                rot_aa = np.asarray(rot.inverse(acts[..., 3:9]))
-                grip = acts[..., 9:10]
-                acts = np.concatenate([pos, rot_aa, grip], axis=-1)   # (T,7)
+            # actions: rot_6d -> axis-angle (matches core storage).
+            # single arm: 10 -> 7; dual arm (transport): 20 -> 14 via
+            # per-arm chunks, same layout as the training loader.
+            acts = np.asarray(rollout["actions"], dtype=np.float32)   # (T,10|20)
+            if acts.shape[-1] in (10, 20):
+                n_arms = acts.shape[-1] // 10
+                per_arm = acts.reshape(-1, n_arms, 10)
+                pos = per_arm[..., :3]
+                rot_aa = np.asarray(rot.inverse(per_arm[..., 3:9]))
+                grip = per_arm[..., 9:10]
+                acts = np.concatenate([pos, rot_aa, grip],
+                                      axis=-1).reshape(acts.shape[:-1] +
+                                                       (n_arms * 7,))
             grp.create_dataset("actions", data=acts)
             # abs_actions: same 7-dim absolute aa (the policy emits absolute
             # actions; the loader reads THIS key for training when abs_action=

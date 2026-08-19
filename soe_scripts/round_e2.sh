@@ -30,9 +30,10 @@ TASK=${1:?usage: round_e2.sh <task> <DP|SCOUT> <round-num>}
 A=${2:?usage: round_e2.sh <task> <DP|SCOUT> <round-num>}
 NUM=${3:?usage: round_e2.sh <task> <DP|SCOUT> <round-num>}
 case "$TASK" in
-  can)    TASKUP=CAN ;;
-  square) TASKUP=SQUARE ;;
-  *) echo "task must be can or square (got: $TASK)"; exit 1 ;;
+  can)      TASKUP=CAN ;;
+  square)   TASKUP=SQUARE ;;
+  transport) TASKUP=TRANSPORT ;;
+  *) echo "task must be can, square or transport (got: $TASK)"; exit 1 ;;
 esac
 case "$A" in
   DP|SCOUT) ;;
@@ -40,10 +41,20 @@ case "$A" in
 esac
 NUM=$(printf '%d' "$NUM" 2>/dev/null) || { echo "round-num must be an integer"; exit 1; }
 [ "$NUM" -ge 1 ] || { echo "round-num must be >= 1"; exit 1; }
+# 2026-08-18 user: optional 4th arg MODE=full|eval-only (default full).
+# eval-only: run ONLY the seed-fixed eval phase (success_rate measurement),
+# skip explore/accum/retrains -- e.g. the final round of a chain.
+MODE=${4:-full}
+case "$MODE" in
+  full|eval-only) ;;
+  *) echo "mode must be full or eval-only (got: $MODE)"; exit 1 ;;
+esac
+EVALONLY=()
+[ "$MODE" = "eval-only" ] && EVALONLY=(--eval-only)
 
 SEED=42                 # eval phase: fixed scene set every round (42..141)
 ESEED=$((NUM * 1000 + 42))   # explore phase: fresh scenes (round i = i*1000+42)
-NEXPLORE=500
+NEXPLORE=100             # 2026-08-18 user: 100 scenes per round (was 500)
 ETRIES=1
 
 GPU=${GPU:-0}
@@ -118,7 +129,7 @@ if [ "$A" = SCOUT ]; then
 fi
 
 T0=$(date +%s)
-log "=== ROUND(e2) $TASK a=$A round=$NUM START (GPU$GPU; rollout DP=$DPROLL; eval_seed=$SEED explore_seed=$ESEED) ==="
+log "=== ROUND(e2) $TASK a=$A round=$NUM mode=$MODE START (GPU$GPU; rollout DP=$DPROLL; eval_seed=$SEED explore_seed=$ESEED) ==="
 
 # ---- [1/3] rollout: SPLIT protocol (eval fixed scenes + explore fresh) --- #
 # SKIP_ROLLOUT=1: crash recovery -- if all.hdf5 already exists (rollout done,
@@ -137,6 +148,7 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
   --guide "$GUIDE" --seed "$SEED" \
   --eval-seed "$SEED" --explore-seed "$ESEED" \
   --n-explore "$NEXPLORE" --explore-try-times "$ETRIES" \
+  ${EVALONLY[@]+"${EVALONLY[@]}"} \
   ${VIBARGS[@]+"${VIBARGS[@]}"} \
   --output-dir "$RDIR" \
   --output-success "$RDIR/success.hdf5" \
@@ -168,6 +180,14 @@ if [ -n "$RID" ]; then
   log "[wandb] shared round-run $WPROJ/$WNAME id=$RID (DP+dyn will resume it)"
 else
   log "[wandb] WARN: no wandb_run_id in rollout json -- retrains will start their own runs"
+fi
+
+# ---- eval-only round: measurement done, skip accum + both retrains ------- #
+if [ "$MODE" = "eval-only" ]; then
+  log "[2/3]+[3/3] SKIPPED (MODE=eval-only: success-rate measurement only)"
+  T3=$(date +%s)
+  log "=== ROUND(e2) $TASK a=$A round=$NUM TOTAL: $(( (T3-T0)/60 ))m$(( (T3-T0)%60 ))s ==="
+  exit 0
 fi
 
 # ---- [2/3] DP retrain on ACCUMULATED successes (core + rounds 1..N) ----- #

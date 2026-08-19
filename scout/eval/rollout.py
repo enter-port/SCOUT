@@ -584,11 +584,19 @@ class RobomimicScoutEnvAdapter:
         a = np.asarray(action)
         if not self.abs_action:
             return a
+        raw_shape = a.shape
+        if raw_shape[-1] == 20:
+            # dual arm (transport): per-arm 10 (pos3|rot6|grip1) -> per-arm 7,
+            # mirroring the training loader's undo_transform_action.
+            a = a.reshape(-1, 2, 10)
         d_rot = a.shape[-1] - 4                        # 10 -> 6 (rot_6d portion)
         pos = a[..., :3]
         rot = np.asarray(self._rot.inverse(a[..., 3:3 + d_rot]))  # rot_6d -> aa
         gripper = a[..., [-1]]
-        return np.concatenate([pos, rot, gripper], axis=-1)
+        out = np.concatenate([pos, rot, gripper], axis=-1)
+        if raw_shape[-1] == 20:
+            out = out.reshape(raw_shape[:-1] + (14,))
+        return out
 
     def step(self, action):
         env_action = self._to_env_action(action)
