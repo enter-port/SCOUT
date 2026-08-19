@@ -207,4 +207,11 @@ def make_default_env_factory(cfg: EasyDict) -> EnvFactory:
         shape_meta=OmegaConf.to_container(lpb_cfg.shape_meta, resolve=True),
         n_obs_steps=int(OmegaConf.select(lpb_cfg, "n_obs_steps", default=2)),
         abs_action=bool(OmegaConf.select(lpb_cfg, "abs_action", default=False)),
+        # per-task render camera (transport has no agentview): read the
+        # base-DP config's task.env_runner.render_obs_key; can/square configs
+        # set agentview_image explicitly = the old hard-coded default, so
+        # their behavior is byte-identical. Fallback keeps that default.
+        render_obs_key=str(OmegaConf.select(
+            lpb_cfg, "task.env_runner.render_obs_key",
+            default="agentview_image")),
     )
