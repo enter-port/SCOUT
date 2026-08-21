@@ -81,7 +81,13 @@ mkdir -p "$TDP" "$TDYN" "$(dirname "$CORE")"
 cd "$REPO" || exit 1
 exec 3>&1
 
-log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+# DRY_RUN must not append to round.log (a fake TOTAL line would trip
+# wait_launch_dp.sh into launching the DP arm prematurely -- happened once
+# 2026-08-22; smoke output goes to stdout/chain-log only).
+log(){
+  echo "[$(date '+%F %T')] $*"
+  [ "${DRY_RUN:-0}" = 1 ] || echo "[$(date '+%F %T')] $*" >> "$LOG"
+}
 RUN(){
   if [ "${DRY_RUN:-0}" = 1 ]; then
     printf 'DRY_RUN:' >&3; printf ' %q' "$@" >&3; echo >&3
