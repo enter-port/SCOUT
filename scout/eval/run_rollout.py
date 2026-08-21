@@ -88,6 +88,10 @@ def main():
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
                         "no hdf5 needed -- pure DP success-rate eval of any ckpt.")
+    p.add_argument("--bank-hdf5", default=None,
+                   help="expert z-bank source hdf5 (default: --core-hdf5). "
+                        "e.g. a round's success_accum.hdf5 -- the exact data "
+                        "that trained the rollout DP.")
     # ---- outputs (naming: {task}_{tag}_{success_exp,all_exp,rollout_exp}{N}) ----
     p.add_argument("--exp-num", type=int, default=1,
                    help="exploration round number N for output naming (default 1)")
@@ -332,6 +336,7 @@ def main():
         cfg=cfg, dp_factory=dp_factory, scout_vib_factory=scout_vib_factory,
         env_factory=env_factory, device=device, guided=guided,
         guide_mode=args.guide if guided else "dyn",
+        bank_hdf5=args.bank_hdf5,
     )
     try:
         result = pipeline.run(

@@ -77,6 +77,7 @@ class RolloutPipeline:
                  env_factory: EnvFactory,
                  device: Optional[torch.device] = None,
                  guided: bool = False, guide_mode: str = "dyn",
+                 bank_hdf5: Optional[str] = None,
                  log_every: Optional[int] = None):
         self.cfg = cfg
         self.dp_factory = dp_factory
@@ -89,6 +90,8 @@ class RolloutPipeline:
         # "expert" = expert z-bank guidance (z* = nearest bank entry, per
         # action chunk; scout/guidance/expert_bank.py). Only read when guided.
         self.guide_mode = str(guide_mode)
+        # expert-mode bank source; None -> cfg.dataset.path (the core hdf5).
+        self.bank_hdf5 = bank_hdf5
         self.n_envs = int(getattr(cfg.eval, "n_envs", 1))
         self.log_every = int(log_every if log_every is not None
                              else getattr(cfg.eval, "log_every", 10))
@@ -125,8 +128,9 @@ class RolloutPipeline:
                 ScoutExpertPlanner,
                 build_expert_z_bank,
             )
+            bank_src = self.bank_hdf5 or self.cfg.dataset.path
             bank = build_expert_z_bank(
-                self.cfg.dataset.path, scout_vib,
+                bank_src, scout_vib,
                 view_names=self.view_names, proprio_keys=self.proprio_keys,
                 device=self.device,
                 stride=int(getattr(getattr(self.cfg, "exploration", {}),
@@ -135,7 +139,7 @@ class RolloutPipeline:
             planner = ScoutExpertPlanner(scout_vib, z_bank=bank,
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
-                  f"entries from {self.cfg.dataset.path}")
+                  f"entries from {bank_src}")
         else:
             planner = ScoutPlanner(scout_vib, bridge=bridge,
                                    obs_adapter=obs_adapter, z=None)
