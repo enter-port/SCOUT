@@ -24,6 +24,10 @@ venv/
 env/
 .ipynb_checkpoints/
 
+# ===== 实验产物（日志 / 图表 / 汇总 md,本地保留,不进 git）=====
+# 注:已在库内的 experiments/scripts/ 与 experiment1.md 仍保持跟踪
+experiments/
+
 # ===== 数据 / 模型权重 / 大文件（不进 git）=====
 *.hdf5
 *.h5
