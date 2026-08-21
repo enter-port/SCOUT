@@ -1,6 +1,9 @@
-# Guidance 的 1/B 缩放 bug(2026-08-21 发现,记录在案、暂不修)
+# Guidance 的 1/B 缩放 bug(2026-08-21 发现,同日修复 + 确认)
 
-> **状态**:已确认 + 已实证;修复方案已定(一行级),**经用户决定先不修**。
+> **状态**:已修复(commit `12bef1f`,用户 2026-08-21 下令)。guided 路径改
+> sum 归约,`guidance_scale` 语义回到 LPB 的 B=1 标定;**修复后
+> guidance_scale=0.01**(用户定,≈ 历史真实 round 的有效力度 0.5/50),已用
+> can e2 round-4 实验确认有效(§6)。
 > 关联分析:`experiments/e2_scout_guidance_gradient_analysis.md`(梯度膨胀);
 > 触发场景记录:`experiments/vis_final_summary.md`(exp1 四宫格排查)。
 
@@ -76,12 +79,37 @@ DP-SCOUT-exp3 + dyn-SCOUT-exp3(|dNLL/da|=10):
 - 真实 round 恒定 n_envs=50,实验内自洽;只有**跨 n_envs 的 run 互相比较**
   (vis_final 重跑)才把 5× 的差暴露出来。
 
-## 5. 修复方案(待批,未实施)
+## 5. 修复(2026-08-21 已实施,commit `12bef1f`)
 
-guided 注入路径的 cost 改 **per-row 归约**:取 sum 的梯度(块对角 ⇒ 每行拿到
-自己完整的无缩放梯度),B 无关,`guidance_scale` 语义回到 LPB 的 B=1 标定。
-实现上一行级(`compute_loss` 加 `reduction` 参数,或 policy 侧乘回 B)。
+guided 注入路径的 cost 改 **sum 归约**:块对角 ⇒ 每行拿到自己完整的无缩放
+梯度,B 无关,`guidance_scale` 语义回到 LPB 的 B=1 标定。实现:
 
-**修后注意**:直接沿用 scale=0.5 会立刻比历史所有实验(~0.01)激进 50 倍,
-行为不可外推——需要重校/重扫 scale 再续链;历史 e2–e5 结论在其(一致的)
-低力度状态下依然自洽。
+- `scout_cost` / `ScoutPlanner.compute_loss` 加 `reduction` 参数(默认
+  `"mean"`,E2/诊断等旧调用方语义不变);`guided_conditional_sample` 传
+  `reduction="sum"`;cost_curve 记录 `loss/B` 保持历史 per-row 均值口径。
+- 回归测试 `_verify.py` check 5:grad(sum)==B·grad(mean) 精确成立、单行
+  (B=1)== 批内该行梯度、spy 确认 policy 实际传了 `"sum"`(本地 + 服务器
+  均通过)。
+
+**修后 scale**:用户定 **0.01**(= 历史真实 round 有效力度 0.5/50),已确认
+(§6)。注意旧 config 里的 0.5/0.1 在修复后分别变成 50×/10× 于历史——续链
+前必须全部换算。
+
+## 6. 修复确认实验(2026-08-21,`soe_scripts/fix01_confirm.sh`)
+
+协议与 vis_final guided run 完全一致:can e2 round-4 trio
+(DP-SCOUT-exp4/99.ckpt + dyn-SCOUT-exp4)、seed-42 同 20 场景、20 条 guided
+rollout,唯一变量 = n_envs(=bug 里的 B)。输出
+`data/vis_final/fix01_e2-SCOUT05-round4/`(服务器)。
+
+| run | 有效 scale | succ/20 | avg_jerk | eval(unguided) |
+|---|---|---|---|---|
+| 修复前 B=20,scale 0.5 | 0.025 | 16 | 0.385 | — |
+| **修复后 B=20,scale 0.01** | 0.01 | **15** | **0.284** | 18/20 @ 0.302 |
+| **修复后 B=4,scale 0.01** | 0.01 | **15** | **0.275** | 18/20 @ 0.284 |
+| (修复前 B=4,scale 0.5,round-3 对) | 0.125 | 9 | 0.989 | 乱飞 |
+
+结论:① **B 无关性实证**——修复后 B=4 与 B=20 完全匹配(成功率相同、jerk
+差 3%,在 z 抽样顺序差异的噪声内);修复前同样的 B=4 会爆到 jerk ~0.99。
+② 行为与修复前有效力度 0.025 的记录同量级且更平滑(0.284 < 0.385),符合
+0.01 略温和的预期;wave 内"失败轨迹被越推越强"的非平稳性同步消失。
