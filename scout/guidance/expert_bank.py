@@ -146,6 +146,12 @@ def build_expert_z_bank(
                         .unsqueeze(1) for k in proprio_keys},
                 }
                 obs_es = adapter(obs_dict)
+                # hdf5 frames enter on CPU; the loaded ScoutVIB sits on
+                # ``device`` (same as rollout-time inference).
+                obs_es = {
+                    "visual": {v: x.to(device) for v, x in obs_es["visual"].items()},
+                    "proprio": obs_es["proprio"].to(device),
+                }
                 a_flat = np.stack([acts[t:t + n_steps].reshape(-1) for t in tb])
                 a_flat = torch.from_numpy(a_flat).float().to(device)
                 with torch.no_grad():
