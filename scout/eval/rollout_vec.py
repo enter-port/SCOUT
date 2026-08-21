@@ -12,8 +12,10 @@ Why single-process batched (not multiprocessing):
   * :meth:`ScoutPolicy.guided_conditional_sample` /
     :meth:`ScoutPlanner.compute_loss` already handle ``(B, ...)`` tensors
     natively -- ``z`` is sampled ``(B, style_dim)`` (policy.py), ``s_bar_t`` is
-    ``(B, s_bar_dim)``, and ``compute_loss`` mean-reduces over batch+chunk -- so
-    the guided path batches too with NO change to policy/planner;
+    ``(B, s_bar_dim)``, and the guided path sum-reduces the cost (block-diagonal
+    rows => per-row gradient is B-independent; the pre-fix mean reduction made
+    the effective guidance guidance_scale/B -- 1/B scaling bug) -- so the guided
+    path batches too with NO change to policy/planner;
   * ``record_obs=True`` exploration carries HWC image frames (~100MB/traj) --
     staying in-process avoids IPC'ing those over pipes.
 

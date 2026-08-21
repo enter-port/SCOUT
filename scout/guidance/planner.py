@@ -131,6 +131,7 @@ class ScoutPlanner:
         self,
         x0_hat: torch.Tensor,
         current_obs=None,
+        reduction: str = "mean",
     ) -> torch.Tensor:
         """``mean_t [−log q_θ(z|s̄_t, a_t)]`` (Gaussian NLL: ½Σ[(z−μ)²/σ² + log σ²]) -- scalar, differentiable in ``x0_hat``.
 
@@ -144,9 +145,18 @@ class ScoutPlanner:
                            previously passed to :meth:`set_current_obs`, the
                            cached ``s̄_t`` is reused (saves a ResNet forward per
                            denoise step -- design §4 "s̄_t 定住").
+            reduction    : passed through to :func:`scout.guidance.cost.scout_cost`.
+                           The guided-injection path MUST use ``"sum"`` --
+                           rows are block-diagonal independent, so grad of the
+                           sum hands every row its full unscaled gradient and
+                           the effective guidance force stays independent of
+                           the batch size B (1/B scaling bug,
+                           idea/guidance_batch_scaling_bug.md). ``"mean"``
+                           (default) keeps the historical semantics for
+                           monitoring / E2 / diagnostics callers.
 
         Returns:
-            scalar tensor (mean-reduced over batch and chunk). Differentiable
+            scalar tensor (reduced over batch per ``reduction``). Differentiable
             w.r.t. ``x0_hat`` (identity bridge + VIB MLP path preserves grad).
         """
         if x0_hat.dim() != 3:
@@ -173,6 +183,7 @@ class ScoutPlanner:
             z=self.z.detach(),
             vib_enc=self.scout_vib.vib_enc,
             bridge=self.bridge,
+            reduction=reduction,
         )
 
     # ------------------------------------------------------------------ #

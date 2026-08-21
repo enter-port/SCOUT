@@ -52,8 +52,9 @@ def scout_cost(
     z: torch.Tensor,
     vib_enc,
     bridge: ActionNormalizerBridge,
+    reduction: str = "mean",
 ) -> torch.Tensor:
-    """``mean over batch of -log q_θ(z | s_bar_t, a_chunk)`` -- scalar,
+    """``-log q_θ(z | s_bar_t, a_chunk)`` reduced over batch -- scalar,
     differentiable in ``x0_hat`` (Gaussian NLL, closed form, no ε sampling).
 
     ``a_chunk`` is the **flattened first ``n_steps`` per-step actions** of the
@@ -77,11 +78,20 @@ def scout_cost(
                   (μ and σ) enters the NLL; neither is sampled here.
         bridge  : :class:`scout.normalizer.ActionNormalizerBridge` mapping
                   ``x0_hat`` (per-step) into the VIB action space.
+        reduction : "mean" (default; historical semantics -- monitoring metrics,
+                  E2 consistency, diagnostics) or "sum" (the guided-injection
+                  path: block-diagonal Jacobian => grad of the sum gives every
+                  row its own FULL unscaled gradient, so the injected guidance
+                  force is independent of how many envs happen to share the
+                  replan call. Pre-fix the mean reduction silently divided the
+                  per-row force by B -- effective scale guidance_scale/B; see
+                  idea/guidance_batch_scaling_bug.md).
 
     Returns:
-        scalar tensor (mean-reduced over batch). Differentiable w.r.t. ``x0_hat``
-        (the affine bridge + VIB MLP path preserves gradient; both the 1/σ²
-        -weighted μ-channel and the σ-channel conduct it).
+        scalar tensor (mean- or sum-reduced over batch per ``reduction``).
+        Differentiable w.r.t. ``x0_hat`` (the affine bridge + VIB MLP path
+        preserves gradient; both the 1/σ²-weighted μ-channel and the σ-channel
+        conduct it).
     """
     if x0_hat.dim() != 3:
         raise ValueError(
@@ -115,4 +125,8 @@ def scout_cost(
     diff = z.detach() - mu
     inv_var = torch.exp(-logvar)
     nll = 0.5 * (diff.pow(2) * inv_var + logvar).sum(dim=-1)   # (B,)
-    return nll.mean()
+    if reduction == "mean":
+        return nll.mean()
+    if reduction == "sum":
+        return nll.sum()
+    raise ValueError(f"reduction must be 'mean' or 'sum'; got {reduction!r}")

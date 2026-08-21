@@ -23,6 +23,9 @@ Checks (task verify):
   3. Per-step cost curve over the guided steps is non-increasing on average /
      final < initial (sign of ``-autograd.grad`` and ``+scale*cond`` correct).
   4. Dummy {image, proprio} obs path works end-to-end.
+  5. 1/B scaling-bug regression (fixed 2026-08-21): grad(sum-reduced cost)
+     == B x grad(mean-reduced); a row alone (B=1) reproduces its batched
+     gradient; the guided path wires ``reduction="sum"`` (spy).
 
 Run:
     python -m scout.guidance._verify
@@ -271,6 +274,93 @@ def check_cost_curve(policy, planner, scout_vib, current_obs,
     print(f"           per-step decreases: {decreases}/{len(curve)-1}")
 
 
+def check_grad_batch_invariance(policy, planner, scout_vib, current_obs,
+                                cond_data, cond_mask, seed=233):
+    """Verify step 5 (1/B scaling-bug regression, fixed 2026-08-21): the
+    per-row guidance gradient must be INDEPENDENT of the batch size B.
+
+    Pre-fix, the guided path mean-reduced the cost over B, so every row's
+    injected force was divided by B (effective guidance = guidance_scale/B;
+    idea/guidance_batch_scaling_bug.md). Checks:
+
+      (a) algebra: grad of the sum-reduced cost == B x grad of the mean-reduced
+          cost (exact for the block-diagonal Jacobian);
+      (b) row isolation: row i's gradient from a B=4 sum-reduced batched call
+          equals its gradient from a B=1 call with that row's obs/z alone --
+          i.e. a row receives the same force whether alone or batched;
+      (c) wiring: the policy's guided path actually passes reduction="sum"
+          (spy on planner.compute_loss during a guided sample).
+    """
+    B = current_obs["proprio"].shape[0]
+    horizon, action_dim = cond_data.shape[1], cond_data.shape[2]
+    torch.manual_seed(seed)
+    z = torch.randn(B, scout_vib.style_dim)
+
+    # (a) grad(sum) == B * grad(mean) on identical inputs.
+    x0 = torch.randn(B, horizon, action_dim, requires_grad=True)
+    planner.reset()
+    planner.set_z(z.clone())
+    planner.set_current_obs(current_obs)
+    loss_sum = planner.compute_loss(x0, current_obs, reduction="sum")
+    g_sum = torch.autograd.grad(loss_sum, x0, retain_graph=False)[0]
+
+    x0b = x0.detach().clone().requires_grad_(True)
+    planner.set_z(z.clone())                      # same z; s̄_t already cached
+    loss_mean = planner.compute_loss(x0b, current_obs, reduction="mean")
+    g_mean = torch.autograd.grad(loss_mean, x0b)[0]
+
+    max_ratio_err = ((g_sum - B * g_mean).abs().max()
+                     / (B * g_mean).abs().max()).item()
+    assert torch.allclose(g_sum, B * g_mean, rtol=1e-4, atol=1e-6), (
+        f"grad(sum) != B*grad(mean): max rel err {max_ratio_err:.2e}"
+    )
+
+    # (b) row i alone (B=1, mean==sum) must reproduce its batched gradient.
+    def _slice_obs(obs, i):
+        return {
+            "visual": {v: x[i:i + 1] for v, x in obs["visual"].items()},
+            "proprio": obs["proprio"][i:i + 1],
+        }
+
+    worst = 0.0
+    for i in range(B):
+        x0_row = x0[i:i + 1].detach().clone().requires_grad_(True)
+        planner.reset()
+        planner.set_z(z[i:i + 1].clone())
+        planner.set_current_obs(_slice_obs(current_obs, i))
+        loss_row = planner.compute_loss(x0_row, _slice_obs(current_obs, i))
+        g_row = torch.autograd.grad(loss_row, x0_row)[0]
+        worst = max(worst, (g_row - g_sum[i:i + 1]).abs().max().item())
+    assert worst < 1e-5, (
+        f"row-alone gradient deviates from batched sum-reduced gradient "
+        f"(max abs diff {worst:.2e}) -- per-row force is still B-dependent"
+    )
+
+    # (c) spy: the guided path must request reduction="sum" on every call.
+    recorded = []
+    orig = planner.compute_loss
+
+    def _spy(x0_hat, obs=None, **kw):
+        recorded.append(kw.get("reduction", "mean"))
+        return orig(x0_hat, obs, **kw)
+
+    planner.compute_loss = _spy
+    try:
+        _run_sample(policy, cond_data, cond_mask, None, current_obs,
+                    z=z.clone(), seed=seed,
+                    classifier_guidance=True, guidance_scale=1.0)
+    finally:
+        planner.compute_loss = orig
+    assert recorded and all(r == "sum" for r in recorded), (
+        f"guided path must call compute_loss(reduction='sum'); got {recorded}"
+    )
+
+    print(f"[check 5] 1/B bug regression: grad(sum)==B*grad(mean) "
+          f"(rel err {max_ratio_err:.1e}); row-alone == batched "
+          f"(max diff {worst:.1e}); policy wiring reduction="
+          f"{set(recorded)} over {len(recorded)} guided steps: OK")
+
+
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -289,6 +379,8 @@ def main():
                          cond_data, cond_mask, global_cond)
     check_cost_curve(policy, planner, scout_vib, current_obs,
                      cond_data, cond_mask, global_cond)
+    check_grad_batch_invariance(policy, planner, scout_vib, current_obs,
+                                cond_data, cond_mask)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

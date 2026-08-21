@@ -228,14 +228,25 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                 x0_hat = scheduler.step(
                     model_output, t, trajectory, generator=_gate_gen
                 ).pred_original_sample
-                loss = self.scout_planner.compute_loss(x0_hat, current_obs)
+                # reduction="sum": rows are block-diagonal independent, so the
+                # gradient of the SUMMED cost gives each row its full unscaled
+                # gradient -- the injected force no longer depends on how many
+                # envs share this replan call. Pre-fix the mean reduction
+                # divided every row's force by B (effective guidance =
+                # guidance_scale/B, B = concurrent envs of the moment); see
+                # idea/guidance_batch_scaling_bug.md.
+                loss = self.scout_planner.compute_loss(
+                    x0_hat, current_obs, reduction="sum"
+                )
                 cond_grad = -torch.autograd.grad(loss, trajectory)[0]
                 grad_scale = self.guidance_scale * (
                     1.0 - scheduler.alphas_cumprod[t]
                 ).sqrt()
                 trajectory = trajectory.detach() + grad_scale * cond_grad
                 if return_cost_curve:
-                    cost_curve.append(float(loss.item()))
+                    # log per-row mean (historical scale of the E2 metric),
+                    # not the B-aggregated sum.
+                    cost_curve.append(float(loss.item()) / x0_hat.shape[0])
 
             # 3. DDPM reverse step x_t -> x_{t-1} -- LPB L262-266.
             trajectory = scheduler.step(
