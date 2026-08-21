@@ -410,6 +410,11 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
 
 def run(cfg):
     set_seed(cfg.seed)
+    # cudnn_deterministic (2026-08-21 user): reproducible CUDA -- pairs with
+    # CUBLAS_WORKSPACE_CONFIG=:4096:8 (round.sh exports it). Default off.
+    if bool(cfg.get("cudnn_deterministic", False)):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 

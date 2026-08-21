@@ -194,6 +194,13 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         use_amp = bool(getattr(cfg.training, 'use_amp', False)) and str(device).startswith('cuda')
         if bool(getattr(cfg.training, 'cudnn_benchmark', False)):
             torch.backends.cudnn.benchmark = True
+        # training.cudnn_deterministic (2026-08-21 user): reproducible CUDA --
+        # deterministic conv algorithms + autotuner off. Pairs with
+        # CUBLAS_WORKSPACE_CONFIG=:4096:8 (set by round.sh) for deterministic
+        # GEMMs; same-seed runs then replay init/shuffle/crop identically.
+        if bool(getattr(cfg.training, 'cudnn_deterministic', False)):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
         # torch.compile opt-in (training.compile_model): the DDPM step is
         # kernel-launch-bound on this net (96% "util" at ~280W), so fusing the
         # many small convs is the lever. Params are SHARED with the original
