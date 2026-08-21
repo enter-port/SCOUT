@@ -53,7 +53,7 @@ EVALONLY=()
 
 SEED=42                 # eval phase: fixed scene set every round (42..141)
 ESEED=$((NUM * 1000 + 42))   # explore phase: fresh scenes (round i = i*1000+42)
-NEXPLORE=500             # e4: 500 explore scenes per round (the ONLY difference vs e2)
+NEXPLORE=10              # e4 (can): 10 explore scenes per round -- the low-budget regime (user 2026-08-19)
 ETRIES=1
 
 GPU=${GPU:-0}
