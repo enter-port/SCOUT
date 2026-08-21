@@ -162,7 +162,11 @@ if [ "$A" = BASE ]; then
   else
     mkdir -p "$TDYN/dyn-base"
     DPB=$(newest_ckpt "$TDP/DP-base")
-    [ -n "$DPB" ] || { log "FATAL: no DP-base ckpt"; exit 1; }
+    if [ -z "$DPB" ]; then
+      if [ "${DRY_RUN:-0}" = 1 ]; then DPB="<DP-base-ckpt>"; else
+        log "FATAL: no DP-base ckpt"; exit 1
+      fi
+    fi
     CFG=$TDYN/dyn-base/config.yaml
     $PY - "$CFG" "$CORE" "$TDYN/dyn-base" "$DPB" "$TSEED" "$WPROJ" "$TASK" <<'PYEOF'
 import sys, yaml
