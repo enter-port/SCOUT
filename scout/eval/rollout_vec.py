@@ -196,6 +196,14 @@ class _VecRunner:
             scout_vib = getattr(planner, "scout_vib", None) if planner else None
             if scout_vib is not None:
                 self.style_dim = int(scout_vib.style_dim)
+            # expert-guided planner (select_z hook): z* is selected per chunk
+            # INSIDE the denoise loop from the current (s, x̂₀) -- the runner
+            # must NOT draw a per-rollout prior z. style_dim=None disables the
+            # _launch draw, and _replan's all-not-None guard then leaves z
+            # resolution to the policy (which selects z* at the first guided
+            # step). Exploration mode (plain ScoutPlanner) is unaffected.
+            if planner is not None and hasattr(planner, "select_z"):
+                self.style_dim = None
 
         # progress counters (incremented in _finalize)
         self.completed = 0     # episodes finalized (baseline inits / expl tries)

@@ -78,10 +78,12 @@ def main():
                         "Required for full rollout; optional for --success-only "
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
-    p.add_argument("--guide", choices=["dyn", "off"], default="off",
-                   help="'dyn' = VIB-guided exploration on failed inits (needs "
-                        "--vib-ckpt); 'off' (default) = plain base-DP retry "
-                        "(baseline).")
+    p.add_argument("--guide", choices=["dyn", "off", "expert"], default="off",
+                   help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
+                        "needs --vib-ckpt); 'expert' = expert z-bank guidance "
+                        "(z* = nearest core-data bank entry per action chunk; "
+                        "needs --vib-ckpt + --core-hdf5); 'off' (default) = "
+                        "plain base-DP rollout (baseline).")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
@@ -174,11 +176,14 @@ def main():
     split_mode = args.explore_seed is not None or args.eval_only
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
-    guided = (args.guide == "dyn") and not args.success_only
+    guided = args.guide in ("dyn", "expert") and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
-        raise SystemExit("[run_rollout] --guide dyn needs --vib-ckpt (SCOUT VIB "
-                         "ckpt for guided exploration). --guide off does not.")
+        raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
+                         "(SCOUT VIB ckpt). --guide off does not.")
+    if guided and args.guide == "expert" and args.core_hdf5 is None:
+        raise SystemExit("[run_rollout] --guide expert needs --core-hdf5 "
+                         "(the expert z-bank is built from it).")
     if not args.success_only and args.core_hdf5 is None:
         raise SystemExit("[run_rollout] --core-hdf5 required for full rollout "
                          "(only --success-only may omit it).")
@@ -326,6 +331,7 @@ def main():
     pipeline = RolloutPipeline(
         cfg=cfg, dp_factory=dp_factory, scout_vib_factory=scout_vib_factory,
         env_factory=env_factory, device=device, guided=guided,
+        guide_mode=args.guide if guided else "dyn",
     )
     try:
         result = pipeline.run(

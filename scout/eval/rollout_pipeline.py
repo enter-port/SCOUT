@@ -76,7 +76,8 @@ class RolloutPipeline:
                  scout_vib_factory: Optional[VIBFactory],
                  env_factory: EnvFactory,
                  device: Optional[torch.device] = None,
-                 guided: bool = False, log_every: Optional[int] = None):
+                 guided: bool = False, guide_mode: str = "dyn",
+                 log_every: Optional[int] = None):
         self.cfg = cfg
         self.dp_factory = dp_factory
         self.scout_vib_factory = scout_vib_factory
@@ -84,6 +85,10 @@ class RolloutPipeline:
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.guided = bool(guided)
+        # "dyn" = SCOUT exploration guidance (z ~ prior, per trajectory);
+        # "expert" = expert z-bank guidance (z* = nearest bank entry, per
+        # action chunk; scout/guidance/expert_bank.py). Only read when guided.
+        self.guide_mode = str(guide_mode)
         self.n_envs = int(getattr(cfg.eval, "n_envs", 1))
         self.log_every = int(log_every if log_every is not None
                              else getattr(cfg.eval, "log_every", 10))
@@ -108,13 +113,32 @@ class RolloutPipeline:
         Per design §4: planner carries the frozen ScoutVIB (``E_s`` +
         ``vib_enc``) + the unnormalize-only action bridge (from this DP's
         normalizer) + the obs-adapter (LPB keyed obs -> E_s format). z is
-        sampled fresh per rollout inside the vec runner.
+        sampled fresh per rollout inside the vec runner -- EXCEPT in expert
+        mode (``guide_mode="expert"``): the expert z-bank planner selects z*
+        per action chunk inside the denoise loop (user 2026-08-21).
         """
         from scout.guidance.planner import ScoutPlanner
         bridge = make_action_bridge(dp)                                   # seam ②
         obs_adapter = make_obs_adapter(self.view_names, self.proprio_keys)  # seam ①
-        planner = ScoutPlanner(scout_vib, bridge=bridge,
-                               obs_adapter=obs_adapter, z=None)
+        if self.guide_mode == "expert":
+            from scout.guidance.expert_bank import (
+                ScoutExpertPlanner,
+                build_expert_z_bank,
+            )
+            bank = build_expert_z_bank(
+                self.cfg.dataset.path, scout_vib,
+                view_names=self.view_names, proprio_keys=self.proprio_keys,
+                device=self.device,
+                stride=int(getattr(getattr(self.cfg, "exploration", {}),
+                                   "bank_stride", 1)),
+            )
+            planner = ScoutExpertPlanner(scout_vib, z_bank=bank,
+                                         bridge=bridge, obs_adapter=obs_adapter)
+            print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
+                  f"entries from {self.cfg.dataset.path}")
+        else:
+            planner = ScoutPlanner(scout_vib, bridge=bridge,
+                                   obs_adapter=obs_adapter, z=None)
         init = getattr(dp, "initialize_scout_planner", None)
         if callable(init):
             init(planner, self.guidance_start_timestep, self.guidance_scale)

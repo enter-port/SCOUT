@@ -154,6 +154,12 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             if self.guidance_start_timestep is None:
                 raise RuntimeError("guidance_start_timestep not set.")
 
+        # expert mode (planner carrying a z-bank selects its own z* per chunk)
+        # -- presence of the ``select_z`` hook is the mode flag.
+        _select_fn = getattr(self.scout_planner, "select_z", None) \
+            if classifier_guidance else None
+        _z_selected = False
+
         model = self.model
         scheduler = self.noise_scheduler
 
@@ -188,28 +194,35 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             # (task verify step 2). Caller can pass z explicitly for full
             # reproducibility (E2 z-set sweep).
             B = condition_data.shape[0]
-            # z precedence: explicit ``z`` arg  >  caller-locked ``planner.z``
-            # (per-trajectory skill, set via planner.set_z and held across ALL
-            # chunks of one rollout -- scout_design §1 "z 整段定住", distinct
-            # from SOE which resamples z per chunk)  >  fresh z~N(0,I) (per-chunk,
-            # SOE-style). ``planner.reset()`` between calls unlocks -> per-chunk.
-            if z is None:
-                z = self.scout_planner.z
-            if z is None:
-                z = torch.randn(
-                    size=(B, self.scout_planner.scout_vib.style_dim),
-                    device=condition_data.device,
-                    dtype=condition_data.dtype,
-                )
+            if _select_fn is None:
+                # z precedence: explicit ``z`` arg  >  caller-locked ``planner.z``
+                # (per-trajectory skill, set via planner.set_z and held across ALL
+                # chunks of one rollout -- scout_design §1 "z 整段定住", distinct
+                # from SOE which resamples z per chunk)  >  fresh z~N(0,I) (per-chunk,
+                # SOE-style). ``planner.reset()`` between calls unlocks -> per-chunk.
+                if z is None:
+                    z = self.scout_planner.z
+                if z is None:
+                    z = torch.randn(
+                        size=(B, self.scout_planner.scout_vib.style_dim),
+                        device=condition_data.device,
+                        dtype=condition_data.dtype,
+                    )
+                else:
+                    z = z.to(device=condition_data.device, dtype=condition_data.dtype)
+                self.scout_planner.set_z(z)
             else:
-                z = z.to(device=condition_data.device, dtype=condition_data.dtype)
-            self.scout_planner.set_z(z)
+                # expert mode: z* is selected at the FIRST guided denoise step
+                # from (s̄_t, x̂₀) via the planner's select_z (one per chunk --
+                # every action generation, NOT once per trajectory). Clear any
+                # stale z* from the previous chunk so compute_loss never sees
+                # it before selection.
+                self.scout_planner.set_z(None)
             # pre-encode s̄_t once (design §4: "s̄_t 定住") -- cached across
             # denoise steps; compute_loss reuses it instead of re-running the
             # frozen ResNet every step.
             if current_obs is not None:
                 self.scout_planner.set_current_obs(current_obs)
-
         for t in scheduler.timesteps:
             # 1. apply conditioning (inpaint) -- LPB L246.
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -228,6 +241,13 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                 x0_hat = scheduler.step(
                     model_output, t, trajectory, generator=_gate_gen
                 ).pred_original_sample
+                if _select_fn is not None and not _z_selected:
+                    # expert mode: pick z* = nearest bank entry under
+                    # q(z|s̄_t, x̂₀) once per denoise loop (per action
+                    # chunk), then guide the rest of the loop at that z*.
+                    self.scout_planner.set_z(
+                        _select_fn(x0_hat, current_obs))
+                    _z_selected = True
                 # reduction="sum": rows are block-diagonal independent, so the
                 # gradient of the SUMMED cost gives each row its full unscaled
                 # gradient -- the injected force no longer depends on how many

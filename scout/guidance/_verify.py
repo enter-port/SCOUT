@@ -26,6 +26,11 @@ Checks (task verify):
   5. 1/B scaling-bug regression (fixed 2026-08-21): grad(sum-reduced cost)
      == B x grad(mean-reduced); a row alone (B=1) reproduces its batched
      gradient; the guided path wires ``reduction="sum"`` (spy).
+  6. Expert z-bank mode (2026-08-21): ``select_z`` returns the argmin-NLL
+     bank row; the policy selects z* exactly once per denoise loop (every
+     action chunk -- NOT once per trajectory) and the guided trajectory
+     differs from unguided; explore mode (checks 1-5, plain planner) is
+     untouched.
 
 Run:
     python -m scout.guidance._verify
@@ -361,6 +366,86 @@ def check_grad_batch_invariance(policy, planner, scout_vib, current_obs,
           f"{set(recorded)} over {len(recorded)} guided steps: OK")
 
 
+def check_expert_guidance(policy, planner, scout_vib, current_obs,
+                          cond_data, cond_mask, seed=233):
+    """Verify step 6: expert z-bank mode (user 2026-08-21).
+
+    (a) ``select_z`` returns, per batch row, the bank entry with the lowest
+        NLL under the query ``q(z|s_bar, x0_hat)`` (verified exactly: the
+        query crafted from bank row j's own (s,a) must re-select row j);
+    (b) the policy's expert path selects z* exactly ONCE per denoise loop
+        (per action chunk) via ``set_z`` -- plus the pre-loop ``set_z(None)``
+        hygiene clear -- and every z* is a bank row;
+    (c) the expert-guided trajectory differs from the unguided one.
+    """
+    from scout.guidance.expert_bank import ScoutExpertPlanner
+
+    horizon, action_dim = cond_data.shape[1], cond_data.shape[2]
+    B = current_obs["proprio"].shape[0]
+    torch.manual_seed(seed)
+
+    # bank: K style-vectors, each the encoder mean of batch-row 0's obs with
+    # a distinct (dummy, 1-step) action chunk.
+    obs0 = {"visual": {v: x[0:1] for v, x in current_obs["visual"].items()},
+            "proprio": current_obs["proprio"][0:1]}
+    K = 6
+    A = torch.randn(K, 1, action_dim)                     # (K, 1, per_step)
+    with torch.no_grad():
+        s0 = scout_vib.encode(obs0)
+        bank = torch.stack([
+            scout_vib.vib_enc(s0, A[j:j + 1].reshape(1, -1))[0][0]
+            for j in range(K)])                            # (K, D)
+
+    expert = ScoutExpertPlanner(scout_vib, z_bank=bank)
+    policy.initialize_scout_planner(
+        planner=expert,
+        guidance_start_timestep=policy.noise_scheduler.config.num_train_timesteps,
+        guidance_scale=5.0,
+    )
+
+    # (a) argmin-NLL selection: query row 0 rebuilt from bank row 2's action.
+    x0_q = torch.randn(B, horizon, action_dim)
+    x0_q[0, 0] = A[2, 0]                                  # n_steps=1 chunk
+    z_star = expert.select_z(x0_q, current_obs)
+    assert torch.allclose(z_star[0], bank[2], atol=1e-5), (
+        "select_z must re-select the bank row the query was built from"
+    )
+    for i in range(B):                                    # every z* is a bank row
+        assert any(torch.allclose(z_star[i], bank[j], atol=1e-6)
+                   for j in range(K)), f"row {i} z* not in bank"
+
+    # (b) policy wiring: exactly one non-None set_z per denoise loop.
+    set_z_calls = []
+    orig_set_z = expert.set_z
+    expert.set_z = lambda z: (set_z_calls.append(
+        None if z is None else z.clone()), orig_set_z(z))
+    try:
+        t_expert = _run_sample(policy, cond_data, cond_mask, None, current_obs,
+                               z=None, seed=seed,
+                               classifier_guidance=True, guidance_scale=5.0)
+    finally:
+        expert.set_z = orig_set_z
+    nonnone = [z for z in set_z_calls if z is not None]
+    assert set_z_calls[0] is None, "pre-loop must clear stale z (set_z(None))"
+    assert len(nonnone) == 1, (
+        f"one z* selection per denoise loop expected; got {len(nonnone)} "
+        f"(calls: {[None if z is None else tuple(z.shape) for z in set_z_calls]})"
+    )
+    assert all(any(torch.allclose(nonnone[0][b], bank[j], atol=1e-6)
+                   for j in range(K)) for b in range(B)), "some z* not in bank"
+
+    # (c) guidance bites: expert-guided != unguided at scale>0.
+    t_unguided = _run_sample(policy, cond_data, cond_mask, None, current_obs,
+                             z=None, seed=seed, classifier_guidance=False,
+                             guidance_scale=0.0)
+    diff = (t_expert - t_unguided).abs().max().item()
+    assert diff > 1e-3, f"expert guidance must bite; max|diff|={diff:.2e}"
+
+    print(f"[check 6] expert z-bank: argmin-NLL selection exact; "
+          f"set_z(non-None) x{len(nonnone)} per loop (z* in bank); "
+          f"guided vs unguided max|diff|={diff:.2e} (bites OK)")
+
+
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -381,6 +466,9 @@ def main():
                      cond_data, cond_mask, global_cond)
     check_grad_batch_invariance(policy, planner, scout_vib, current_obs,
                                 cond_data, cond_mask)
+    # check 6 replaces the policy's planner with the expert one -- run LAST.
+    check_expert_guidance(policy, planner, scout_vib, current_obs,
+                          cond_data, cond_mask)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")
