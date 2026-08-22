@@ -60,11 +60,16 @@ DYN_FREEZE_AFTER=${DYN_FREEZE_AFTER:-3}
 SEED=42                       # eval phase: FIXED scene set every round (42..141)
 NEXPLORE=${NEXPLORE:-100}
 ETRIES=1
+NENV=${NENV:-25}              # rollout concurrency (config also says 25)
+NENV_RETRY=${NENV_RETRY:-12}  # render-corruption retry: halve the EGL surface
 if [ "$A" = BASE ]; then ESEED=0; else ESEED=$((NUM * 1000 + 42)); fi
 
 export MUJOCO_GL=egl
 export TMPDIR=/tmp            # MUST be local (CPFS TMPDIR kills torch_shm_manager)
 export CUBLAS_WORKSPACE_CONFIG=:4096:8   # T2: deterministic cuBLAS GEMM
+# spread offscreen rendering one GPU per chain (see rollout.py's env factory;
+# 2026-08-22: everything-on-EGL-device-0 overloaded it into frame corruption)
+export SCOUT_RENDER_GPU=$GPU
 set -a; . /root/workspace/baojiachun/.secrets/wandb.env; set +a
 export WANDB_DIR=/root/workspace/baojiachun/wandb_runs
 export WANDB_CACHE_DIR=/root/workspace/baojiachun/.cache/wandb
@@ -247,31 +252,55 @@ T0=$(date +%s)
 log "=== ROUND $TASK a=$A seed=$TSEED round=$NUM mode=$MODE START (GPU$GPU; rollout DP=$DPROLL vib=${VIBDIR:-none}; eval_seed=$SEED explore_seed=$ESEED) ==="
 
 # ---- [1/3] rollout: SPLIT protocol (eval fixed scenes + explore fresh) ---- #
+# Render-corruption guard (2026-08-22): after the rollout, vis_validate the
+# explore images in all.hdf5; on CORRUPT, delete the outputs and retry ONCE
+# at NENV_RETRY (fewer concurrent envs = smaller EGL surface). Two strikes ->
+# FATAL (chain stops loudly instead of training on blind-policy data).
 GUIDE=off; [ "$A" = SCOUT ] && GUIDE=dyn
-if [ "${SKIP_ROLLOUT:-0}" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
-  log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (rollout already done)"
+NE=$NENV
+ROLLOUT_OK=0
+for ATTEMPT in 1 2; do
+  if [ "${SKIP_ROLLOUT:-0}" = 1 ] && [ "$ATTEMPT" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
+    log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (validating it)"
+  else
+    rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5"; rm -rf "$RDIR/log"
+    log "[1/3] rollout guide=$GUIDE try$ATTEMPT n_envs=$NE eval=$SEED(100) explore=$ESEED($NEXPLORE x$ETRIES) dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
+    RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU $PY -m scout.eval.run_rollout \
+      --config configs/eval_${TASK}_exp1.yaml --task "$TASK" --exp-num "$NUM" \
+      --base-dp-ckpt "$DPCKPT" \
+      --core-hdf5 "$CORE" \
+      --guide "$GUIDE" --seed "$SEED" \
+      --eval-seed "$SEED" --explore-seed "$ESEED" \
+      --n-explore "$NEXPLORE" --explore-try-times "$ETRIES" \
+      --n-envs "$NE" \
+      ${EVALONLY[@]+"${EVALONLY[@]}"} \
+      ${VIBARGS[@]+"${VIBARGS[@]}"} \
+      --output-dir "$RDIR" \
+      --output-success "$RDIR/success.hdf5" \
+      --output-all "$RDIR/all.hdf5" \
+      --wandb-name "$WNAME" \
+      --wandb-project "$WPROJ" \
+      > "$RLOG" 2>&1
+    RC=$?
+    if [ $RC -ne 0 ]; then
+      log "[1/3] rollout rc=$RC (attempt $ATTEMPT, n_envs=$NE) -- see $RLOG"
+      [ "$MODE" = "eval-only" ] && { log "ROLLOUT FAILED (eval-only, no retry data)"; exit 1; }
+      NE=$NENV_RETRY
+      continue
+    fi
+  fi
   T1=$(date +%s)
-else
-log "[1/3] rollout guide=$GUIDE eval=$SEED(100) explore=$ESEED($NEXPLORE x$ETRIES) dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
-RUN env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.eval.run_rollout \
-  --config configs/eval_${TASK}_exp1.yaml --task "$TASK" --exp-num "$NUM" \
-  --base-dp-ckpt "$DPCKPT" \
-  --core-hdf5 "$CORE" \
-  --guide "$GUIDE" --seed "$SEED" \
-  --eval-seed "$SEED" --explore-seed "$ESEED" \
-  --n-explore "$NEXPLORE" --explore-try-times "$ETRIES" \
-  ${EVALONLY[@]+"${EVALONLY[@]}"} \
-  ${VIBARGS[@]+"${VIBARGS[@]}"} \
-  --output-dir "$RDIR" \
-  --output-success "$RDIR/success.hdf5" \
-  --output-all "$RDIR/all.hdf5" \
-  --wandb-name "$WNAME" \
-  --wandb-project "$WPROJ" \
-  > "$RLOG" 2>&1
-RC=$?; T1=$(date +%s)
-log "[1/3] rollout rc=$RC in $(( (T1-T0)/60 ))m$(( (T1-T0)%60 ))s"
-[ $RC -ne 0 ] && { log "ROLLOUT FAILED - see $RLOG"; exit 1; }
-fi   # end SKIP_ROLLOUT else-branch
+  if [ "$MODE" = "eval-only" ] || [ ! -f "$RDIR/all.hdf5" ]; then
+    ROLLOUT_OK=1; break     # eval-only writes no all.hdf5 -- nothing to check
+  fi
+  if "$PY" soe_scripts/vis_validate.py "$RDIR/all.hdf5" 20 > "$RDIR/validate.log" 2>&1; then
+    log "[1/3] rollout images HEALTHY (attempt $ATTEMPT, n_envs=$NE)"
+    ROLLOUT_OK=1; break
+  fi
+  log "[1/3] RENDER CORRUPT (attempt $ATTEMPT, n_envs=$NE): $(grep -m1 CORRUPT "$RDIR/validate.log")"
+  NE=$NENV_RETRY
+done
+[ $ROLLOUT_OK -eq 1 ] || { log "ROLLOUT FAILED - render corruption persisted after retry - see $RDIR/validate.log"; exit 1; }
 
 # the rollout json carries the shared wandb run id for the retrains
 RID=$($PY - "$RDIR/log" <<'PYEOF'

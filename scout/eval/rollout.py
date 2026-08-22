@@ -651,6 +651,17 @@ def make_robomimic_env_factory(dataset_path: str, shape_meta: dict,
         if abs_action:
             env_meta["env_kwargs"]["controller_configs"]["control_delta"] = False
 
+        # offscreen-render device (2026-08-22): the dataset's env_meta pins
+        # render_gpu_device_id=0, so EVERY chain rendered on EGL device 0 --
+        # under 4 concurrent chains that overloaded it and corrupted frames
+        # (2333-DP r1, both SCOUT arms r4-6). round.sh exports
+        # SCOUT_RENDER_GPU=<chain gpu> to spread rendering one GPU per chain;
+        # robosuite 1.4.1's egl_context picks the device directly by index.
+        import os as _os
+        _rgpu = int(_os.environ.get("SCOUT_RENDER_GPU", -1))
+        if _rgpu >= 0:
+            env_meta["env_kwargs"]["render_gpu_device_id"] = _rgpu
+
         modality_mapping = collections.defaultdict(list)
         for key, attr in shape_meta["obs"].items():
             modality_mapping[attr.get("type", "low_dim")].append(key)
