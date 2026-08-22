@@ -60,8 +60,11 @@ DYN_FREEZE_AFTER=${DYN_FREEZE_AFTER:-3}
 SEED=42                       # eval phase: FIXED scene set every round (42..141)
 NEXPLORE=${NEXPLORE:-100}
 ETRIES=1
-NENV=${NENV:-25}              # rollout concurrency (config also says 25)
-NENV_RETRY=${NENV_RETRY:-12}  # render-corruption retry: halve the EGL surface
+NENV=${NENV:-12}              # rollout concurrency (2026-08-22 user: 12 by
+                              # default -- fastest tier AND lowest render-
+                              # corruption rate; env creation overhead scales
+                              # with n_envs and dominates on 100-scene rounds)
+NENV_RETRY=${NENV_RETRY:-6}   # render-corruption retry: halve the EGL surface
 if [ "$A" = BASE ]; then ESEED=0; else ESEED=$((NUM * 1000 + 42)); fi
 
 export MUJOCO_GL=egl
