@@ -81,7 +81,9 @@ TDP=$DATA/$TASK/train/DP
 TDYN=$DATA/$TASK/train/dyn
 CORE=$DATA/$TASK/rollout/${TASK}_core.hdf5
 LOG=$DATA/$TASK/round.log
-WPROJ=${TASKUP}-2026-8-21
+# wandb project: overridable per chain (user 2026-08-22: each seed experiment
+# gets its OWN project, e.g. WPROJ=CAN-exp1-23333); default = shared project.
+WPROJ=${WPROJ:-${TASKUP}-2026-8-21}
 mkdir -p "$TDP" "$TDYN" "$(dirname "$CORE")"
 cd "$REPO" || exit 1
 exec 3>&1
