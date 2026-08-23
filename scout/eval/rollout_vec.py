@@ -230,6 +230,10 @@ class _VecRunner:
         obs_batch = _batch_obs([s.current_obs for s in need], self.device)
         if self.guided:
             planner = getattr(self.dp, "scout_planner", None)
+            # entropy-cost planners (novelty/atypical): tell each batch row
+            # which scene (init_idx) it belongs to -- per-scene code buffers.
+            if planner is not None and hasattr(planner, "set_row_context"):
+                planner.set_row_context([s.job[1] for s in need])
             # lock the batched z (one row per slot in this batch) just before the
             # call; guided_conditional_sample reads planner.z (policy.py).
             if planner is not None and all(s.z is not None for s in need):

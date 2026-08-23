@@ -78,11 +78,13 @@ class RolloutPipeline:
                  device: Optional[torch.device] = None,
                  guided: bool = False, guide_mode: str = "dyn",
                  bank_hdf5: Optional[str] = None,
-                 log_every: Optional[int] = None):
+                 log_every: Optional[int] = None,
+                 entropy_kwargs: Optional[dict] = None):
         self.cfg = cfg
         self.dp_factory = dp_factory
         self.scout_vib_factory = scout_vib_factory
         self.env_factory = env_factory
+        self.entropy_kwargs = entropy_kwargs or {}
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.guided = bool(guided)
@@ -140,6 +142,26 @@ class RolloutPipeline:
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
                   f"entries from {bank_src}")
+        elif self.guide_mode in ("novelty", "atypical"):
+            # entropy-dev (user 2026-08-24 方案二/三): only the cost changes;
+            # same injection path, same frozen dyn/VIB encoder.
+            from scout.guidance.entropy_costs import (
+                AtypicalCostPlanner,
+                NoveltyCostPlanner,
+            )
+            ek = dict(self.entropy_kwargs or {})
+            if self.guide_mode == "novelty":
+                planner = NoveltyCostPlanner(
+                    scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                    h_scale=float(ek.get("novelty_h", 1.0)),
+                    sample_z=bool(ek.get("novelty_sample_z", True)),
+                )
+            else:
+                planner = AtypicalCostPlanner(
+                    scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                    cap=float(ek.get("atypical_cap", 10.0)),
+                )
+            print(f"[rollout] entropy cost guidance: mode={self.guide_mode} {ek}")
         else:
             planner = ScoutPlanner(scout_vib, bridge=bridge,
                                    obs_adapter=obs_adapter, z=None)

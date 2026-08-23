@@ -78,12 +78,26 @@ def main():
                         "Required for full rollout; optional for --success-only "
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
-    p.add_argument("--guide", choices=["dyn", "off", "expert"], default="off",
+    p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
+                                        "atypical"], default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
                         "(z* = nearest core-data bank entry per action chunk; "
-                        "needs --vib-ckpt + --core-hdf5); 'off' (default) = "
+                        "needs --vib-ckpt + --core-hdf5); 'novelty' = entropy "
+                        "cost, minimize KDE density of the candidate's encoder "
+                        "code in the scene's visited-code set (方案二; needs "
+                        "--vib-ckpt); 'atypical' = entropy cost, maximize "
+                        "KL to the policy's own unguided-intent encoder "
+                        "(方案三; needs --vib-ckpt); 'off' (default) = "
                         "plain base-DP rollout (baseline).")
+    p.add_argument("--novelty-h", type=float, default=1.0,
+                   help="novelty KDE kernel width, in units of the encoder's "
+                        "running per-dim sigma (default 1.0)")
+    p.add_argument("--novelty-sample-z", type=int, default=1,
+                   help="novelty: evaluate the code at mu+sigma*eps with a "
+                        "per-chunk fixed eps (1, default) or at mu (0)")
+    p.add_argument("--atypical-cap", type=float, default=10.0,
+                   help="atypical: cap on the KL bonus in nats (default 10)")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
@@ -354,6 +368,9 @@ def main():
         env_factory=env_factory, device=device, guided=guided,
         guide_mode=args.guide if guided else "dyn",
         bank_hdf5=args.bank_hdf5,
+        entropy_kwargs={"novelty_h": args.novelty_h,
+                        "novelty_sample_z": bool(args.novelty_sample_z),
+                        "atypical_cap": args.atypical_cap},
     )
     try:
         result = pipeline.run(
