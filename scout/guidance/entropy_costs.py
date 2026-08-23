@@ -93,12 +93,13 @@ class NoveltyCostPlanner(ScoutPlanner):
     def encode_executed(self, obs, chunk_np) -> torch.Tensor:
         """Code of an EXECUTED chunk: raw actions + the obs the chunk was
         conditioned on (single env, unbatched numpy obs dict)."""
-        obs_t = {k: torch.as_tensor(np.asarray(v, dtype=np.float32)).unsqueeze(0)
+        dev = next(self.scout_vib.parameters()).device
+        obs_t = {k: torch.as_tensor(np.asarray(v, dtype=np.float32)).unsqueeze(0).to(dev)
                  for k, v in obs.items()}
         obs_es = (self.obs_adapter(obs_t) if self.obs_adapter is not None
                   else obs_t)
         a_flat = torch.as_tensor(
-            np.asarray(chunk_np, dtype=np.float32).reshape(1, -1))
+            np.asarray(chunk_np, dtype=np.float32).reshape(1, -1)).to(dev)
         with torch.no_grad():
             s_bar = self.scout_vib.encode(obs_es)
             mu, _ = self.scout_vib.vib_enc(s_bar.to(a_flat.device), a_flat)
