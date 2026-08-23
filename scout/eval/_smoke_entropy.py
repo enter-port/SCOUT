@@ -31,6 +31,9 @@ class MockVib:
     def eval(self):
         return self
 
+    def parameters(self):
+        return iter([torch.nn.Parameter(torch.zeros(1))])
+
     def encode(self, obs):
         return obs                                  # s_bar passthrough
 
