@@ -94,7 +94,9 @@ class NoveltyCostPlanner(ScoutPlanner):
         """Code of an EXECUTED chunk: raw actions + the obs the chunk was
         conditioned on (single env, unbatched numpy obs dict)."""
         dev = next(self.scout_vib.parameters()).device
-        obs_t = {k: torch.as_tensor(np.asarray(v, dtype=np.float32)).unsqueeze(0).to(dev)
+        # match the policy-path convention: E_s consumes the LAST obs frame
+        # (predict_action_dyn_guided slices x[:, -1:, ...] before the adapter)
+        obs_t = {k: torch.as_tensor(np.asarray(v, dtype=np.float32))[-1:].unsqueeze(0).to(dev)
                  for k, v in obs.items()}
         obs_es = (self.obs_adapter(obs_t) if self.obs_adapter is not None
                   else obs_t)
