@@ -92,10 +92,11 @@ class NoveltyCostPlanner(ScoutPlanner):
     # -- executed-code recording (rollout_vec) ----------------------------- #
     def encode_executed(self, obs, chunk_np) -> torch.Tensor:
         """Code of an EXECUTED chunk: raw actions + the obs the chunk was
-        conditioned on (single env, unbatched obs dict)."""
-        obs_es = (self.obs_adapter({k: np.asarray(v)[None] for k, v in obs.items()})
-                  if self.obs_adapter is not None
-                  else {k: np.asarray(v)[None] for k, v in obs.items()})
+        conditioned on (single env, unbatched numpy obs dict)."""
+        obs_t = {k: torch.as_tensor(np.asarray(v, dtype=np.float32)).unsqueeze(0)
+                 for k, v in obs.items()}
+        obs_es = (self.obs_adapter(obs_t) if self.obs_adapter is not None
+                  else obs_t)
         a_flat = torch.as_tensor(
             np.asarray(chunk_np, dtype=np.float32).reshape(1, -1))
         with torch.no_grad():
