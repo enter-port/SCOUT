@@ -168,6 +168,8 @@ class RolloutPipeline:
                     h_scale=float(ek.get("novelty_h", 5.0)),
                     sample_z=bool(ek.get("novelty_sample_z", False)),
                     cap=float(ek.get("atypical_cap", 10.0)),
+                    nov_weight=float(ek.get("combo_nov_weight", 1.0)),
+                    att_weight=float(ek.get("combo_att_weight", 1.0)),
                 )
             print(f"[rollout] entropy cost guidance: mode={self.guide_mode} {ek}")
         else:

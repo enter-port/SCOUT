@@ -101,6 +101,12 @@ def main():
                         "per-chunk fixed eps (1, default) or at mu (0)")
     p.add_argument("--atypical-cap", type=float, default=10.0,
                    help="atypical: cap on the KL bonus in nats (default 10)")
+    p.add_argument("--combo-nov-weight", type=float, default=1.0,
+                   help="combo: weight of the novelty cost term (default 1.0; "
+                        "0.5 at scale 2.0 keeps its force at the h0.5/s1.0 "
+                        "solo calibration)")
+    p.add_argument("--combo-att-weight", type=float, default=1.0,
+                   help="combo: weight of the atypical cost term (default 1.0)")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
@@ -373,7 +379,9 @@ def main():
         bank_hdf5=args.bank_hdf5,
         entropy_kwargs={"novelty_h": args.novelty_h,
                         "novelty_sample_z": bool(args.novelty_sample_z),
-                        "atypical_cap": args.atypical_cap},
+                        "atypical_cap": args.atypical_cap,
+                        "combo_nov_weight": args.combo_nov_weight,
+                        "combo_att_weight": args.combo_att_weight},
     )
     try:
         result = pipeline.run(
