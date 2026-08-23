@@ -165,7 +165,8 @@ class _VecRunner:
                  guided: bool,
                  on_done: Optional[Callable[[_VecSlot], None]] = None,
                  progress_cb: Optional[Callable[[int], None]] = None,
-                 wandb_run=None, log_every: int = 10):
+                 wandb_run=None, log_every: int = 10,
+                 job_gate: Optional[Callable[[tuple], bool]] = None):
         self.dp = dp
         self.n_action_steps = int(n_action_steps)
         self.horizon = int(horizon)
@@ -175,6 +176,7 @@ class _VecRunner:
         self.progress_cb = progress_cb
         self.wandb_run = wandb_run
         self.log_every = max(1, int(log_every))
+        self.job_gate = job_gate
 
         # one env per slot (independent MuJoCo sim)
         self.envs = [env_factory() for _ in range(n_envs)]
@@ -215,6 +217,9 @@ class _VecRunner:
         slot.reset_for_job(job, record_obs)
         slot.current_obs = slot.env.reset_to(init_state)
         slot.current_state_dict = init_state
+        # entropy-cost planners: per-try executed-code bookkeeping
+        slot.chunk_obs = None            # obs the current chunk was generated from
+        slot.exec_codes = []             # codes of this try's executed chunks
         if self.guided and self.style_dim is not None:
             # one fresh skill latent per rollout, held across ALL its chunks
             # (scout_design §1 "z 整段定住"; distinct from SOE per-chunk resample).
@@ -234,6 +239,14 @@ class _VecRunner:
             # which scene (init_idx) it belongs to -- per-scene code buffers.
             if planner is not None and hasattr(planner, "set_row_context"):
                 planner.set_row_context([s.job[1] for s in need])
+            # novelty v2: record the code of the chunk that just FINISHED
+            # executing (s.chunk, conditioned on s.chunk_obs) BEFORE it is
+            # replaced by the new one.
+            if planner is not None and hasattr(planner, "encode_executed"):
+                for s in need:
+                    if s.chunk is not None and s.chunk_obs is not None:
+                        s.exec_codes.append(
+                            planner.encode_executed(s.chunk_obs, s.chunk))
             # lock the batched z (one row per slot in this batch) just before the
             # call; guided_conditional_sample reads planner.z (policy.py).
             if planner is not None and all(s.z is not None for s in need):
@@ -246,6 +259,7 @@ class _VecRunner:
         for i, s in enumerate(need):
             s.chunk = chunks[i]
             s.t = 0
+            s.chunk_obs = s.current_obs      # snapshot the conditioning obs
 
     def _step_slots(self):
         for s in self.slots:
@@ -307,19 +321,39 @@ class _VecRunner:
         self.completed += 1
         if slot.success:
             self.successes += 1
+        # novelty v2: a retry finalized -- commit its executed codes to the
+        # scene buffer so the NEXT retry of the same scene is pushed away
+        # from them (retries are serialized per scene by the job gate).
+        if self.guided:
+            planner = getattr(self.dp, "scout_planner", None)
+            if (planner is not None and hasattr(planner, "on_try_done")
+                    and getattr(slot, "exec_codes", None)):
+                planner.on_try_done(slot.job[1], slot.exec_codes)
         if self.on_done is not None:
             self.on_done(slot)
 
     # -- main loop --------------------------------------------------------- #
     def run(self, job_queue: Deque[tuple], record_obs: bool):
         """Drain ``job_queue`` across the slots. Each job is a tuple whose first
-        element is the init_state; remaining elements are caller routing tags."""
+        element is the init_state; remaining elements are caller routing tags.
+        ``self.job_gate`` (optional) can veto popping a job -- used to
+        serialize a scene's retries (try j waits for try j-1 to finalize)."""
         tick = 0
         while job_queue or any(s.active for s in self.slots):
-            # 1. fill idle slots from the queue
+            # 1. fill idle slots from the queue (first gate-passing job)
             for s in self.slots:
                 if not s.active and job_queue:
-                    self._launch(s, job_queue.popleft(), record_obs)
+                    job = None
+                    if self.job_gate is None:
+                        job = job_queue.popleft()
+                    else:
+                        for qi, qj in enumerate(job_queue):
+                            if self.job_gate(qj):
+                                job = qj
+                                del job_queue[qi]
+                                break
+                    if job is not None:
+                        self._launch(s, job, record_obs)
             # 2. batched re-plan for slots needing a new chunk
             self._replan()
             # 3. step every active slot (may finalize some -> on_done)
@@ -477,10 +511,14 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
     # SOE 3rd-difference norm (scout.eval.metrics.jerk); T<4 -> 0.0, skipped.
     jerk_sum = 0.0
     jerk_n = 0
+    # novelty planners serialize a scene's retries (try j waits for j-1 so
+    # the scene's executed-code buffer is complete before the next attempt).
+    done_tries: dict = {}
 
     def on_done(slot: _VecSlot):
         nonlocal jerk_sum, jerk_n
         _init_state, init_idx, try_idx = slot.job
+        done_tries[init_idx] = max(done_tries.get(init_idx, -1), try_idx)
         entry = results[init_idx]
         entry["all_trajs"].append(slot.traj)
         if try_idx == 0:
@@ -533,6 +571,10 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
         dp, env_factory, n_envs, n_action_steps, horizon, device,
         guided=guided, on_done=on_done, progress_cb=progress_cb,
         wandb_run=wandb_run, log_every=log_every,
+        job_gate=(lambda job: job[2] == 0
+                  or done_tries.get(job[1], -1) >= job[2] - 1)
+        if (guided and hasattr(dp, "scout_planner")
+           and hasattr(dp.scout_planner, "on_try_done")) else None,
     )
     try:
         runner.run(job_queue, record_obs=True)

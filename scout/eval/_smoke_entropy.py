@@ -1,15 +1,12 @@
-"""Hermetic smoke for the entropy-cost planners (novelty / atypical).
-
-Pure mocks -- no robomimic. The mock encoder is mu = W @ a (+ constant logvar),
-so gradients w.r.t. the candidate action flow through a linear map and the
-"away from the visited code" direction is checkable in closed form.
+"""Hermetic smoke for the entropy-cost planners, v2 API (executed-code
+buffers + on_try_done + graph-connected empty rows).
 
 Run:  python -m scout.eval._smoke_entropy
 """
+import numpy as np
 import torch
 
 from scout.guidance.entropy_costs import AtypicalCostPlanner, NoveltyCostPlanner
-
 
 Ds, Da, Dz = 6, 5, 4          # s_bar dim / action dim / style dim
 torch.manual_seed(0)
@@ -21,7 +18,7 @@ class MockEncNet:
 
     def __call__(self, s_bar, a):
         mu = a @ W.T                                # (B, Dz)
-        logvar = torch.full_like(mu, -1.0)          # sigma ~ 0.61, constant
+        logvar = torch.full_like(mu, -1.0)
         return mu, logvar
 
 
@@ -39,7 +36,6 @@ class MockVib:
 
 
 def _x(a):
-    """wrap a flat action (B, Da) as an x0_hat of shape (B, T=1, Da)."""
     return a.unsqueeze(1).clone().requires_grad_(True)
 
 
@@ -47,61 +43,62 @@ def main():
     vib = MockVib()
     s_bar = torch.randn(2, Ds)
 
-    # ---------------- novelty (方案二) -------------------------------------- #
-    pl = NoveltyCostPlanner(vib, h_scale=1.0, sample_z=False)
+    # ---------------- novelty v2 ------------------------------------------- #
+    pl = NoveltyCostPlanner(vib, h_scale=5.0, sample_z=False,
+                            obs_adapter=lambda d: (torch.as_tensor(d["v"])[None]
+                                                   if isinstance(d, dict) else d))
     pl.set_current_obs(s_bar)
-    pl.set_row_context([7, 8])                       # two scenes
+    pl.set_row_context([7, 8])
 
-    # empty buffers -> zero cost, zero grad
+    # all-empty buffers: cost is a graph-connected zero -> backward works
     x = _x(torch.randn(2, Da))
-    assert pl.compute_loss(x, s_bar).item() == 0.0
+    loss = pl.compute_loss(x, s_bar, reduction="sum")
+    loss.backward()
+    assert x.grad is not None and float(x.grad.abs().sum()) == 0.0
 
-    # chunk 1: select_z parks anchors; chunk 2: previous committed to buffer
-    pl.select_z(x.detach(), s_bar)
-    pl.select_z(x.detach(), s_bar)                   # second call commits
-    assert len(pl._buffers[7]) == 1 and len(pl._buffers[8]) == 1
+    # try 0 of scene 7 executed two chunks -> codes committed at try end
+    acts0 = [np.random.randn(8, Da).astype(np.float32) for _ in range(2)]
+    codes0 = [pl.encode_executed({"v": s_bar[0].numpy()}, c) for c in acts0]
+    pl.on_try_done(7, codes0)
+    assert len(pl._buffers[7]) == 2
 
-    # candidate AT the buffered code of scene 7 -> cost ~ log(1+eps) ~ 0
-    # candidate FAR  from it -> cost ~ log(eps) < 0 (reward for novelty)
-    a0 = torch.linalg.pinv(W) @ pl._buffers[7][0]    # preimage: c = W a0
-    at = torch.stack([a0, torch.randn(Da)])
-    cost_near = pl.compute_loss(_x(at), s_bar, reduction="sum")
-    af = at + 0.5
-    cost_far = pl.compute_loss(_x(af), s_bar, reduction="sum")
-    assert cost_far < cost_near - 2.0, (cost_near.item(), cost_far.item())
+    # candidate near the executed region -> HIGHER cost than one far away
+    a_near = torch.stack([torch.from_numpy(acts0[0][0]).float(),
+                          torch.randn(Da)])
+    a_far = a_near + 2.0
+    c_near = pl.compute_loss(_x(a_near), s_bar, reduction="sum")
+    c_far = pl.compute_loss(_x(a_far), s_bar, reduction="sum")
+    assert c_far < c_near, (c_near.item(), c_far.item())
 
-    # gradient direction: -grad must push the code AWAY from the buffer
-    xg = _x(at)
+    # gradient direction pushes row 0 AWAY from the executed codes
+    xg = _x(a_near)
     pl.compute_loss(xg, s_bar, reduction="sum").backward()
-    d_far = (af[0] @ W.T - pl._buffers[7][0]).norm()
-    d_step = ((at[0] - 0.1 * xg.grad[0]) @ W.T - pl._buffers[7][0]).norm()
-    assert d_step > (at[0] @ W.T - pl._buffers[7][0]).norm(), "grad sign wrong"
+    d0 = (a_near[0] @ W.T - codes0[0]).norm()
+    d1 = ((a_near[0] - 0.1 * xg.grad[0]) @ W.T - codes0[0]).norm()
+    assert d1 > d0, "gradient must push away from executed codes"
 
-    # batch invariance: row 0's cost identical alone vs in a batch of 2
-    c1 = pl.compute_loss(_x(at[:1]), s_bar, reduction="sum")
-    c2 = pl.compute_loss(_x(at), s_bar, reduction="sum") \
-        - pl.compute_loss(_x(at[1:]), s_bar, reduction="sum")
-    assert torch.allclose(c1, c2, atol=1e-5), (c1.item(), c2.item())
+    # row 1 (scene 8, empty buffer) contributes exactly 0 even in a batch
+    c2 = pl.compute_loss(_x(a_near[1:]), s_bar, reduction="sum")
+    assert float(c2) == 0.0
 
-    # per-scene isolation: scene 8's buffer is independent of scene 7's
-    pl._buffers[8].append(pl._buffers[7][0] + 10.0)
-    c8 = pl.compute_loss(_x(at[1:]), s_bar, reduction="sum")
-    assert c8.item() < -2.0, "scene 8 should now be pulled away too"
+    # batch invariance: row 0's cost alone == its cost in the batch
+    c_alone = pl.compute_loss(_x(a_near[:1]), s_bar, reduction="sum")
+    c_batch = pl.compute_loss(_x(a_near), s_bar, reduction="sum")
+    assert torch.allclose(c_alone, c_batch, atol=1e-5)
 
-    # ---------------- atypical (方案三) ------------------------------------- #
+    # ---------------- atypical --------------------------------------------- #
     pa = AtypicalCostPlanner(vib, cap=2.0)
     pa.set_current_obs(s_bar)
     x0 = torch.randn(2, Da)
-    pa.select_z(x0.unsqueeze(1), s_bar)              # baseline from x0
+    pa.select_z(x0.unsqueeze(1), s_bar)
     same = pa.compute_loss(_x(x0), s_bar, reduction="sum")
     moved = pa.compute_loss(_x(x0 + 1.0), s_bar, reduction="sum")
-    assert moved < same, "moving away from own baseline must lower the cost"
-    # cap: a huge deviation must saturate at -cap per row (2 rows -> -2*cap)
+    assert moved < same
     huge = pa.compute_loss(_x(x0 + 50.0), s_bar, reduction="sum")
     assert abs(huge.item() + 2 * 2.0) < 1e-4, huge.item()
 
-    print("[smoke_entropy] OK: novelty(buffer lifecycle, direction, batch "
-          "invariance, per-scene isolation) + atypical(direction, cap)")
+    print("[smoke_entropy v2] OK: empty-row graph safety, executed-code "
+          "buffers, direction, batch invariance, atypical cap")
 
 
 if __name__ == "__main__":

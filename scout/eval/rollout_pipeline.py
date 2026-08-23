@@ -153,8 +153,8 @@ class RolloutPipeline:
             if self.guide_mode == "novelty":
                 planner = NoveltyCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
-                    h_scale=float(ek.get("novelty_h", 1.0)),
-                    sample_z=bool(ek.get("novelty_sample_z", True)),
+                    h_scale=float(ek.get("novelty_h", 5.0)),
+                    sample_z=bool(ek.get("novelty_sample_z", False)),
                 )
             else:
                 planner = AtypicalCostPlanner(

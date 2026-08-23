@@ -90,10 +90,12 @@ def main():
                         "KL to the policy's own unguided-intent encoder "
                         "(方案三; needs --vib-ckpt); 'off' (default) = "
                         "plain base-DP rollout (baseline).")
-    p.add_argument("--novelty-h", type=float, default=1.0,
-                   help="novelty KDE kernel width, in units of the encoder's "
-                        "running per-dim sigma (default 1.0)")
-    p.add_argument("--novelty-sample-z", type=int, default=1,
+    p.add_argument("--novelty-h", type=float, default=5.0,
+                   help="novelty KDE kernel width floor, in units of the "
+                        "encoder's running per-dim sigma; width also adapts "
+                        "to the buffer spread (default 5.0 -- quadratic-"
+                        "repulsion regime, constant force, no saturation)")
+    p.add_argument("--novelty-sample-z", type=int, default=0,
                    help="novelty: evaluate the code at mu+sigma*eps with a "
                         "per-chunk fixed eps (1, default) or at mu (0)")
     p.add_argument("--atypical-cap", type=float, default=10.0,
