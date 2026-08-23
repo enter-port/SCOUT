@@ -263,6 +263,22 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                     1.0 - scheduler.alphas_cumprod[t]
                 ).sqrt()
                 trajectory = trajectory.detach() + grad_scale * cond_grad
+                # telemetry: running stats of the injected force so a
+                # numerically no-op cost is visible in stdout (reflection #2:
+                # novelty v1 ran 4h with force ~1/4 of DP's own sampling
+                # noise before anyone noticed). GPU-side accumulation; the
+                # .item() sync happens only on the print tick.
+                if getattr(self, "_g_acc", None) is None or self._g_acc.device != cond_grad.device:
+                    self._g_acc = torch.zeros(2, device=cond_grad.device)
+                    self._g_n = 0
+                _gn = (grad_scale * cond_grad).reshape(-1).norm()
+                self._g_acc[0] += _gn
+                self._g_acc[1] = torch.maximum(self._g_acc[1], _gn)
+                self._g_n += 1
+                if self._g_n % 5000 == 0:
+                    print(f"[guidance-telemetry] n={self._g_n} "
+                          f"mean_inject={float(self._g_acc[0]) / self._g_n:.4g} "
+                          f"max_inject={float(self._g_acc[1]):.4g}", flush=True)
                 if return_cost_curve:
                     # log per-row mean (historical scale of the E2 metric),
                     # not the B-aggregated sum.
