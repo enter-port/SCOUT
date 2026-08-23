@@ -142,11 +142,12 @@ class RolloutPipeline:
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
                   f"entries from {bank_src}")
-        elif self.guide_mode in ("novelty", "atypical"):
+        elif self.guide_mode in ("novelty", "atypical", "combo"):
             # entropy-dev (user 2026-08-24 方案二/三): only the cost changes;
             # same injection path, same frozen dyn/VIB encoder.
             from scout.guidance.entropy_costs import (
                 AtypicalCostPlanner,
+                ComboCostPlanner,
                 NoveltyCostPlanner,
             )
             ek = dict(self.entropy_kwargs or {})
@@ -156,9 +157,16 @@ class RolloutPipeline:
                     h_scale=float(ek.get("novelty_h", 5.0)),
                     sample_z=bool(ek.get("novelty_sample_z", False)),
                 )
-            else:
+            elif self.guide_mode == "atypical":
                 planner = AtypicalCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                    cap=float(ek.get("atypical_cap", 10.0)),
+                )
+            else:
+                planner = ComboCostPlanner(
+                    scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                    h_scale=float(ek.get("novelty_h", 5.0)),
+                    sample_z=bool(ek.get("novelty_sample_z", False)),
                     cap=float(ek.get("atypical_cap", 10.0)),
                 )
             print(f"[rollout] entropy cost guidance: mode={self.guide_mode} {ek}")

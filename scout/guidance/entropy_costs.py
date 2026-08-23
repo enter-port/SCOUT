@@ -206,3 +206,51 @@ class AtypicalCostPlanner(ScoutPlanner):
         if reduction == "sum":
             return nll.sum()
         raise ValueError(reduction)
+
+
+class ComboCostPlanner(ScoutPlanner):
+    """方案二+方案三 (reflection #3): summed cost -- KDE repulsion from the
+    scene's EXECUTED codes PLUS the capped KL bonus away from the policy's
+    own unguided intent.  The two mechanisms cracked disjoint never-rescued
+    scenes on the same 39-failed set (novelty: 95; atypical: 75/83), so both
+    pushes are kept at their calibrated strengths (h_scale as passed, cap as
+    passed) and simply added; the DP prior remains the only trust region."""
+
+    def __init__(self, scout_vib, bridge=None, obs_adapter=None,
+                 h_scale: float = 0.5, spread_c: float = 1.0,
+                 sample_z: bool = False, cap: float = 2.5,
+                 nov_weight: float = 1.0, att_weight: float = 1.0):
+        super().__init__(scout_vib, bridge=bridge, z=None, obs_adapter=obs_adapter)
+        self._nov = NoveltyCostPlanner(
+            scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+            h_scale=h_scale, spread_c=spread_c, sample_z=sample_z)
+        self._att = AtypicalCostPlanner(
+            scout_vib, bridge=bridge, obs_adapter=obs_adapter, cap=cap)
+        self.nov_weight = float(nov_weight)
+        self.att_weight = float(att_weight)
+
+    # lifecycle calls fan out to the mechanism that consumes them
+    def set_row_context(self, init_ids: Sequence):
+        self._nov.set_row_context(init_ids)
+
+    def select_z(self, x0_hat: torch.Tensor, current_obs=None):
+        self._nov.select_z(x0_hat, current_obs)
+        self._att.select_z(x0_hat, current_obs)
+        return None
+
+    def set_current_obs(self, current_obs):
+        self._nov.set_current_obs(current_obs)
+        self._att.set_current_obs(current_obs)
+
+    def encode_executed(self, obs, chunk_np) -> torch.Tensor:
+        return self._nov.encode_executed(obs, chunk_np)
+
+    def on_try_done(self, init_idx, codes: Sequence[torch.Tensor]):
+        self._nov.on_try_done(init_idx, codes)
+
+    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
+                     reduction: str = "mean") -> torch.Tensor:
+        return (self.nov_weight
+                * self._nov.compute_loss(x0_hat, current_obs, reduction)
+                + self.att_weight
+                * self._att.compute_loss(x0_hat, current_obs, reduction))

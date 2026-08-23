@@ -6,7 +6,11 @@ Run:  python -m scout.eval._smoke_entropy
 import numpy as np
 import torch
 
-from scout.guidance.entropy_costs import AtypicalCostPlanner, NoveltyCostPlanner
+from scout.guidance.entropy_costs import (
+    AtypicalCostPlanner,
+    ComboCostPlanner,
+    NoveltyCostPlanner,
+)
 
 Ds, Da, Dz = 6, 5, 4          # s_bar dim / action dim / style dim
 torch.manual_seed(0)
@@ -102,8 +106,28 @@ def main():
     huge = pa.compute_loss(_x(x0 + 50.0), s_bar, reduction="sum")
     assert abs(huge.item() + 2 * 2.0) < 1e-4, huge.item()
 
+    # ---------------- combo (方案二+三) ------------------------------------ #
+    pc = ComboCostPlanner(vib, h_scale=5.0, sample_z=False, cap=2.0)
+    pc.set_current_obs(s_bar)
+    x0c = torch.randn(2, Da)
+    # select_z fans out: novelty sigma-bar updated + atypical baseline stored
+    pc.select_z(x0c.unsqueeze(1), s_bar)
+    assert len(pc._att._base_mu) == 2
+    c_same = pc.compute_loss(_x(x0c), s_bar, reduction="sum")
+    c_moved = pc.compute_loss(_x(x0c + 1.0), s_bar, reduction="sum")
+    assert c_moved < c_same, "combo must push away from both mechanisms' anchors"
+    # decomposition: combo cost == nov_weight*nov + att_weight*att
+    pc.set_row_context([7, 8])      # scene 7 has 2 executed codes by now
+    nov_only = pc._nov.compute_loss(_x(x0c), s_bar, reduction="sum")
+    att_only = pc._att.compute_loss(_x(x0c), s_bar, reduction="sum")
+    combo = pc.compute_loss(_x(x0c), s_bar, reduction="sum")
+    assert torch.allclose(combo, nov_only + att_only, atol=1e-5)
+    # lifecycle forwarding: executed codes reach the novelty buffer
+    pc.on_try_done(8, [torch.zeros(Dz)])
+    assert len(pc._nov._buffers[8]) == 1
+
     print("[smoke_entropy v2] OK: empty-row graph safety, executed-code "
-          "buffers, direction, batch invariance, atypical cap")
+          "buffers, direction, batch invariance, atypical cap, combo")
 
 
 if __name__ == "__main__":
