@@ -211,7 +211,7 @@ def main():
                                         or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
-    guided = args.guide in ("dyn", "expert") and not args.success_only
+    guided = args.guide in ("dyn", "expert", "novelty", "atypical") and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
