@@ -375,6 +375,8 @@ class RolloutPipeline:
                 "jerk_baseline": jerk_of_results(first_results, only_successful=True),
                 "baseline_solved": baseline_solved,
                 "n_failed": n_eval - baseline_solved,
+                "failed_init_indices": [i for i, (s, _) in
+                                        enumerate(first_results) if not s],
                 "eval_only": True,
             }
             print("[rollout:split] eval-only round -- skipping explore phase")
@@ -473,6 +475,8 @@ class RolloutPipeline:
                 "jerk_baseline": jerk_of_results(first_results, only_successful=True),
                 "baseline_solved": baseline_solved,
                 "n_failed": n_failed,
+                "failed_init_indices": [i for i, (s, _) in
+                                        enumerate(first_results) if not s],
                 "eval_only": True,
             }
             print("[rollout:rescue] eval-only round -- skipping explore phase")
