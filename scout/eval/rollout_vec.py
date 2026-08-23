@@ -456,10 +456,12 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
         if only_failed_of is not None and only_failed_of[i][0]:
             results.append({"solved": True, "n_tries": 0,
                             "successful_trajs": [], "all_trajs": [],
+                            "first_traj": None,
                             "baseline_solved": True})
             continue
         entry = {"solved": False, "n_tries": 0,
                  "successful_trajs": [], "all_trajs": [],
+                 "first_traj": None,
                  "baseline_solved": False}
         results.append(entry)
         for j in range(int(try_times)):
@@ -477,6 +479,11 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
         _init_state, init_idx, try_idx = slot.job
         entry = results[init_idx]
         entry["all_trajs"].append(slot.traj)
+        if try_idx == 0:
+            # rescue-protocol dyn rule (user 2026-08-23): an all-failed init
+            # contributes its FIRST retry to the dyn data -- completion order
+            # is NOT try order under parallel envs, so tag try 0 explicitly.
+            entry["first_traj"] = slot.traj
         j = _traj_jerk(slot.traj["actions"])
         if j > 0.0:                              # T<4 -> 0.0, skipped
             jerk_sum += j

@@ -154,7 +154,8 @@ class RolloutPipeline:
             explore_seed: Optional[int] = None,
             n_explore: Optional[int] = None,
             explore_try_times: int = 1,
-            eval_only: bool = False) -> dict:
+            eval_only: bool = False,
+            explore_mode: str = "fresh") -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -173,10 +174,20 @@ class RolloutPipeline:
         rollouts; successes -> DP retrain data, ALL trajs -> dyn retrain data
         (eval-phase trajs are measurement only and are NOT collected).
 
+        Rescue mode (user 2026-08-23, ``explore_mode="rescue"``): SOE protocol
+        -- explore retries ONLY the failed eval inits (same initial states)
+        ``explore_try_times`` each; DP data = successful retries, dyn data =
+        per failed init {successful retries if any, else FIRST retry}. See
+        :meth:`_run_rescue`.
+
         Returns ``{"metrics": {...},
                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
                    "all_trajs": [every traj of the round, with obs]}``.     # dyn
         """
+        if explore_mode == "rescue":
+            return self._run_rescue(
+                dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
+                try_times=int(explore_try_times), eval_only=eval_only)
         if explore_seed is not None or eval_only:
             return self._run_split(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
@@ -373,6 +384,118 @@ class RolloutPipeline:
             "avg_jerk": _jerk_all_explore_trajs(expl),
             "collected_trajs": len(trajs),
             "n_all_trajs": len(all_trajs),
+        }
+        return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
+
+    # ------------------------------------------------------------------ #
+    def _run_rescue(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
+                    on_progress: Optional[Callable[..., None]] = None,
+                    try_times: int = 5, eval_only: bool = False) -> dict:
+        """SOE rescue protocol (user 2026-08-23) -- explore == eval scenes.
+
+        eval   : the seed-fixed measurement set (``cfg.eval.seed`` -> seeds
+                 seed..seed+n_eval-1, default 42..141, 100 scenes), 1 try
+                 each, NO data collection (record_obs=False).
+        explore: retry ONLY the failed eval inits, ``try_times`` each
+                 (default 5), from the SAME initial states, guided or plain
+                 per ``self.guided`` (SOE run.py:121-149 semantics).
+                 DP data  = every SUCCESSFUL retry (``trajs``).
+                 dyn data = per failed init: its successful retries if any,
+                 else its FIRST retry (``all_trajs``) -- user rule: scenes
+                 solved by exploration contribute their successes, all-failed
+                 scenes contribute one representative (first) trajectory.
+        """
+        horizon = int(self.cfg.eval.horizon)
+        n_eval = int(self.cfg.eval.n_init_states)
+        print(f"[rollout:rescue] dp_ckpt={dp_ckpt} guided={self.guided} "
+              f"eval: n={n_eval} seed={self.base_seed} | "
+              f"explore: failed-of-eval x{try_times} n_envs={self.n_envs}"
+              + (f" vib_ckpt={vib_ckpt}" if self.guided else ""))
+        if self.base_seed is not None:
+            torch.manual_seed(int(self.base_seed))
+            np.random.seed(int(self.base_seed))
+
+        dp = self.dp_factory(dp_ckpt)
+        n_action_steps = int(getattr(dp, "n_action_steps", 1))
+
+        # ---- phase 1: eval on the seed-fixed scene set (measurement only) -- #
+        eval_states = collect_initial_states(
+            self.env_factory, n_init_states=n_eval, base_seed=self.base_seed)
+        eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
+        first_results, _, _ = evaluate_baseline_vec(
+            dp, self.env_factory, eval_states, horizon=horizon,
+            n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
+            n_tries=1, metric_prefix="eval",
+            record_obs=False,                      # eval trajs are NOT data
+            on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
+        )
+        baseline_solved = int(sum(1 for s, _ in first_results if s))
+        n_failed = n_eval - baseline_solved
+        print(f"[rollout:rescue] eval: success_rate={baseline_solved}/{n_eval} "
+              f"({baseline_solved / max(n_eval, 1):.3f}); "
+              f"{n_failed} failed inits -> explore")
+
+        if eval_only:
+            metrics = {
+                "success_rate": success_rate_per_round(first_results),
+                "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+                "baseline_solved": baseline_solved,
+                "n_failed": n_failed,
+                "eval_only": True,
+            }
+            print("[rollout:rescue] eval-only round -- skipping explore phase")
+            return {"metrics": metrics, "trajs": [], "all_trajs": []}
+
+        # ---- phase 2: explore = retry FAILED eval inits -------------------- #
+        if self.guided:
+            if self.scout_vib_factory is None:
+                raise ValueError("guided=True requires a scout_vib_factory")
+            scout_vib = (self.scout_vib_factory(vib_ckpt)
+                         if vib_ckpt is not None else self.scout_vib_factory())
+            self._attach_planner(dp, scout_vib)
+        expl_cb = (lambda p: on_progress("explore", p, baseline_solved, n_eval)
+                   ) if on_progress else None
+        expl = evaluate_exploration_vec(
+            dp, self.env_factory, eval_states, horizon=horizon,
+            try_times=try_times, n_envs=self.n_envs,
+            n_action_steps=n_action_steps, device=self.device,
+            only_failed_of=first_results, guided=self.guided,
+            on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
+        )
+        trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
+        all_trajs: List[dict] = []
+        for e in expl:
+            if e["baseline_solved"]:
+                continue                       # eval-solved scenes add no data
+            if e["solved"]:
+                all_trajs.extend(e["successful_trajs"])
+            else:
+                first = e.get("first_traj")
+                if first is None:
+                    raise RuntimeError(
+                        "rescue: all-failed init has no first_traj "
+                        "(engine must tag try_idx==0)")
+                all_trajs.append(first)
+        rescued = int(sum(1 for e in expl
+                          if e["solved"] and not e["baseline_solved"]))
+        print(f"[rollout:rescue] explore: rescued {rescued}/{n_failed} "
+              f"failed inits; {len(trajs)} successful trajs -> DP retrain; "
+              f"{len(all_trajs)} selected trajs -> dyn retrain")
+        metrics = {
+            "success_rate": success_rate_per_round(first_results),
+            "pass_at_5": pass_at_k(expl, first_results, k=try_times),
+            "avg_jerk": _jerk_all_explore_trajs(expl),
+            "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+            "baseline_solved": baseline_solved,
+            "n_failed": n_failed,
+            "exploration_rescued": rescued,
+            "explore_solved": rescued,
+            "explore_total": n_failed,
+            "explore_try_times": try_times,
+            "collected_trajs": len(trajs),
+            "n_all_trajs": len(all_trajs),
+            "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
+                                    if not s],
         }
         return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
 

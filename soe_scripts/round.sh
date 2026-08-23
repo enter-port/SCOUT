@@ -59,13 +59,33 @@ DATA_ROOT=${DATA_ROOT:?set DATA_ROOT=<experiment dir, e.g. data/2026_8_21/CAN-ex
 DYN_FREEZE_AFTER=${DYN_FREEZE_AFTER:-3}
 SEED=42                       # eval phase: FIXED scene set every round (42..141)
 NEXPLORE=${NEXPLORE:-100}
-ETRIES=1
+# XMODE (user 2026-08-23): explore protocol -- both settings coexist and are
+# switchable by this one parameter.
+#   fresh (default, v3 split): explore = NEXPLORE FRESH scenes (seed
+#       NUM*1000+42) x ETRIES each; ALL explore trajs -> dyn data.
+#   soe (SOE protocol): explore = retry ONLY the failed eval inits (the SAME
+#       scenes/initial states as eval) x ETRIES each (default 5); DP data =
+#       successful retries; dyn data = per failed init {successful retries
+#       if any, else FIRST retry}. Fixed budgets: DP_EPOCHS_SOE=300,
+#       DYN_EPOCHS_SOE=100 (fresh mode keeps adaptive DP / config dyn).
+XMODE=${XMODE:-fresh}
+case "$XMODE" in fresh|soe) ;; *) echo "XMODE must be fresh or soe (got: $XMODE)"; exit 1 ;; esac
+if [ "$XMODE" = soe ]; then ETRIES=${ETRIES:-5}; else ETRIES=${ETRIES:-1}; fi
 NENV=${NENV:-12}              # rollout concurrency (2026-08-22 user: 12 by
                               # default -- fastest tier AND lowest render-
                               # corruption rate; env creation overhead scales
                               # with n_envs and dominates on 100-scene rounds)
 NENV_RETRY=${NENV_RETRY:-6}   # render-corruption retry: halve the EGL surface
-if [ "$A" = BASE ]; then ESEED=0; else ESEED=$((NUM * 1000 + 42)); fi
+if [ "$A" = BASE ]; then ESEED=0
+elif [ "$XMODE" = soe ]; then ESEED=$SEED        # explore targets the eval scene set's failed inits
+else ESEED=$((NUM * 1000 + 42)); fi
+if [ "$XMODE" = soe ]; then
+  EXPLORE_ARGS=(--explore-mode rescue --explore-try-times "$ETRIES")
+  EDESC="failed-of-eval(x$ETRIES)"
+else
+  EXPLORE_ARGS=(--explore-seed "$ESEED" --n-explore "$NEXPLORE" --explore-try-times "$ETRIES")
+  EDESC="$ESEED($NEXPLORE x$ETRIES)"
+fi
 
 export MUJOCO_GL=egl
 export TMPDIR=/tmp            # MUST be local (CPFS TMPDIR kills torch_shm_manager)
@@ -149,7 +169,7 @@ if [ "$A" = BASE ]; then
       dataloader.num_workers=8 dataloader.persistent_workers=true \
       +logging.metric_prefix=DP/ \
       logging.name=DP-s${TSEED}-round0 \
-      logging.project=$WPROJ \
+      logging.project=\'"$WPROJ"\' \
       hydra.run.dir="$TDP/DP-base" \
       > "$TDP/DP-base/train.log" 2>&1
     RC=$?
@@ -164,7 +184,7 @@ if [ "$A" = BASE ]; then
         dataloader.num_workers=0 \
         +logging.metric_prefix=DP/ \
         logging.name=DP-s${TSEED}-round0 \
-        logging.project=$WPROJ \
+        logging.project=\'"$WPROJ"\' \
         hydra.run.dir="$TDP/DP-base" \
         > "$TDP/DP-base/train.log" 2>&1
       RC=$?
@@ -269,14 +289,14 @@ for ATTEMPT in 1 2; do
     log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (validating it)"
   else
     rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5"; rm -rf "$RDIR/log"
-    log "[1/3] rollout guide=$GUIDE try$ATTEMPT n_envs=$NE eval=$SEED(100) explore=$ESEED($NEXPLORE x$ETRIES) dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
+    log "[1/3] rollout guide=$GUIDE try$ATTEMPT n_envs=$NE xmode=$XMODE eval=$SEED(100) explore=$EDESC dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
     RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU $PY -m scout.eval.run_rollout \
       --config configs/eval_${TASK}_exp1.yaml --task "$TASK" --exp-num "$NUM" \
       --base-dp-ckpt "$DPCKPT" \
       --core-hdf5 "$CORE" \
       --guide "$GUIDE" --seed "$SEED" \
-      --eval-seed "$SEED" --explore-seed "$ESEED" \
-      --n-explore "$NEXPLORE" --explore-try-times "$ETRIES" \
+      --eval-seed "$SEED" \
+      ${EXPLORE_ARGS[@]+"${EXPLORE_ARGS[@]}"} \
       --n-envs "$NE" \
       ${EVALONLY[@]+"${EVALONLY[@]}"} \
       ${VIBARGS[@]+"${VIBARGS[@]}"} \
@@ -357,6 +377,11 @@ accum = os.path.join(rdir, "success_accum.hdf5")
 info = merge_accumulated_hdf5(core_path, succs, accum)
 print(f"[dp-accum] merged {info} -> {accum}")
 PYEOF
+if [ "$XMODE" = soe ]; then
+  EP=${DP_EPOCHS_SOE:-300}
+  CKE=150                   # 300ep -> ckpts 149/299 (final epoch is saved)
+  log "[2/3] DP retrain: ${EP}ep (soe fixed budget) ckpt_every=$CKE seed=$TSEED ds=$RDIR/success_accum.hdf5 -> $OUTDP"
+else
 EP=$($PY - "$RDIR/success_accum.hdf5" <<'PYEOF'
 import sys, h5py
 with h5py.File(sys.argv[1], "r") as f:
@@ -372,6 +397,7 @@ if ! [[ "$EP" =~ ^[0-9]+$ ]]; then
 fi
 CKE=$(( EP < 200 ? EP : 200 ))
 log "[2/3] DP retrain: ${EP}ep (adaptive, clamp 100..600) ckpt_every=$CKE seed=$TSEED ds=$RDIR/success_accum.hdf5 -> $OUTDP"
+fi
 RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY train.py \
   --config-path configs --config-name base_dp_${TASK}_image \
   task.dataset_path="$RDIR/success_accum.hdf5" \
@@ -382,7 +408,7 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="
   dataloader.num_workers=8 dataloader.persistent_workers=true \
   +logging.metric_prefix=DP/ \
   logging.name=$WNAME \
-  logging.project=$WPROJ \
+  logging.project=\'"$WPROJ"\' \
   hydra.run.dir="$OUTDP" \
   > "$DPLOG" 2>&1
 RC=$?; T2=$(date +%s)
@@ -399,7 +425,7 @@ if [ $RC -ne 0 ]; then
     dataloader.num_workers=0 \
     +logging.metric_prefix=DP/ \
     logging.name=$WNAME \
-    logging.project=$WPROJ \
+    logging.project=\'"$WPROJ"\' \
     hydra.run.dir="$OUTDP" \
     > "$DPLOG" 2>&1
   RC=$?; T2=$(date +%s)
@@ -415,9 +441,11 @@ if [ "$NUM" -gt "$DYN_FREEZE_AFTER" ]; then
 else
 CFG=$OUTDYN/config.yaml
 NEWDP=$(newest_ckpt "$OUTDP")
-$PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TSEED" "$WPROJ" "$TASK" "$CORE" <<'PYEOF'
+DYN_EPOCHS=0
+[ "$XMODE" = soe ] && DYN_EPOCHS=${DYN_EPOCHS_SOE:-100}
+$PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TSEED" "$WPROJ" "$TASK" "$CORE" "$DYN_EPOCHS" <<'PYEOF'
 import sys, yaml, glob, os, re
-cfg_path, rdir, outdyn, outdp, a_tag, num, tseed, wproj, task, core_path = sys.argv[1:11]
+cfg_path, rdir, outdyn, outdp, a_tag, num, tseed, wproj, task, core_path, dyn_ep = sys.argv[1:12]
 sys.path.insert(0, os.getcwd())
 from scout.eval.hdf5_writer import merge_accumulated_hdf5
 
@@ -442,6 +470,8 @@ if ck:
     cfg["model"]["E_s"]["base_dp_ckpt"] = ck[-1]
 cfg["seed"] = int(tseed)
 cfg["cudnn_deterministic"] = True
+if int(dyn_ep) > 0:
+    cfg["num_epochs"] = int(dyn_ep)   # soe fixed budget (default 100)
 cfg["save_dir"] = outdyn
 cfg.setdefault("wandb", {})["name"] = f"{a_tag}-s{tseed}-round{num}"
 cfg["wandb"]["project"] = wproj
@@ -449,7 +479,7 @@ with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 print(f"[dyn-cfg] seed={tseed} ds={accum} es={ck[-1] if ck else None} -> {outdyn}")
 PYEOF
-log "[3/3] dyn retrain: seed=$TSEED ds=$RDIR/all_accum.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
+log "[3/3] dyn retrain: seed=$TSEED ep=${DYN_EPOCHS:-cfg} ds=$RDIR/all_accum.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
 RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY -m scout.train_vib \
   --config "$CFG" \
   > "$DYNLOG" 2>&1

@@ -131,10 +131,20 @@ def main():
                         "uses i*1000+42 (seeds ..+499 -> 500 scenes). Passing "
                         "this switches the pipeline to the split protocol; "
                         "omitting it keeps the legacy retry-failed-inits mode.")
+    p.add_argument("--explore-mode", choices=["fresh", "rescue"], default="fresh",
+                   help="explore protocol (user 2026-08-23): 'fresh' (default) = "
+                        "split protocol, explore rolls fresh scenes from "
+                        "--explore-seed; 'rescue' = SOE protocol, explore "
+                        "retries ONLY the failed eval inits (same scenes) "
+                        "--explore-try-times each. DP data = successful "
+                        "retries; dyn data = per failed init {successes, else "
+                        "first retry}. --explore-seed/--n-explore ignored.")
     p.add_argument("--n-explore", type=int, default=500,
                    help="split mode: number of explore scenes (default 500)")
     p.add_argument("--explore-try-times", type=int, default=1,
-                   help="split mode: rollouts per explore scene (default 1)")
+                   help="rollouts per explore scene in fresh mode / retries per "
+                        "failed eval init in rescue mode (default 1; rescue "
+                        "drivers pass 5)")
     p.add_argument("--eval-only", action="store_true",
                    help="split protocol but SKIP the explore phase: run the "
                         "seed-fixed eval set once, report success_rate/jerk, "
@@ -167,17 +177,24 @@ def main():
     cfg.eval.seed = args.seed          # base seed for init scenes (pipeline reads it)
     # split-protocol defaults may live in the config (cfg.explore.*); explicit
     # CLI --explore-seed wins. Absent section -> legacy retry-failed mode.
+    # Rescue mode overrides all of this -- the config's explore section must
+    # NOT force split mode when the driver asked for the SOE rescue protocol.
     _exp = getattr(cfg, "explore", None)
-    if args.explore_seed is None and _exp is not None \
-            and getattr(_exp, "base_seed_round1", None) is not None:
-        args.explore_seed = int(_exp.base_seed_round1)
-    if _exp is not None:
-        if getattr(_exp, "n_scenes", None) is not None and args.n_explore == 500:
-            args.n_explore = int(_exp.n_scenes)
-        if getattr(_exp, "try_times", None) is not None \
-                and args.explore_try_times == 1:
-            args.explore_try_times = int(_exp.try_times)
-    split_mode = args.explore_seed is not None or args.eval_only
+    if args.explore_mode == "rescue":
+        args.explore_seed = None
+    else:
+        if args.explore_seed is None and _exp is not None \
+                and getattr(_exp, "base_seed_round1", None) is not None:
+            args.explore_seed = int(_exp.base_seed_round1)
+        if _exp is not None:
+            if getattr(_exp, "n_scenes", None) is not None and args.n_explore == 500:
+                args.n_explore = int(_exp.n_scenes)
+            if getattr(_exp, "try_times", None) is not None \
+                    and args.explore_try_times == 1:
+                args.explore_try_times = int(_exp.try_times)
+    rescue_mode = args.explore_mode == "rescue"
+    split_mode = (not rescue_mode) and (args.explore_seed is not None
+                                        or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = args.guide in ("dyn", "expert") and not args.success_only
@@ -348,6 +365,7 @@ def main():
             n_explore=args.n_explore,
             explore_try_times=args.explore_try_times,
             eval_only=args.eval_only,
+            explore_mode=args.explore_mode,
         )
         metrics = result["metrics"]
 
@@ -467,12 +485,17 @@ def main():
                     "explore_total": metrics["explore_total"],
                 })
             else:
+                # rescue (SOE) and legacy share the retry-failed-inits metric
+                # schema; only the data-selection rules differ (see pipeline).
                 summary.update({
-                    "protocol": "legacy",
+                    "protocol": "rescue" if rescue_mode else "legacy",
                     "pass_at_5": metrics["pass_at_5"],
                     "exploration_rescued": metrics["exploration_rescued"],
-                    "n_baseline_trajs": int(cfg.eval.n_init_states),
                 })
+                if rescue_mode:
+                    summary["explore_try_times"] = metrics["explore_try_times"]
+                else:
+                    summary["n_baseline_trajs"] = int(cfg.eval.n_init_states)
             with open(json_path, "w") as f:
                 json.dump(summary, f, indent=2)
 
