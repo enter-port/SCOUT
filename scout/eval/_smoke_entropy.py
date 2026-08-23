@@ -57,7 +57,7 @@ def main():
     assert x.grad is not None and float(x.grad.abs().sum()) == 0.0
 
     # try 0 of scene 7 executed two chunks -> codes committed at try end
-    acts0 = [np.random.randn(8, Da).astype(np.float32) for _ in range(2)]
+    acts0 = [np.random.randn(1, Da).astype(np.float32) for _ in range(2)]  # 1-step chunks (mock encoder is per-step)
     codes0 = [pl.encode_executed({"v": s_bar[0].numpy()}, c) for c in acts0]
     pl.on_try_done(7, codes0)
     assert len(pl._buffers[7]) == 2
@@ -77,9 +77,11 @@ def main():
     d1 = ((a_near[0] - 0.1 * xg.grad[0]) @ W.T - codes0[0]).norm()
     assert d1 > d0, "gradient must push away from executed codes"
 
-    # row 1 (scene 8, empty buffer) contributes exactly 0 even in a batch
+    # a fresh-scene row (empty buffer) contributes exactly 0
+    pl.set_row_context([8])
     c2 = pl.compute_loss(_x(a_near[1:]), s_bar, reduction="sum")
-    assert float(c2) == 0.0
+    assert float(c2.detach()) == 0.0
+    pl.set_row_context([7, 8])
 
     # batch invariance: row 0's cost alone == its cost in the batch
     c_alone = pl.compute_loss(_x(a_near[:1]), s_bar, reduction="sum")
