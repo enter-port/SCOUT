@@ -225,7 +225,7 @@ def eval_val_mse(model, val_loader, device, val_img_transform, feats_mode=False)
 def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
                    device, out_dir, train_t=None, val_t=None, val_every=20,
                    wandb_run=None, E_s=None, feats_mode=False,
-                   metric_prefix=""):
+                   metric_prefix="", wandb_minimal=False):
     if E_s is None:
         E_s = build_E_s(E_s_cfg)
     model = ScoutVIB(
@@ -348,17 +348,23 @@ def train_one_beta(cfg, train_loader, val_loader, ds, E_s_cfg, action_dim, beta,
               + (f" | val_mse {val_mse:.4f}" if val_mse is not None else ""))
         if wandb_run is not None:
             if metric_prefix:
-                # experiment2 round-run section: dyn/{latent_mse,kl,lr,epoch}.
-                # NO explicit step=epoch here: the resumed round-run's global
-                # counter sits at the DP stage's ~5x10^4 steps and wandb 0.28
-                # drops any explicit step below it (observed 2026-08-18:
-                # every dyn/* row discarded with "monotonically increasing"
-                # warnings). Auto-increment keeps the counter monotonic; the
-                # charts' x-axis is dyn/epoch via define_metric(step_metric).
-                log_d = {metric_prefix + "latent_mse": history["latent_mse"][-1],
-                         metric_prefix + "kl": history["kl"][-1],
-                         metric_prefix + "lr": opt.param_groups[0]["lr"],
-                         metric_prefix + "epoch": epoch}
+                if wandb_minimal:
+                    # formal entropy experiment (2026-08-24): only these keys
+                    log_d = {metric_prefix + "KL-loss": history["kl"][-1],
+                             metric_prefix + "mse-loss": history["latent_mse"][-1],
+                             metric_prefix + "epoch": epoch}
+                else:
+                    # experiment2 round-run section: dyn/{latent_mse,kl,lr,epoch}.
+                    # NO explicit step=epoch here: the resumed round-run's global
+                    # counter sits at the DP stage's ~5x10^4 steps and wandb 0.28
+                    # drops any explicit step below it (observed 2026-08-18:
+                    # every dyn/* row discarded with "monotonically increasing"
+                    # warnings). Auto-increment keeps the counter monotonic; the
+                    # charts' x-axis is dyn/epoch via define_metric(step_metric).
+                    log_d = {metric_prefix + "latent_mse": history["latent_mse"][-1],
+                             metric_prefix + "kl": history["kl"][-1],
+                             metric_prefix + "lr": opt.param_groups[0]["lr"],
+                             metric_prefix + "epoch": epoch}
                 wandb_run.log(log_d)
             else:
                 log_d = {"latent_mse": history["latent_mse"][-1],
@@ -532,22 +538,27 @@ def run(cfg):
         # opt-in metric prefix (experiment2: dyn/* section of a shared
         # round-run; also honors WANDB_RUN_ID resume from the driver)
         metric_prefix = str(wcfg.get("metric_prefix", "") or "")
+        # formal entropy experiment (2026-08-24): wandb.minimal=true ->
+        # only dyn/KL-loss, dyn/mse-loss, dyn/epoch rows
+        wandb_minimal = bool(wcfg.get("minimal", False))
         if metric_prefix:
             wandb.define_metric(metric_prefix + "epoch", hidden=True)
             wandb.define_metric(metric_prefix + "*",
                                 step_metric=metric_prefix + "epoch")
         print(f"wandb: project={wcfg.get('project', 'scout-dynamics')} "
-              f"name={wcfg.get('name')} prefix={metric_prefix or None}")
+              f"name={wcfg.get('name')} prefix={metric_prefix or None}"
+              f" minimal={wandb_minimal}")
     else:
         print("wandb: disabled")
         metric_prefix = ""
+        wandb_minimal = False
 
     val_every = int(getattr(cfg, "val_every", 20))
     print(f"\n=== training β={beta:g} (feats_mode={feats_mode}) ===")
     s = train_one_beta(cfg, train_loader, val_loader, ds, cfg, action_dim, beta, device,
                        run_root, train_t=train_t, val_t=val_t, val_every=val_every,
                        wandb_run=wandb_run, E_s=E_s, feats_mode=feats_mode,
-                       metric_prefix=metric_prefix)
+                       metric_prefix=metric_prefix, wandb_minimal=wandb_minimal)
     print(f"=== done | β={beta:g} | latent_mse={s['latent_mse']:.4f} "
           f"kl={s['kl']:.4f} |μ|={s['mu_abs']:.4f} ===")
 
@@ -555,8 +566,9 @@ def run(cfg):
         yaml.safe_dump(to_plain(s), f, default_flow_style=False)
     if wandb_run is not None:
         # /final = cross-stage summary of the shared round-run (rollout adds
-        # eval/explore, DP retrain adds dp_train_loss)
-        wandb_run.log({"final/dyn_mse_loss": s["latent_mse"], "final/dyn_kl_loss": s["kl"]})
+        # eval/explore, DP retrain adds dp_train_loss) -- dropped in minimal mode
+        if not wandb_minimal:
+            wandb_run.log({"final/dyn_mse_loss": s["latent_mse"], "final/dyn_kl_loss": s["kl"]})
         wandb_run.finish()
     print(f"run_root: {run_root}")
     return run_root

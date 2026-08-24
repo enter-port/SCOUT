@@ -130,6 +130,10 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # the legacy flat keys byte-identical.
         _logging_kwargs = OmegaConf.to_container(cfg.logging, resolve=True)
         _metric_prefix = _logging_kwargs.pop('metric_prefix', '') or ''
+        # formal entropy experiment (2026-08-24): +logging.wandb_minimal=true
+        # reduces the wandb surface to one DP/loss + DP/epoch row per epoch.
+        # json_logger keeps the full local record either way.
+        _wandb_minimal = bool(_logging_kwargs.pop('wandb_minimal', False))
         wandb_run = wandb.init(
             dir=str(self.output_dir),
             config=OmegaConf.to_container(cfg, resolve=True),
@@ -268,7 +272,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
-                            _wandb_log(step_log, self.global_step)
+                            if not _wandb_minimal:
+                                _wandb_log(step_log, self.global_step)
                             json_logger.log(step_log)
                             self.global_step += 1
 
@@ -375,7 +380,11 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
                 # end of epoch
                 # log of last step is combined with validation and rollout
-                _wandb_log(step_log, self.global_step)
+                if _wandb_minimal:
+                    _wandb_log({'loss': train_loss, 'epoch': self.epoch},
+                               self.global_step)
+                else:
+                    _wandb_log(step_log, self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
@@ -384,7 +393,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # shared round-run (rollout logs eval/explore, train_vib logs dyn) --
         # direct wandb_run.log so the key lands in final/, not DP/. Legacy
         # standalone runs (no metric_prefix) stay byte-identical.
-        if _metric_prefix:
+        if _metric_prefix and not _wandb_minimal:
             wandb_run.log({'final/dp_train_loss': train_loss})
 
 @hydra.main(

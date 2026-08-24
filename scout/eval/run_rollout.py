@@ -181,6 +181,11 @@ def main():
                    help="wandb run dir (default --output-dir)")
     p.add_argument("--no-wandb", action="store_true",
                    help="disable wandb live logging")
+    p.add_argument("--wandb-minimal", action="store_true",
+                   help="formal entropy experiment (2026-08-24): log ONLY "
+                        "eval/success_rate + explore/pass@10; the creator also "
+                        "pre-registers the DP/loss and dyn/KL-loss, dyn/mse-loss "
+                        "axes for the retrain stages that resume this run")
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
@@ -272,7 +277,23 @@ def main():
                 dir=args.wandb_dir or out_dir,
                 tags=list(wcfg.get("tags", ["step2", "rollout"])) + [args.task],
             )
-            if split_mode:
+            if args.wandb_minimal:
+                # formal entropy experiment (user 2026-08-24): ONLY these keys
+                # ever reach this run. The creator must pre-register EVERY
+                # section's axes here (2026-08-18 lesson: define_metric calls
+                # from the resuming retrain processes cannot override the
+                # panel config of an already-created run; explicit per-name
+                # defs dispatch immediately, globs do not).
+                wandb.define_metric("eval_init_done", hidden=True)
+                wandb.define_metric("explore_init_done", hidden=True)
+                wandb.define_metric("eval/success_rate", step_metric="eval_init_done")
+                wandb.define_metric("explore/pass@10", step_metric="explore_init_done")
+                wandb.define_metric("DP/epoch", hidden=True)
+                wandb.define_metric("DP/loss", step_metric="DP/epoch")
+                wandb.define_metric("dyn/epoch", hidden=True)
+                for _n in ("KL-loss", "mse-loss"):
+                    wandb.define_metric(f"dyn/{_n}", step_metric="dyn/epoch")
+            elif split_mode:
                 # experiment2+ layout: one wandb run per ROUND. THIS process
                 # CREATES the run, so it must pre-register the metric axes of
                 # EVERY section here -- define_metric calls from the later
@@ -328,7 +349,12 @@ def main():
         if phase == "eval":
             completed = int(payload.get("completed", 0))
             succ = int(payload.get("successes", 0))
-            if split_mode:
+            if args.wandb_minimal:
+                wandb_run.log({
+                    "eval/success_rate": succ / max(completed, 1),
+                    "eval_init_done": completed,
+                })
+            elif split_mode:
                 wandb_run.log({
                     "eval/env_done": completed,
                     "eval/success_rate": succ / max(completed, 1),
@@ -344,7 +370,13 @@ def main():
             jn = int(payload.get("jerk_n", 0))
             js = float(payload.get("jerk_sum", 0.0))
             avg_jerk = js / jn if jn > 0 else 0.0
-            if split_mode:
+            if args.wandb_minimal:
+                p10 = (baseline_solved + solved_failed) / max(n_total, 1)
+                wandb_run.log({
+                    "explore/pass@10": p10,
+                    "explore_init_done": eid,
+                })
+            elif split_mode:
                 wandb_run.log({
                     "explore/env_done": eid,
                     "explore/success_count": solved_failed,
@@ -473,9 +505,15 @@ def main():
                     N = int(cfg.eval.n_init_states)
                     wandb_run.log({"eval/success_rate": metrics["success_rate"],
                                    "eval_init_done": N})
-                    wandb_run.log({"rollout/pass@5": metrics["pass_at_5"],
-                                   "rollout/avg_jerk": metrics["avg_jerk"],
-                                   "explore_init_done": metrics["n_failed"]})
+                    if args.wandb_minimal:
+                        if "pass_at_5" in metrics:   # value = pass@(try_times)
+                            wandb_run.log({
+                                "explore/pass@10": metrics["pass_at_5"],
+                                "explore_init_done": metrics["n_failed"]})
+                    else:
+                        wandb_run.log({"rollout/pass@5": metrics["pass_at_5"],
+                                       "rollout/avg_jerk": metrics["avg_jerk"],
+                                       "explore_init_done": metrics["n_failed"]})
 
             # ---- JSON summary ------------------------------------------------- #
             summary = {
