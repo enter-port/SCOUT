@@ -36,6 +36,7 @@ Successful rollouts (``record_obs=True``) feed the augmented-hdf5 write-back
 from __future__ import annotations
 
 import copy
+import gc
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -620,7 +621,34 @@ class RobomimicScoutEnvAdapter:
         return np.array(self.env.env.sim.get_state().flatten())
 
     def close(self):
-        if hasattr(self.env, "close"):
+        # robomimic's EnvRobosuite has no close(), so without an explicit
+        # teardown the sim<->render_context cycle only dies at some later
+        # gc pass -- whose finalizers then unbind the thread's EGL current
+        # context and free GL objects by name in the *current* context,
+        # freezing/corrupting every live env's offscreen rendering
+        # (2026-08-25 root cause; experiments/egl_render_corruption_root_cause.md).
+        # Destroy the robosuite sim NOW, inside this safe window.
+        inner = getattr(self.env, "env", None)       # robosuite Environment
+        destroy = getattr(inner, "_destroy_sim", None)
+        if destroy is not None:
+            try:
+                # capture the render context BEFORE the sim is freed, then
+                # run its finalizer work explicitly: sim.free()'s own
+                # gc.collect() runs with the sim pinned by free()'s frame,
+                # and stray references can keep the context collectable-only
+                # at some arbitrary later gc pass.
+                rc = getattr(getattr(inner, "sim", None),
+                             "_render_context_offscreen", None)
+                destroy()       # _destroy_sim -> sim.free(): breaks the cycle
+                if rc is not None:
+                    rc.con.free()       # idempotent-safe: gl names already
+                    rc.gl_ctx.free()    # freed no-op; gl_ctx.free() guards
+                # sweep the now-harmless dead-graph shells in this safe
+                # window instead of some arbitrary later gc pass.
+                gc.collect()
+            except Exception:
+                pass
+        elif hasattr(self.env, "close"):
             self.env.close()
 
 
