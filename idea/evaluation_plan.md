@@ -1,6 +1,8 @@
 # 评估方案:SOE 怎么评,SCOUT 怎么评
 
 > 配套 `long_term_plan.md` 阶段 1 的 go/no-go。
+>
+> **cost 注记(2026-08-24)**:§二.1 中围绕"目标 z"的判据(命中 z_θ(s,a)≈z、一致性)与梯度式 `∇_a‖z−z_θ‖²` 对应 **v0 NLL cost**;现行正式 cost = **entropy cost**(后验 KL 到 DP 意图后验,见 [`entropy_cost.md`](entropy_cost.md))——生死诊断照旧(∂(μ,logvar)/∂a 非零,cost 对 a 有梯度),但「命中」判据换成「KL(q_a‖q_{a⁰}) 随引导上升、κ 封顶后梯度归零」;task 级指标(success rate / Pass@k / yield / jerk)不受影响。
 
 ---
 

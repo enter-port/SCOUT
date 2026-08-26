@@ -3,6 +3,7 @@
 > **状态**:设计已与用户逐节确认;**任何代码落实仍需用户审核**。
 > **相关**:[`idea.md`](idea.md)(导师原始 idea)、[`stage1_plan.md`](stage1_plan.md)(实验计划)、[`evaluation_plan.md`](evaluation_plan.md)(评估口径)、memory `lpb-reference.md`(LPB 参考)。
 > **优先级**:与 `stage1_plan.md` 冲突处以本文档为准。
+> **cost 修订(2026-08-24)**:测试期 guidance cost 已由 v0(`‖z−z_θ‖`/NLL,采样 z)改为 **entropy cost**(方案三,`-min(KL(q_φ(z|s̄,a)‖q_φ(z|s̄,a⁰)),κ)`),不再从先验采样 z;权威推导见 [`entropy_cost.md`](entropy_cost.md)。§4 的注入机制不变,只换 cost 定义。
 > **架构基线(2026-08-08 修订)**:`E_s` = **LPB 式双输入**(image + proprio **永远同时**进:冻结 base-DP ResNet + 训练的 proprio embed)。**没有 low_dim/image 两种模式、没有 stage1/stage2 之分**——一条管线,永远 image+proprio。数据用 robomimic **image** 数据集。
 
 ---
@@ -13,14 +14,14 @@
 
 1. **冻结 base Diffusion Policy(image DP)**——其 **ResNet 编码器冻结复用**给 `E_s`(LPB 式);base DP 自身不更新。
 2. **潜空间 VIB 动力学模型**——`E_s`(双输入:image + proprio)→ `s̄_t`;VIB 学 skill 潜空间 `z`;目标 $\max\ I(Z;S_{t+1}\mid S_t) - \beta\,I(Z;A_t\mid S_t)$。
-3. **测试期 classifier guidance**——采样 `z`,在 base DP 去噪循环把动作推向"编码回去 $\approx z$",产生有意义的多样性探索,驱动 self-improvement。
+3. **测试期 classifier guidance(entropy cost)**——在 base DP 去噪循环注入 cost 梯度,把候选动作的编码后验推离 DP 自身无引导意图的后验("做策略不会做的事"),产生有意义的多样性探索,驱动 self-improvement。
 
 **与 idea 的已知偏离(LP B 式所致)**:idea 写"base DP 训练时不在场";但 LPB 式 `E_s` **复用 base DP 的冻结 ResNet** → VIB 训练时 base DP 的**编码器在线(冻结、不更新)**。这是为图像输入(必须有编码器),LPB 已验证可行。base DP 的其余部分(动作解码器等)仍不在场。
 
 **代码来源 + 复用边界(关键,防混淆)**:
 - **LPB 可复用 —— 全是「非动力学」件**:base DP(`DiffusionUnetHybridImagePolicy`)、数据(`RobomimicImageDynamicsModelDataset`)、**E_s 前端编码器**(`ResNetEncoder` + `ProprioceptiveEmbedding`,只做 `obs → s̄_t`)、guidance 注入(`guided_conditional_sample`)。
 - **SCOUT 自研 —— = dynamics 本身,LPB 没有,绝不能 fork**:`VIB_enc → z(变分 skill)→ D_s` + latent/KL loss。**LPB 的 `z` 是确定性 embedding(无 μ,logvar/KL);SCOUT 的 `z` 是采样的变分 skill —— 结构根本不同**。dynamics 必须 SCOUT 自己写(已在 `scout/model/`)。
-- SCOUT cost(`‖z−z_θ‖`,z_θ=reparam 采样=p_θ(s̄_t,a);**注意非均值 μ**——见 §4)+ self-improvement loop 同为自研。
+- SCOUT cost(现行 **entropy cost**,后验 KL 到 DP 意图后验,见 §4;v0 曾用 `‖z−z_θ‖`/NLL)+ self-improvement loop 同为自研。
 - 实现:方案 B —— 在当前 `scout/` 上把 SOE 件逐个换成 LPB 的**非动力学件**;dynamics 保持 SCOUT 自研。
 
 ---
@@ -39,9 +40,9 @@
   E_s = 冻结 base-DP ResNet(image, per-view)+ 训练 proprio embed → concat → s̄_t   (永远两个同时进)
   loss = latent MSE( ŝ̄_{t+1}, E_s(S_{t+1}).detach() ) + β·KL    (latent 级监督 = LPB;无 state decoder)
 
-测试(D_s 下线;只用 z_θ + 冻结 base DP):
-  z ~ N(0,I)  整段 chunk 定住
-  → 在 base DP 去噪循环注入 ∇_{x_t}[ −‖z − z_θ(s̄_t, a)‖ ]   (z_θ=reparam 采样=p_θ(s̄_t,a);LPB 范式,详见 §4)
+测试(D_s 下线;只用 VIB 编码器 q_φ + 冻结 base DP;不再采样 z):
+  a⁰ = DP 无引导意图(每 chunk 首个 guided 去噪步捕获一次)
+  → 在 base DP 去噪循环注入 ∇_{x_t}[ min(KL(q_φ(z|s̄_t,a) ‖ q_φ(z|s̄_t,a⁰)), κ) ]   (entropy cost;LPB 注入范式,详见 §4)
 ```
 
 **永远 image + proprio 同时输入**(LPB 式),无 low_dim/image 模式之分、无 stage 分。**无 state decoder、不解码**;D_s 预测 next-latent(下一帧 ResNet 特征 + proprio,特征空间非像素)→ #1 风险(像素预测)规避。
@@ -111,12 +112,12 @@ for t in scheduler.timesteps:
 - 改 $x_t$、不改 ε;然后正常 `scheduler.step`。
 - 缩放 $\eta\sqrt{1-\bar\alpha_t}$(Dhariwal & Nichol 标准式)。
 
-**SCOUT 的 cost 函数**(替换 LPB 的 NN 距离):
-$$\text{cost}(\hat{x}_0,\, s) \;=\; \text{mean}_t\,\big\|\,z - z_\theta(s̄_t,\, a_t)\,\big\|_2,\quad a = \hat{x}_0,\ \ s̄_t = E_s(\{image, proprio\})\ \text{(定住)},\ \ z\ \text{整段定住}$$
-$z_\theta = \text{reparam}(\text{VIB\_enc}(s̄_t,a_t))$ = p_θ(s̄_t,a_t) 即 **reparam 采样的 skill**(逐 chunk 步)。**非均值 μ**——见 §4 注(μ-only 会让 KL 压制 ∂μ/∂a 使 guidance 失效)。
+**SCOUT 的 cost 函数**(替换 LPB 的 NN 距离;2026-08-24 定稿 = **entropy cost**,即方案三,逐步推导见 [`entropy_cost.md`](entropy_cost.md)):
+$$\text{cost}(\hat{x}_0,\, s) \;=\; -\min\big(\mathrm{KL}(q_\phi(z\mid \bar s_t, a)\,\|\,q_\phi(z\mid \bar s_t, a^0)),\ \kappa\big),\qquad a=\mathrm{bridge}(\hat x_0),\ \ \kappa=2.5\ \text{nats}$$
+$a^0$ = 本块 DP 无引导意图动作(基线,每 chunk 首个 guided 去噪步捕获一次)。KL 为对角高斯闭式解,均值差按 $1/\sigma^{0\,2}_i$ 马氏加权——度量"候选动作的行为编码离策略习惯行为多远";$\nabla_{x_t}\text{cost}$ 即 KL 的梯度上升(封顶前)。κ 封顶 + DP 先验 = 两个信任域(引导后采样分布 $\propto p_{DP}\cdot e^{\min(\mathrm{KL},\kappa)}$)。**不再从先验采样目标 z**(v0 曾用 $\text{mean}_t\|z-z_\theta(\bar s_t,a_t)\|_2$/高斯 NLL,z 整段定住——需外部 z 目标且 guidance↔数据正反馈致梯度膨胀,弃用;实现保留 `scout/guidance/cost.py`)。
 
 **门控**:
-- (a) `t < guidance_start_timestep`(最后 K 步引导)→ **保留**(标准 CG 做法)。
+- (a) `t < guidance_start_timestep` → **机制保留**;正式 entropy 实验取 gst=100(全程引导)、η=guidance_scale=3.0、批内 sum 归约(1/B bug 修复后,并发 env 数不稀释梯度)。
 - (b) LPB 的 OOD 门 `current_cost > threshold` → **去掉**(SCOUT 是探索,每个 chunk 都主动引导;且无 expert-latent NN 距离)。
 
 **归一化桥**(实现细节):cost 里要把 base DP(SOE 归一化)的动作 **unnormalize → 再 normalize 进 VIB 空间**(参照 LPB `dyn_model/planner.py:211-213`)。
@@ -146,7 +147,7 @@ Round 1:  DP₁ vs DP₀ 性能对比;多轮滚,success rate / round 应单调�
 
 **默认参数(沿用 SOE,可调)**:core demos = core_20;初始态 N = 100;探索 try_times = 5;轮数 6;成功判定——sim 用 `env.is_success()["task"]`(成功即止),真机人标 j / k / d。
 
-**前置 action 级闸门(建议,跑 loop 前过)**:生死诊断 $\|\partial\mu/\partial a\|$(敏感比 = $\|\partial\mu/\partial a\|\cdot\sigma_a / \sigma_\mu$,阈值 ~0.3)、guidance 三判据(多样性 / 一致性 / Cost 方向)、on-manifold(jerk / Mahalanobis)。
+**前置 action 级闸门(建议,跑 loop 前过)**:生死诊断 $\|\partial\mu/\partial a\|$(敏感比 = $\|\partial\mu/\partial a\|\cdot\sigma_a / \sigma_\mu$,阈值 ~0.3)、guidance 三判据(多样性 / KL 偏离上升 / Cost 方向)、on-manifold(jerk / Mahalanobis)。
 
 **实现依赖**:step 3 / 5 需 robomomxic sim rollout + 判成功 → 用 LPB / SOE 的 robomimic rollout 脚手架。在 robomimic **lift image** 上跑。回灌参照 SOE `run_full_multi_round.py`(写增强 hdf5 + `scout_aug` mask),**不用** in-memory buffer。
 

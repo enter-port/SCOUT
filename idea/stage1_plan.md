@@ -5,6 +5,8 @@
 > 实现遵循「代码须经用户审核」(memory `code-requires-user-approval`)。
 >
 > **本次修订(2026-08-11)**:去掉原 E1 的 β 扫描 + E2/E3 action 闸门,改成 **Step 0→4 线性端到端**,先用 **lift** 跑通一轮(can/square 同配方跟进)。
+>
+> **cost 注记(2026-08-24)**:本文 Step 2 描述的 cost(mean_t‖z−z_θ‖,z 从先验采样、整段定住)是 **v0 设计**,且"最后 K 步引导"已改为全程(gst=100);现行正式 cost = **entropy cost**(`-min(KL(q_φ(z|s̄,a)‖q_φ(z|s̄,a⁰)),κ)`,κ=2.5,不再采样 z),推导见 [`entropy_cost.md`](entropy_cost.md),注入参数 η=3.0/sum 归约。本文其余流程(eval→explore→回灌)仍有效。
 
 ---
 

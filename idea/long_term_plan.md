@@ -2,6 +2,8 @@
 
 > 目标：把导师给的 classifier-guided exploration idea 落地到学长 SOE 工作同等成熟度（仿真 benchmark + multi-round self-improvement + 真机 + 论文）。
 > 制定日期：2026-08-06。
+>
+> **cost 注记（2026-08-24）**：下文阶段 1「推 guidance 可实现性：Cost=‖z−z_θ(s,a)‖」为 v0 表述；现行正式 cost = **entropy cost**（后验 KL 到 DP 意图后验，见 [`entropy_cost.md`](entropy_cost.md)）。
 
 ## 核心判断（贯穿全程的最大风险）
 

@@ -5,8 +5,9 @@
 - 训练：输入转移三元组 $(S_t,\ A_{t:t+fs},\ S_{t+fs})$（fs=8，robomimic image 演示数据）。
   一切先过状态编码器进入 latent 空间：产出 $\hat{\bar s}_{t+1}$，与真实
   $\bar s_{t+1}=E_s(S_{t+fs})$ 比较（**latent 级**比较，不重建像素/状态）。
-- 测试：输入观测 $s$ + $z\sim\mathcal N(0,I)$（每条 rollout 采样一个 z，
-  **整段定住、跨 chunk 不变**）；输出动作 $a$（被引导的 base DP 生成）。
+- 测试：输入观测 $s$ + DP 无引导意图基线 $a^0$（每 chunk 首个 guided
+  去噪步捕获一次）；输出动作 $a$（被引导的 base DP 生成）。
+  **不再从先验采样目标 z**（entropy cost 以 DP 自身意图为参照系，见 §5）。
   测试时用到 $E_s$ + VIB 编码器 + base DP；**动力学解码器不用**。
 
 ## 2. 涉及的网络（共 4 个）
@@ -93,7 +94,7 @@ z (B,16) ⊕ s̄_t (B,1088)
 （c）训练 / 采样：
 ```
 训练: 干净动作 chunk 加噪到随机 t → UNet 预测 ε → MSE(ε̂, ε)
-采样: 100 步 DDPM（guidance 只注入最后 50 步）→ x̂₀ (B,16,10)
+采样: 100 步 DDPM（entropy 配置全程 100 步注入 guidance，gst=100）→ x̂₀ (B,16,10)
       →[unnormalize：10 维 6d → 7 维 axis-angle]→ 取 [1:1+8] 执行 8 步
 ```
 - 参数量：UNet can/lift/square **255.6M**、transport **263.5M**；视觉 2 视角 ~22.4M（4 视角 ~44.8M）。
@@ -116,10 +117,12 @@ z (B,16) ⊕ s̄_t (B,1088)
   规避 world-model 级难度（设计上的 #1 风险规避）。
 - 第②项（KL，解析）：$\beta\,KL=-\tfrac{\beta}{2}\sum_i\big(1+\log\sigma_i^2-\mu_i^2-\sigma_i^2\big)$
   （= 代码里的 $\tfrac{\beta}{2}\sum_i(\mu_i^2+\sigma_i^2-1-\log\sigma_i^2)$，同一式）。
-  β 把 z 压向 $\mathcal N(0,I)$ 先验 —— 训练后 kl→0、μ→0 是**预期结果而非 bug**，
-  这样测试时 z~N(0,I) 盲采才有意义。
+  β 把 z 压向 $\mathcal N(0,I)$ 先验 —— KL 被压低是**预期结果而非 bug**
+  （free_bits 设逐维 KL 地板防完全坍缩；先验作为编码器的合法参照系保留，
+  即便测试期已不再从先验采样目标 z）。
 - **内在张力**：KL 压制 z 对 a 的依赖（∂μ/∂a→0），而测试 guidance 需要 cost 对 a
-  有梯度；靠 σ 通道化解（见 §5 双通道）。
+  有梯度；entropy cost 的 KL 同时经 μ 与 logvar 双通道传动（见 §5），β 由坍缩
+  扫描定标（正式实验 3e-5）。
 
 ## 4. 训练前向链路与梯度回传
 
@@ -131,44 +134,52 @@ z (B,16) ⊕ s̄_t (B,1088)
   - **可训练参数 = {proprio 嵌入, VIB 编码器, D_s}**；base-DP ResNet
     `requires_grad=False` 且固定 eval（BN 不动），梯度为 None。
 
-## 5. 测试阶段：classifier-guided 探索
+## 5. 测试阶段：classifier-guided 探索（entropy cost）
 
 - 用 E_s + VIB 编码器 + 冻结 base DP；动力学解码器测试时不用。
-- z：每条 rollout 采样一次 $z\sim\mathcal N(0,I)$，整段定住（SOE 是每 chunk 重采，
-  我们是 per-trajectory）；$\bar s_t$ 在每个 chunk 内定住（整段去噪循环缓存一次 E_s 前向）。
-- **Cost（核心；2026-08-14 定稿为高斯 NLL）**：
-  $\text{Cost}(a,z\mid s)=-\log q_\theta(z\mid\bar s_t,a)
-  =\tfrac12\sum_i\big[\tfrac{(z_i-\mu_i)^2}{\sigma_i^2}+\log\sigma_i^2\big]$，
-  即 VIB 编码器输出的**分布** $q_\theta=\mathcal N(\mu,\mathrm{diag}\,\sigma^2)$ 对采样
-  skill $z$ 的负对数似然（classifier guidance 的原生形式，$\nabla_a[-\text{Cost}]
-  =\nabla_a\log q_\theta(z\mid\bar s_t,a)$；相比早期 reparam-L2 版少一次 ε 采样、梯度
-  方差更低；梯度双通道 $\tfrac{z_i-\mu_i}{\sigma_i^2}\cdot\partial\mu_i/\partial a
-  +\big[\tfrac{(z_i-\mu_i)^2}{\sigma_i^3}-\tfrac1{\sigma_i}\big]\cdot
-  \partial\sigma_i/\partial a$）。
-  这里的 a 是 DP 干净估计 $\hat a_0$ 的前 8 步展平（80 维，与训练时 encoder 输入对齐）。
+- **不再采样目标 z**；$\bar s_t$ 在每个 chunk 内定住（整段去噪循环缓存一次 E_s 前向）。
+- **Cost（核心；2026-08-24 定稿为 entropy cost，即方案三；完整推导见 [`entropy_cost.md`](entropy_cost.md)）**：
+  $$\text{Cost}(a\mid\bar s_t)=-\min\big(\mathrm{KL}(q_\phi(z\mid\bar s_t,a)\,\|\,q_\phi(z\mid\bar s_t,a^0)),\ \kappa\big),\qquad \kappa=2.5\ \text{nats}$$
+  - $a=\text{bridge}(\hat a_0)$：DP 干净估计的前 8 步展平（80 维，与训练时 encoder 输入对齐）；$a^0$ = 同一块尚未被引导修改时 DP 的无引导意图（基线，每 chunk 捕获一次）；
+  - KL 为对角高斯闭式解，均值差按 $1/\sigma^{0\,2}_i$ 马氏加权——度量「候选动作的行为编码离策略习惯行为多远」；$\nabla_a[-\text{Cost}]$ = KL 的梯度上升（封顶前），经 μ 与 logvar 双通道传动；
+  - κ 封顶 + DP 先验 = 两个信任域：引导后采样分布 $\propto p_{DP}\cdot e^{\min(\mathrm{KL},\kappa)}$；
+  - 设计来源：$\max I(Z;S')$ 中 $H(S')$ 不可直接计算（需未来状态密度）→ 确定性解码器推前引理（后验不动 ⇒ 未来分布不动）→ DIAYN 变分界的同一 z 差分（先验相消）= 后验间 KL → 封顶（六步推导见 entropy_cost.md §3）。
 - score 分解（概念框架）：
-  $$\nabla_a\log p(a\mid s)=\nabla_a\log\bar p_{DP}(a\mid s)+\nabla_a[-\text{Cost}(a,z\mid s)]$$
-- 去噪循环（t=100→0，**仅 t<50 的最后 50 步**注入 guidance）：
+  $$\nabla_a\log p(a\mid s)=\nabla_a\log\bar p_{DP}(a\mid s)+\nabla_a[-\text{Cost}(a\mid s)]$$
+- 去噪循环（t=100→0，**全程 100 步注入**，gst=100；η=guidance_scale=3.0；批内 sum 归约）：
   1. DP 看（带噪 $a_t$、步 t、obs）→ 去噪方向 $\varepsilon_\theta$
   2. 由 $\varepsilon_\theta$ 推一步干净估计 $\hat a_0$（`pred_original_sample`）
   3. 算 Cost($\hat a_0$)，对带噪轨迹取梯度 $\nabla_{a_t}\text{Cost}$，
      乘缩放加到**带噪轨迹**上：
      $$a_t\leftarrow a_t-\eta\sqrt{1-\bar\alpha_t}\;\nabla_{a_t}\text{Cost}$$
-     （注意：加在带噪样本上，**不是**加在去噪方向上）
+     （注意：加在带噪样本上，**不是**加在去噪方向上；sum 归约保证每行梯度
+     不随并发 env 数稀释——1/B bug 修复，见 `guidance_batch_scaling_bug.md`）
   4. 用原 $\varepsilon_\theta$ 沿调整后的 $a_t$ 走一步 DDPM 反步 → $a_{t-1}$
-  5. 走完得：既在 DP 支集上、又朝着"重新编码回去正好等于 z"走的动作块
+  5. 走完得：既在 DP 支集上、又把行为编码推离策略习惯后验的动作块
 
-## 6. 采样 z 的意义
+> **v0 旧版 cost（历史，2026-08-14 定稿、08-24 弃用）**：高斯 NLL
+> $-\log q_\theta(z\mid\bar s_t,a)$（z 从先验采样、每条 rollout 定住；expert 模式
+> 从 bank 选 z*）——「把动作推向能命中给定 skill 的方向」。因需要外部 z 目标
+> （成功率对 z 组敏感）且 guidance↔训练数据正反馈致梯度膨胀
+> （`../experiments/e2_scout_guidance_gradient_analysis.md`），被 entropy cost 取代；
+> 实现保留在 `scout/guidance/cost.py`（`--guide dyn`/`expert`）。
 
-- base DP 自跑只给默认动作（无探索）；采 z = 在"合法 skill 空间"挑目标，逼 DP 生成奔向它的动作 → 探索多样性
-- 从 $\mathcal N(0,I)$ 采：训练 KL 已把真实 skill 压到标准正态附近 → 采到的是"合法 skill"
-- 每个 rollout 一个 z（跨 chunk 定住）：让同一条轨迹有连贯的"目标"，而非每步换目标
+## 6. 为什么不再采样 z（2026-08-24 起）
+
+- 旧机制的 z 有两个作用：选探索目标（从先验采「合法 skill」）+ 轨迹内连贯
+  （per-trajectory 定住）。代价：探索质量押在 z 组上（同 seed 不同 batch 结构 →
+  不同 z 组 → 成功率波动），且 KL 压制 ∂μ/∂a 使「命中 z」越来越难。
+- entropy cost 把探索方向内生化：参照系 = DP 自身意图 $a^0$，无需外部目标；
+  「离策略习惯多远」由编码器自己的后验度量，κ 封顶控制偏离幅度；轨迹连贯性
+  由 DP 先验（采样分布主体）保证。
+- 重试语境下这正合需求：失败场景的失败模式就是 DP 的习惯行为，重试要的
+  就是「策略不会做的动作」。
 
 ## 7. 代码位置与训练超参
 
 - E_s：`scout/model/encoder.py`；VIB：`scout/model/vib.py` + `scout/model/scout_vib.py`
 - 训练：`scout/train_vib.py`（config `configs/vib_{task}_image.yaml`）
-- Cost：`scout/guidance/cost.py`；planner：`scout/guidance/planner.py`
+- Cost：**entropy cost** `scout/guidance/entropy_costs.py`（AtypicalCostPlanner，CLI `--guide atypical --atypical-cap 2.5`；同文件另有方案二 Novelty 与 Combo 组合）；v0 NLL `scout/guidance/cost.py`（`--guide dyn`/`expert`）；planner：`scout/guidance/planner.py`
 - 去噪循环：`scout/guidance/policy.py`（`guided_conditional_sample`）
 - base DP：`diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py`（config `configs/base_dp_{task}_image.yaml`）
 
@@ -177,5 +188,5 @@ z (B,16) ⊕ s̄_t (B,1088)
 | batch / lr | 64 / 1e-4 AdamW(0.95,0.999) eps 1e-8 wd 1e-6 | 256 / 1e-3 AdamW(0.9,0.999) wd 1e-6 |
 | 调度 | cosine warmup 500，EMA(0.75) | — |
 | 轮数 | 600 epoch，rollout/ckpt 每 20 | 300 epoch × 200 step，val 10% demos |
-| 其他 | seed 42 | β=1e-3，seed 233，frameskip 8 |
+| 其他 | seed 42 | β=3e-5（正式 entropy 实验；早期 1e-3），seed 233（TSEED），frameskip 8 |
 

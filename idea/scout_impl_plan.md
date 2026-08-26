@@ -3,6 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development(推荐)或 superpowers:executing-plans 逐任务实现。步骤用 `- [ ]` 跟踪。
 > **权威设计**:[`scout_design.md`](scout_design.md);**实验口径**:[`stage1_plan.md`](stage1_plan.md)。本文档冲突处以设计文档为准。
 > **约束**:遵循「代码须经用户审核」(memory `code-requires-user-approval`)——本计划是规划、不是代码;真正落代码每个任务都要可审核、可回退,且整体执行前需用户点头。
+>
+> **cost 注记(2026-08-24)**:本文规划的 `guidance/cost.py`(‖z−z_θ‖,reparam 采样)是 v0;现行正式 cost = **entropy cost**(`scout/guidance/entropy_costs.py`,方案三;另有方案二 Novelty 与 Combo),推导见 [`entropy_cost.md`](entropy_cost.md)。
 
 **Goal:** 在 robomimic `lift` low_dim 上实现并验证 SCOUT(VIB 潜空间动力学 + LPB 式 classifier guidance + self-improvement loop),跑到 go/no-go。
 

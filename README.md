@@ -28,9 +28,9 @@ SCOUT 本意为「侦察 / 探索」，恰好对应本方法的核心——**探
 
 - **base Diffusion Policy**：预训练、**冻结**。负责生成合法动作，提供去噪 score；训练时不在场。
 - **VIB 动力学模型**：一个编码器 + 一个 next-state 解码器，学习一个与 $\mathcal N(0,I)$ 对齐的 skill 潜空间。
-- **测试时 classifier guidance**：从 $\mathcal N(0,I)$ 采样一个 skill 目标 $z$，在 DP 的去噪循环里注入 Cost 梯度，把动作推向「能命中该 skill」的方向。
+- **测试时 classifier guidance（entropy cost）**：在 DP 的去噪循环里注入 Cost 梯度，把候选动作的编码后验推离 **DP 自身无引导意图**的后验——即「做策略自己不会做的事」（cost 定义见下文 §2，完整推导见 [`idea/entropy_cost.md`](idea/entropy_cost.md)）。
 
-冻结的 base DP 自己只会输出默认动作（无探索）；SCOUT 通过给定 skill 目标，逼它生成奔向不同 skill 的动作，从而产生**有意义的多样性探索**。
+冻结的 base DP 自己只会重复同类动作（无探索）；SCOUT 用 entropy cost 给重试动作一个明确、可控的「偏离习惯行为」方向，从而产生**有意义的多样性探索**。
 
 ### 与 SOE 的对比
 
@@ -39,7 +39,7 @@ SCOUT 建立在学长 [SOE](https://arxiv.org/abs/2509.19292)（*Sample-Efficien
 |  | SOE | SCOUT |
 |---|---|---|
 | 信息瓶颈 | action reconstruction（动作低维、好预测） | next-state prediction（抓住「要把状态带成什么样」） |
-| 探索方式 | 潜空间加噪 $z=\mu+\sigma\varepsilon\cdot\alpha$ | classifier guidance（去噪每步加 Cost 梯度） |
+| 探索方式 | 潜空间加噪 $z=\mu+\sigma\varepsilon\cdot\alpha$ | classifier guidance（entropy cost，去噪每步加 Cost 梯度） |
 | base DP | 训练时与插件共享 | 冻结，训练时不在场 |
 | skill 来源 | 观测压缩潜空间 | $(s,a)\to$ skill 语义潜空间 |
 
@@ -70,25 +70,28 @@ $$\mathcal{L} = \underbrace{-\mathbb{E}_{z \sim \bar{p}_\theta(z|S_t,A_t)} \log 
 
 前向是一条直链，单次 `loss.backward()` 即可，无需梯度隔离（base DP 本就冻结、不在场）。
 
-### 2. 测试阶段：classifier-guided 探索
+### 2. 测试阶段：classifier-guided 探索（entropy cost）
 
-测试时**只用编码器的 $\mu$ 和冻结的 base DP**，动力学解码器下线。
-
-```
-z ~ N(0, I)        # 从先验采样一个 skill 目标，整段生成定住
-```
+测试时**只用 VIB 编码器 $q_\phi$ 和冻结的 base DP**，动力学解码器下线；**不再从先验采样目标 $z$**——引导的参照系换成 DP 自己的无引导意图动作 $a^0$（每个动作块的第一个 guided 去噪步捕获一次）。
 
 **score 分解**（注入 DP 去噪循环）：
-$$\nabla_a \log p(a \mid s) = \nabla_a \log \bar{p}_{DP}(a \mid s) + \nabla_a[-Cost(a, z \mid s)]$$
+$$\nabla_a \log p(a \mid s) = \nabla_a \log \bar{p}_{DP}(a \mid s) + \nabla_a[-Cost(a \mid s)]$$
 
 - 第一项：base DP 自身的去噪方向；
-- 第二项：Cost 梯度，把动作往「编码回去正好等于 $z$」的方向推。
+- 第二项：entropy cost 梯度——把动作往「编码后验偏离 DP 意图后验」的方向推（KL 梯度上升，封顶前）。
 
-$$Cost(a, z \mid s) = -\log q_\theta(z \mid s, a) = \tfrac{1}{2}\sum_i\Big[\tfrac{(z_i - \mu_i(s,a))^2}{\sigma_i(s,a)^2} + \log \sigma_i(s,a)^2\Big]$$
+$$Cost(a \mid s) = -\min\Big(\mathrm{KL}\big(q_\phi(z \mid \bar s, a)\,\big\|\,q_\phi(z \mid \bar s, a^0)\big),\ \kappa\Big)$$
 
-（高斯 NLL：编码分布 $q_\theta$ 对采样 skill $z$ 的负对数似然；梯度双通道 $\tfrac{z_i-\mu_i}{\sigma_i^2}\cdot\partial\mu_i/\partial a + \big[\tfrac{(z_i-\mu_i)^2}{\sigma_i^3}-\tfrac{1}{\sigma_i}\big]\cdot\partial\sigma_i/\partial a$，无 ε 采样、梯度方差低于 reparam-L2）
+- $q_\phi(z\mid\bar s,\cdot)=\mathcal N(\mu_\phi,\mathrm{diag}\,\sigma_\phi^2)$：VIB 编码器（16 维 skill 潜空间）；$\bar s = E_s(o)$（冻结视觉前端摘要，块内缓存）；$a=\mathrm{bridge}(\hat x_0)$：回到编码器训练动作空间的 80 维动作块；
+- $a^0$：本块 DP 无引导意图动作——KL 度量「候选动作的行为编码离策略习惯行为多远」；
+- 对角高斯 KL 有闭式解，均值差按 $1/\sigma^{0\,2}_i$ 马氏加权（意图后验越确定的维度，偏离罚得越重）；
+- $\kappa = 2.5$ nats：KL 封顶——与 DP 先验构成两个信任域；引导后采样分布 $\propto p_{DP}\cdot e^{\min(\mathrm{KL},\kappa)}$，似然至多放大 $e^\kappa\approx 12$ 倍。
 
-**去噪循环**（$t = T \to 0$）：每步先取 DP 去噪方向，再算 Cost 对 $a$ 的梯度、乘缩放叠加，沿调整方向走一步（并加随机噪声）。走完得到的动作**既在 DP 支集上、又朝着目标 skill $z$ 走**——这就是受控的探索。
+**设计来源**（DIAYN 一脉）：探索目标 $\max\ I(Z;S')=H(S')-H(S'\mid Z)$ 中 $H(S')$ 不可直接计算（需要未来状态密度）；由确定性解码器的推前引理，**后验不动的动作不可能改变未来分布**，于是以「后验相对意图的移动量」（DIAYN 变分界的同一 $z$ 差分 = 后验间 KL）为可计算代理。逐步推导与论文依据见 [`idea/entropy_cost.md`](idea/entropy_cost.md)。
+
+**去噪循环**（$t = T \to 0$，全程引导）：每步先取 DP 去噪方向与干净估计 $\hat x_0$，算 $Cost$ 对带噪轨迹 $x_t$ 的梯度、乘 $\eta\sqrt{1-\bar\alpha_t}$（$\eta=3.0$，批内 sum 归约——每行梯度不随并发 env 数稀释）叠加，沿调整方向走一步（并加随机噪声）。走完得到的动作**既在 DP 支集上、又偏离策略习惯行为**——这就是受控的探索。
+
+> **历史（v0 cost）**：曾用 $Cost=-\log q_\theta(z\mid s,a)$（高斯 NLL，$z$ 从 $\mathcal N(0,I)$ 采样、每条 rollout 定住）——「给定 skill 目标，逼动作编码回去等于 $z$」。因需要外部 $z$ 目标且 guidance↔训练数据存在正反馈（梯度膨胀，`experiments/e2_scout_guidance_gradient_analysis.md`），2026-08-24 被 entropy cost 取代为正式方法；实现保留在 `scout/guidance/cost.py`（`--guide dyn` / `expert`）。
 
 ### 3. Self-improvement 闭环
 
@@ -124,11 +127,12 @@ SCOUT/                              # 当前分支:impl/scout-stage1
 ├── dyn_model/                      # 【LPB 复用】E_s 前端：ResNetEncoder + proprio embed + robomimic image dataset
 ├── scout/                          # 【SCOUT 自研】
 │   ├── model/                      #   scout_vib（VIB dynamics）、encoder（StateEncoder）、vib（VIB enc / D_s）
-│   ├── guidance/                   #   policy（ScoutPolicy）、planner（ScoutPlanner）、cost（−log q_θ(z|s,a) 高斯 NLL）
+│   ├── guidance/                   #   policy（ScoutPolicy 注入）、planner、entropy_costs（★现行 entropy cost/方案二三）、cost（旧 NLL）、expert_bank
 │   └── eval/                       #   rollout、metrics、self_improvement（multi-round 闭环）
 └── idea/                           # 研究构思 + 落地计划 + 组会笔记
     ├── idea.md / idea_notes.md     #   导师原始 idea + 流程梳理
     ├── scout_design.md             #   ★ 权威设计文档（LPB 对齐架构，冲突以此为准）
+    ├── entropy_cost.md             #   ★ entropy cost 推导（现行 guidance cost）
     ├── stage1_plan.md / evaluation_plan.md
     └── long_term_plan.md / group_meeting_notes.md
 ```
@@ -255,6 +259,8 @@ source /root/workspace/baojiachun/.venv/bin/activate   # 或直接 .venv/bin/pyt
 ✅ **Stage-1 已实现（branch `impl/scout-stage1`）。** SCOUT 三件套 —— VIB 动力学模型（`scout/model/`）、classifier guidance 去噪路径（`scout/guidance/`）、multi-round self-improvement 闭环 + eval（`scout/eval/`）—— 均已落地，采用 **LPB 对齐架构**：base DP 复用 LPB 的 `DiffusionUnetHybridImagePolicy`（冻结，其 ResNet 给 `E_s` 复用）；dynamics 是 SCOUT 自研的 VIB（`VIB_enc → z → D_s` + latent MSE + βKL），与 LPB 的确定性 embedding 结构不同，未 fork。每步 mock/合成验证通过。服务器环境（uv，py3.10 / torch 2.4.1+cu121）已配好并验证：SCOUT/LPB 全模块 import + H20 CUDA（见上方「环境配置」）。
 
 ⏳ **真实验 deferred。** E0 base DP 训练 / E1 β 扫描 + 生死诊断 / E4 multi-round loop 尚未实跑 —— 缺 robomimic lift **image** 数据、训好的 base-DP checkpoint，以及 5 个集成点（robomimic env adapter、LPB ckpt load、core demo 提取、round warm-start、ScoutPolicy 实例化）的真实验证。落地路线见 `idea/long_term_plan.md`，**权威设计见 `idea/scout_design.md`**（正文若与之冲突，以 `scout_design.md` 为准）。
+
+> 📝 **2026-08 更新**：上述「deferred」为 stage-1 完成时点的快照。此后 base DP / VIB / multi-round 已在服务器实跑（e2–e5 系列实验，见 `experiments/experiment_log.md`）；**正式 entropy-cost 实验**（can，3 seed × DP/SCOUT 双臂，SOE rescue 口径 ×10 重试，`--guide atypical`）自 2026-08-24 起运行（服务器 `data/2026_8_21_entropy/`，驱动 `soe_scripts/round_entropy.sh`）。
 
 ---
 
