@@ -1,0 +1,5 @@
+#!/bin/bash
+# stage-B round-2 loop: guided rescue with the IMPROVED DP (sb_n5t10 299.ckpt, SR 0.70)
+cd /root/workspace/baojiachun/scout-entropy
+mkdir -p data/entropy_e2e/full3_s3t10
+exec env CUDA_VISIBLE_DEVICES=4 SCOUT_RENDER_GPU=4 MUJOCO_GL=egl TMPDIR=/tmp PYTHONUNBUFFERED=1   /root/workspace/baojiachun/.venv/bin/python -m scout.eval.run_rollout   --config configs/eval_att_s30_g100.yaml --task can   --base-dp-ckpt /root/workspace/baojiachun/scout-entropy/data/entropy_e2e/sb3_accum/dp/checkpoints/299.ckpt   --vib-ckpt /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/train/dyn/dyn-base/20260823-115415/scout_vib.ckpt   --core-hdf5 /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/rollout/can_core.hdf5   --guide atypical --atypical-cap 2.5 --seed 42 --eval-seed 42 --explore-mode rescue --explore-try-times 10   --n-init-states 100 --n-envs 12 --no-wandb   --output-dir data/entropy_e2e/full3_s3t10   --output-success data/entropy_e2e/full3_s3t10/success.hdf5   --output-all data/entropy_e2e/full3_s3t10/all.hdf5   > data/entropy_e2e/full3_s3t10/stdout.log 2>&1

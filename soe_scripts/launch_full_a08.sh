@@ -1,0 +1,5 @@
+#!/bin/bash
+# entropy-dev: atypical s=0.5 gst=80, full 100 scenes, rescue protocol
+cd /root/workspace/baojiachun/scout-entropy
+mkdir -p data/entropy_e2e/full_a08
+exec env CUDA_VISIBLE_DEVICES=3 SCOUT_RENDER_GPU=3 MUJOCO_GL=egl TMPDIR=/tmp PYTHONUNBUFFERED=1   /root/workspace/baojiachun/.venv/bin/python -m scout.eval.run_rollout   --config configs/eval_att_a3.yaml --task can   --base-dp-ckpt /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/train/DP/DP-base/checkpoints/599.ckpt   --vib-ckpt /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/train/dyn/dyn-base/20260823-115415/scout_vib.ckpt   --core-hdf5 /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/rollout/can_core.hdf5   --guide atypical --seed 42 --eval-seed 42 --explore-mode rescue --explore-try-times 5   --n-init-states 100 --n-envs 12 --no-wandb   --output-dir data/entropy_e2e/full_a08   --output-success data/entropy_e2e/full_a08/success.hdf5   --output-all data/entropy_e2e/full_a08/all.hdf5   > data/entropy_e2e/full_a08/stdout.log 2>&1

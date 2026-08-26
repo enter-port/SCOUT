@@ -1,0 +1,5 @@
+#!/bin/bash
+# entropy-dev: combo cost (novelty h0.5 w0.5 + atypical k2.5 w1.0) scale 2.0 gst100
+cd /root/workspace/baojiachun/scout-entropy
+mkdir -p data/entropy_e2e/full_na
+exec env CUDA_VISIBLE_DEVICES=6 SCOUT_RENDER_GPU=6 MUJOCO_GL=egl TMPDIR=/tmp PYTHONUNBUFFERED=1   /root/workspace/baojiachun/.venv/bin/python -m scout.eval.run_rollout   --config configs/eval_att_s20_g100.yaml --task can   --base-dp-ckpt /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/train/DP/DP-base/checkpoints/599.ckpt   --vib-ckpt /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/train/dyn/dyn-base/20260823-115415/scout_vib.ckpt   --core-hdf5 /root/workspace/baojiachun/scout/data/2026_8_21/CAN-exp1-233-ee/can/rollout/can_core.hdf5   --guide combo --novelty-h 0.5 --atypical-cap 2.5   --combo-nov-weight 0.5 --combo-att-weight 1.0   --seed 42 --eval-seed 42 --explore-mode rescue --explore-try-times 5   --n-init-states 100 --n-envs 12 --no-wandb   --output-dir data/entropy_e2e/full_na   --output-success data/entropy_e2e/full_na/success.hdf5   --output-all data/entropy_e2e/full_na/all.hdf5   > data/entropy_e2e/full_na/stdout.log 2>&1

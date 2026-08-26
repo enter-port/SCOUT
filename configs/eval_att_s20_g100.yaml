@@ -1,0 +1,51 @@
+seed: 42
+base_dp:
+  initial_ckpt_path: /root/workspace/baojiachun/scout/data/experiment2/can/train/DP/DP-base/checkpoints/580.ckpt
+  config_name: base_dp_can_image
+  config_dir: configs
+vib:
+  ckpt_path: /root/workspace/baojiachun/scout/data/experiment2/can/train/dyn/dyn-base/scout_vib.ckpt
+  base_dp_ckpt: /root/workspace/baojiachun/scout/data/experiment2/can/train/DP/DP-base/checkpoints/580.ckpt
+  view_names:
+  - agentview_image
+  - robot0_eye_in_hand_image
+  proprio_dim: 9
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+dataset:
+  path: /root/workspace/baojiachun/scout/data/experiment2/can/rollout/can_core.hdf5
+  core_filter_key: core_20
+action_dim: 10
+eval:
+  n_init_states: 100
+  try_times: 5
+  horizon: 300
+  n_envs: 12              # 2026-08-22 user: 25 -> 12 (speed probe: 12 fastest tier, lowest corruption)
+  log_every: 10
+  view_names:
+  - agentview_image
+  - robot0_eye_in_hand_image
+  proprio_keys:
+  - robot0_eef_pos
+  - robot0_eef_quat
+  - robot0_gripper_qpos
+exploration:
+  guidance_scale: 2.0
+  guidance_start_timestep: 100
+self_improvement:
+  num_rounds: 6
+  scout_aug_mask: scout_aug
+  num_epochs: 1500
+wandb:
+  use_wandb: true
+  project: scout-eval
+  tags:
+  - step2
+  - eval
+device: auto
+log_dir: logs/scout_eval_can_image
+explore:
+  base_seed_round1: 1042
+  n_scenes: 100
+  try_times: 1
