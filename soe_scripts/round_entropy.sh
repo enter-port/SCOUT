@@ -63,11 +63,8 @@ NEXPLORE=${NEXPLORE:-100}
 XMODE=${XMODE:-soe}
 case "$XMODE" in fresh|soe) ;; *) echo "XMODE must be fresh or soe (got: $XMODE)"; exit 1 ;; esac
 if [ "$XMODE" = soe ]; then ETRIES=${ETRIES:-10}; else ETRIES=${ETRIES:-1}; fi
-NENV=${NENV:-12}              # rollout concurrency (2026-08-22 user: 12 by
-                              # default -- fastest tier AND lowest render-
-                              # corruption rate; env creation overhead scales
-                              # with n_envs and dominates on 100-scene rounds)
-NENV_RETRY=${NENV_RETRY:-6}   # render-corruption retry: halve the EGL surface
+NENV=50                        # 2026-08-26 user order: every arm (SCOUT+DP)
+                               # runs env=50 (old default 12; render gate gone)
 if [ "$A" = BASE ]; then ESEED=0
 elif [ "$XMODE" = soe ]; then ESEED=$SEED        # explore targets the eval scene set's failed inits
 else ESEED=$((NUM * 1000 + 42)); fi
@@ -270,58 +267,41 @@ T0=$(date +%s)
 log "=== ROUND $TASK a=$A seed=$TSEED round=$NUM mode=$MODE START (GPU$GPU; rollout DP=$DPROLL vib=${VIBDIR:-none}; eval_seed=$SEED explore_seed=$ESEED) ==="
 
 # ---- [1/3] rollout: SPLIT protocol (eval fixed scenes + explore fresh) ---- #
-# Render-corruption guard (2026-08-22): after the rollout, vis_validate the
-# explore images in all.hdf5; on CORRUPT, delete the outputs and retry ONCE
-# at NENV_RETRY (fewer concurrent envs = smaller EGL surface). Two strikes ->
-# FATAL (chain stops loudly instead of training on blind-policy data).
+# Render gate REMOVED (2026-08-26 user order): vis_validate's thresholds were
+# calibrated on can (agentview tstd healthy 3.4-14.4 / noise 27-32); square's
+# healthy demos measure 17.6-27.4 (both seeds' offline-rendered core data) and
+# straddle the >20 noise line, so its CORRUPT verdicts on square were false
+# positives. Single-shot rollout now; rc!=0 -> stop (no retry, no validation).
 GUIDE=off; GEXTRA=()
 [ "$A" = SCOUT ] && { GUIDE=atypical; GEXTRA=(--atypical-cap "$ATT_CAP"); }
 NE=$NENV
-ROLLOUT_OK=0
-for ATTEMPT in 1 2; do
-  if [ "${SKIP_ROLLOUT:-0}" = 1 ] && [ "$ATTEMPT" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
-    log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (validating it)"
-  else
-    rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5"; rm -rf "$RDIR/log"
-    log "[1/3] rollout guide=$GUIDE try$ATTEMPT n_envs=$NE xmode=$XMODE eval=$SEED(100) explore=$EDESC dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
-    RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU $PY -m scout.eval.run_rollout \
-      --config configs/eval_${TASK}_entropy.yaml --task "$TASK" --exp-num "$NUM" \
-      --base-dp-ckpt "$DPCKPT" \
-      --core-hdf5 "$CORE" \
-      --guide "$GUIDE" --seed "$SEED" \
-      --eval-seed "$SEED" \
-      ${EXPLORE_ARGS[@]+"${EXPLORE_ARGS[@]}"} \
-      --n-envs "$NE" \
-      ${EVALONLY[@]+"${EVALONLY[@]}"} \
-      ${VIBARGS[@]+"${VIBARGS[@]}"} \
-      ${GEXTRA[@]+"${GEXTRA[@]}"} \
-      --wandb-minimal \
-      --output-dir "$RDIR" \
-      --output-success "$RDIR/success.hdf5" \
-      --output-all "$RDIR/all.hdf5" \
-      --wandb-name "$WNAME" \
-      --wandb-project "$WPROJ" \
-      > "$RLOG" 2>&1
-    RC=$?
-    if [ $RC -ne 0 ]; then
-      log "[1/3] rollout rc=$RC (attempt $ATTEMPT, n_envs=$NE) -- see $RLOG"
-      [ "$MODE" = "eval-only" ] && { log "ROLLOUT FAILED (eval-only, no retry data)"; exit 1; }
-      NE=$NENV_RETRY
-      continue
-    fi
-  fi
-  T1=$(date +%s)
-  if [ "$MODE" = "eval-only" ] || [ ! -f "$RDIR/all.hdf5" ]; then
-    ROLLOUT_OK=1; break     # eval-only writes no all.hdf5 -- nothing to check
-  fi
-  if "$PY" soe_scripts/vis_validate.py "$RDIR/all.hdf5" 20 > "$RDIR/validate.log" 2>&1; then
-    log "[1/3] rollout images HEALTHY (attempt $ATTEMPT, n_envs=$NE)"
-    ROLLOUT_OK=1; break
-  fi
-  log "[1/3] RENDER CORRUPT (attempt $ATTEMPT, n_envs=$NE): $(grep -m1 CORRUPT "$RDIR/validate.log")"
-  NE=$NENV_RETRY
-done
-[ $ROLLOUT_OK -eq 1 ] || { log "ROLLOUT FAILED - render corruption persisted after retry - see $RDIR/validate.log"; exit 1; }
+if [ "${SKIP_ROLLOUT:-0}" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
+  log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5"
+else
+  rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5"; rm -rf "$RDIR/log"
+  log "[1/3] rollout guide=$GUIDE n_envs=$NE xmode=$XMODE eval=$SEED(100) explore=$EDESC dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
+  RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU $PY -m scout.eval.run_rollout \
+    --config configs/eval_${TASK}_entropy.yaml --task "$TASK" --exp-num "$NUM" \
+    --base-dp-ckpt "$DPCKPT" \
+    --core-hdf5 "$CORE" \
+    --guide "$GUIDE" --seed "$SEED" \
+    --eval-seed "$SEED" \
+    ${EXPLORE_ARGS[@]+"${EXPLORE_ARGS[@]}"} \
+    --n-envs "$NE" \
+    ${EVALONLY[@]+"${EVALONLY[@]}"} \
+    ${VIBARGS[@]+"${VIBARGS[@]}"} \
+    ${GEXTRA[@]+"${GEXTRA[@]}"} \
+    --wandb-minimal \
+    --output-dir "$RDIR" \
+    --output-success "$RDIR/success.hdf5" \
+    --output-all "$RDIR/all.hdf5" \
+    --wandb-name "$WNAME" \
+    --wandb-project "$WPROJ" \
+    > "$RLOG" 2>&1
+  RC=$?
+  [ $RC -ne 0 ] && { log "[1/3] rollout rc=$RC (n_envs=$NE) -- see $RLOG"; exit 1; }
+fi
+T1=$(date +%s)
 
 # the rollout json carries the shared wandb run id for the retrains
 RID=$($PY - "$RDIR/log" <<'PYEOF'
