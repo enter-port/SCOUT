@@ -1,0 +1,63 @@
+# vib_square_exp1.yaml -- v3 dyn training template, SQUARE (2026-08-26).
+# Copy of vib_can_exp1.yaml (formal entropy experiment lineage); square
+# dataset placeholders only, knobs identical (beta 3e-5, free_bits 0.005,
+# failure_weight 1). round_entropy.sh overlays at runtime: dataset.zarr_path,
+# dataset.feature_cache, model.E_s.base_dp_ckpt, seed, cudnn_deterministic,
+# save_dir, wandb.{name,project,minimal}.
+seed: 233
+dataset:
+  zarr_path: /root/workspace/baojiachun/scout/data/robomimic/square/ph/image_v141_abs_core20.hdf5
+  view_names:
+  - agentview_image
+  - robot0_eye_in_hand_image
+  abs_action: true
+  feature_cache: true
+  use_crop: true
+  original_img_size: 84
+  cropped_img_size: 76
+  action_dim: 10
+  frameskip: 8
+  num_workers: 0
+  shape_obs:
+    robot0_eef_pos:
+      shape: [3]
+    robot0_eef_quat:
+      shape: [4]
+    robot0_gripper_qpos:
+      shape: [2]
+    agentview_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+model:
+  E_s:
+    base_dp_ckpt: /root/workspace/baojiachun/scout/data/2026_8_14/experiment1/square/train/DP/DP-base/checkpoints/580.ckpt
+    view_names: [agentview_image, robot0_eye_in_hand_image]
+    proprio_dim: 9
+    proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+beta: 3.0e-05
+free_bits: 0.005
+failure_weight: 1
+optimizer:
+  name: AdamW
+  params:
+    lr: 0.001
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-06
+  lr_scheduler: cosine
+  warmup_epochs: 5
+batch_size: 256
+num_epochs: 300
+steps_per_epoch: 100
+val_ratio: 0.1
+val_every: 20
+save_dir: /root/workspace/baojiachun/scout-entropy/data/2026_8_26_entropy/SQUARE-entropy-s233/square/train/dyn/dyn-base
+use_wandb: true
+wandb:
+  project: SQUARE-8-26-entropy
+  name: SQUARE-round0
+  metric_prefix: dyn/
