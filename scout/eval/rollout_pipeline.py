@@ -180,6 +180,19 @@ class RolloutPipeline:
                     att_weight=float(ek.get("combo_att_weight", 1.0)),
                 )
             print(f"[rollout] entropy cost guidance: mode={self.guide_mode} {ek}")
+        elif self.guide_mode.startswith("rand_"):
+            # entropy-random-dev registry (user 2026-08-27): idea plugins in
+            # scout/guidance/rand_costs/<name>.py; auto-discovered, shared
+            # files never edited per-idea (conflict-management contract).
+            from scout.guidance.rand_costs import REGISTRY
+            token = self.guide_mode[4:]
+            if token not in REGISTRY:
+                raise SystemExit(f"[rollout] unknown rand idea '{token}' "
+                                 f"(have: {sorted(REGISTRY)})")
+            ek = dict(self.entropy_kwargs or {})
+            planner = REGISTRY[token](scout_vib, bridge=bridge,
+                                      obs_adapter=obs_adapter, ek=ek)
+            print(f"[rollout] rand cost guidance: idea={token} {ek}")
         else:
             planner = ScoutPlanner(scout_vib, bridge=bridge,
                                    obs_adapter=obs_adapter, z=None)

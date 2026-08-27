@@ -78,9 +78,7 @@ def main():
                         "Required for full rollout; optional for --success-only "
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
-    p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo", "shell"],
-                   default="off",
+    p.add_argument("--guide", default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
                         "(z* = nearest core-data bank entry per action chunk; "
@@ -94,6 +92,8 @@ def main():
                         "'shell' = 方案A: per-retry random target posterior on "
                         "the kappa-shell of the intent posterior (SOE spray in "
                         "cost form; needs --vib-ckpt); "
+                        "'rand_<idea>' = entropy-random-dev registry plugin "
+                        "(scout/guidance/rand_costs/; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
     p.add_argument("--novelty-h", type=float, default=5.0,
                    help="novelty KDE kernel width floor, in units of the "
@@ -109,6 +109,10 @@ def main():
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
                         "from the intent posterior (default 2.5)")
+    p.add_argument("--rand-kwargs", default="",
+                   help="rand_<idea> plugins: comma-separated k=v pairs "
+                        "merged into entropy_kwargs (floats auto-parsed); "
+                        "idea-specific knobs WITHOUT touching shared code")
     p.add_argument("--combo-nov-weight", type=float, default=1.0,
                    help="combo: weight of the novelty cost term (default 1.0; "
                         "0.5 at scale 2.0 keeps its force at the h0.5/s1.0 "
@@ -197,6 +201,22 @@ def main():
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
+    # --guide validation: static set + auto-discovered rand registry
+    # (entropy-random-dev, 2026-08-27; free-form instead of argparse choices)
+    from scout.guidance.rand_costs import REGISTRY as _RAND
+    _static = ("dyn", "off", "expert", "novelty", "atypical", "combo", "shell")
+    if not (args.guide in _static or (args.guide.startswith("rand_")
+                                      and args.guide[4:] in _RAND)):
+        p.error(f"--guide must be one of {_static} or rand_<idea>, "
+                f"ideas available: {sorted(_RAND)} (got {args.guide!r})")
+    rand_ek = {}
+    for kv in filter(None, args.rand_kwargs.split(",")):
+        k, _, v = kv.partition("=")
+        try:
+            rand_ek[k.strip()] = float(v)
+        except ValueError:
+            rand_ek[k.strip()] = v.strip()
+
     cfg = load_cfg(args.config)
     cfg.base_dp.initial_ckpt_path = args.base_dp_ckpt
     if args.vib_ckpt is not None:
@@ -233,8 +253,9 @@ def main():
                                         or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
-    guided = args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell") and not args.success_only
+    guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
+                             "shell") or args.guide.startswith("rand_")
+              ) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -424,7 +445,8 @@ def main():
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
-                        "shell_seed": args.seed},
+                        "shell_seed": args.seed,
+                        **rand_ek},
     )
     try:
         result = pipeline.run(
