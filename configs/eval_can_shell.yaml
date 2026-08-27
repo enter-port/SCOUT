@@ -1,0 +1,63 @@
+seed: 42
+# eval_can_shell.yaml -- 方案A shell cost (user 2026-08-27), injection-matched
+# to the 方案三 operating point. Copy of eval_can_entropy.yaml with ONLY
+# exploration.guidance_scale changed: the first shell run (kappa 2.5, scale
+# 3.0) measured mean_inject ~= 26 (telemetry) vs atypical's calibrated ~1.0 --
+# the shell cost starts at kappa downhill force (~ sqrt(2*kappa)/sigma0 per
+# dim) where atypical starts at zero gradient and only ramps to the cap, so
+# equal eta means ~26x the pull.  User order: match mean_inject to the
+# original.  eta = 3.0 / 26 ~= 0.115.  kappa stays 2.5 nats (target radius is
+# semantic; the pull STRENGTH lives in eta).
+# Stale absolute paths below are ALWAYS overridden by run_rollout CLI
+# (--base-dp-ckpt / --vib-ckpt / --core-hdf5); dataset.path is the merge
+# template source and follows --core-hdf5 (run_rollout.py:197).
+base_dp:
+  initial_ckpt_path: /root/workspace/baojiachun/scout/data/experiment2/can/train/DP/DP-base/checkpoints/580.ckpt
+  config_name: base_dp_can_image
+  config_dir: configs
+vib:
+  ckpt_path: /root/workspace/baojiachun/scout/data/experiment2/can/train/dyn/dyn-base/scout_vib.ckpt
+  base_dp_ckpt: /root/workspace/baojiachun/scout/data/experiment2/can/train/DP/DP-base/checkpoints/580.ckpt
+  view_names:
+  - agentview_image
+  - robot0_eye_in_hand_image
+  proprio_dim: 9
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+dataset:
+  path: /root/workspace/baojiachun/scout/data/experiment2/can/rollout/can_core.hdf5
+  core_filter_key: core_20
+action_dim: 10
+eval:
+  n_init_states: 100
+  try_times: 5
+  horizon: 300
+  n_envs: 12              # 2026-08-22 user: 25 -> 12 (speed probe: 12 fastest tier, lowest corruption)
+  log_every: 10
+  view_names:
+  - agentview_image
+  - robot0_eye_in_hand_image
+  proprio_keys:
+  - robot0_eef_pos
+  - robot0_eef_quat
+  - robot0_gripper_qpos
+exploration:
+  guidance_scale: 0.115            # 2026-08-27 user: match 方案三 mean_inject ~1.0 (= 3.0/26)
+  guidance_start_timestep: 100    # full denoise window (same as 方案三)
+self_improvement:
+  num_rounds: 6
+  scout_aug_mask: scout_aug
+  num_epochs: 1500
+wandb:
+  use_wandb: true
+  project: CAN-8-24-entropy
+  tags:
+  - formal
+  - entropy
+device: auto
+log_dir: logs/scout_eval_can_image
+explore:
+  base_seed_round1: 1042
+  n_scenes: 100
+  try_times: 1
