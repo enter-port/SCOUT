@@ -156,8 +156,10 @@ class RShellCostPlanner(ShellTargetCostPlanner):
             l1s = [round(float(lam1[i]), 3) for i in range(B)]
             l2s = [round(float(S[i, 1]), 3) if S.shape[1] > 1 else 0.0
                    for i in range(B)]
+            l3s = [round(float(S[i, 2]), 3) if S.shape[1] > 2 else 0.0
+                   for i in range(B)]
             print(f"[rshell-probe] call#{self._probe_calls} rows={B} "
-                  f"r={rs} lam1={l1s} lam2={l2s}", flush=True)
+                  f"r={rs} lam1={l1s} lam2={l2s} lam3={l3s}", flush=True)
 
     def _u_for(self, row: int, key, device, dtype) -> torch.Tensor:
         """Unit direction for batch-row ``row`` (uses the CURRENT chunk's
