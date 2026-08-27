@@ -206,7 +206,7 @@ def main():
     from scout.guidance.rand_costs import REGISTRY as _RAND
     _static = ("dyn", "off", "expert", "novelty", "atypical", "combo", "shell")
     if not (args.guide in _static or (args.guide.startswith("rand_")
-                                      and args.guide[4:] in _RAND)):
+                                      and args.guide[5:] in _RAND)):
         p.error(f"--guide must be one of {_static} or rand_<idea>, "
                 f"ideas available: {sorted(_RAND)} (got {args.guide!r})")
     rand_ek = {}

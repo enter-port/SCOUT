@@ -185,7 +185,7 @@ class RolloutPipeline:
             # scout/guidance/rand_costs/<name>.py; auto-discovered, shared
             # files never edited per-idea (conflict-management contract).
             from scout.guidance.rand_costs import REGISTRY
-            token = self.guide_mode[4:]
+            token = self.guide_mode[5:]
             if token not in REGISTRY:
                 raise SystemExit(f"[rollout] unknown rand idea '{token}' "
                                  f"(have: {sorted(REGISTRY)})")
