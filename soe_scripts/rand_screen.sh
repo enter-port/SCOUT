@@ -35,6 +35,7 @@ $PY -m scout.eval.run_rollout \
   --vib-ckpt "$D/train/dyn/dyn-base/20260824-232156/scout_vib.ckpt" \
   --core-hdf5 "$D/rollout/can_core.hdf5" \
   --guide "$GUIDE" --seed 42 --eval-seed 42 \
+  --atypical-cap 2.5 \
   --explore-mode rescue --explore-try-times 10 \
   --n-init-states 20 --n-envs 20 \
   --no-wandb \
