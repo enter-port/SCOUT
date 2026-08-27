@@ -79,7 +79,8 @@ def main():
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
     p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo"], default="off",
+                                        "atypical", "combo", "shell"],
+                   default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
                         "(z* = nearest core-data bank entry per action chunk; "
@@ -90,6 +91,9 @@ def main():
                         "KL to the policy's own unguided-intent encoder "
                         "(方案三; needs --vib-ckpt); 'combo' = novelty + "
                         "atypical summed (方案二+三; needs --vib-ckpt); "
+                        "'shell' = 方案A: per-retry random target posterior on "
+                        "the kappa-shell of the intent posterior (SOE spray in "
+                        "cost form; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
     p.add_argument("--novelty-h", type=float, default=5.0,
                    help="novelty KDE kernel width floor, in units of the "
@@ -101,6 +105,10 @@ def main():
                         "per-chunk fixed eps (1, default) or at mu (0)")
     p.add_argument("--atypical-cap", type=float, default=10.0,
                    help="atypical: cap on the KL bonus in nats (default 10)")
+    p.add_argument("--shell-kappa", type=float, default=2.5,
+                   help="shell (方案A): target-shell radius in nats -- the "
+                        "random target posterior sits exactly this many nats "
+                        "from the intent posterior (default 2.5)")
     p.add_argument("--combo-nov-weight", type=float, default=1.0,
                    help="combo: weight of the novelty cost term (default 1.0; "
                         "0.5 at scale 2.0 keeps its force at the h0.5/s1.0 "
@@ -225,7 +233,8 @@ def main():
                                         or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
-    guided = args.guide in ("dyn", "expert", "novelty", "atypical", "combo") and not args.success_only
+    guided = args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
+                            "shell") and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -413,7 +422,9 @@ def main():
                         "novelty_sample_z": bool(args.novelty_sample_z),
                         "atypical_cap": args.atypical_cap,
                         "combo_nov_weight": args.combo_nov_weight,
-                        "combo_att_weight": args.combo_att_weight},
+                        "combo_att_weight": args.combo_att_weight,
+                        "shell_kappa": args.shell_kappa,
+                        "shell_seed": args.seed},
     )
     try:
         result = pipeline.run(
