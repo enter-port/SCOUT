@@ -8,8 +8,9 @@ seed42 100 场景、无数据回灌)pass@10 > 0.85**。现行最好 = 方案三 
 1. 服务器改动仅限 `/root/workspace/baojiachun/`;绝不删别的东西;不碰别人进程。
 2. **绝不 kill 任何进程**(自己的 tmux 也不行——跑错了就让它跑完,报告即可)。
 3. 用 GPU 前查占用:`ssh -o BatchMode=yes -p <port> root@106.14.2.243 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'`。
-   - port **1022**:GPU 0/1/3/4 = square 链(勿动),GPU 2/5 可用,**GPU7 禁用**(ECC 硬件缺陷)。
-   - port **1024**:8 张全可用(独立容器,同 CPFS)。
+   - **优先级(用户令 2026-08-27):1022 优先,不够再用 1024**。
+   - port **1022**:GPU 0/1/3/4 = square 链(收尾后释放,释放后可用),GPU 2/5 可用,**GPU7 禁用**(ECC 硬件缺陷)。
+   - port **1024**(仅当 1022 无空卡):8 张可用(独立容器,同 CPFS;**有他人 tmux server/stu2v2a,绝不碰**)。
 4. 一切写操作走新文件;不改共享代码文件(见下);部署自己的 idea 文件用
    `tr -d '\r' < local | ssh ... 'cat > /root/workspace/baojiachun/scout-rand/scout/guidance/rand_costs/<name>.py'`
    然后 `python -m py_compile` 验证。
