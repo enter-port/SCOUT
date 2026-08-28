@@ -409,6 +409,14 @@ if [ $RC -ne 0 ]; then
 fi
 [ $RC -ne 0 ] && { log "DP RETRAIN FAILED - see $DPLOG"; exit 1; }
 
+# disk hygiene (2026-08-29, POST_PRUNE=1): this round's success_accum was
+# rebuilt fresh from core + per-round success.hdf5 (all sources kept) and no
+# later round reads it. Remove it (+ its zarr cache) once retraining is done.
+if [ "${POST_PRUNE:-0}" = "1" ] && [ -f "$RDIR/success_accum.hdf5" ]; then
+  rm -f "$RDIR"/success_accum.hdf5 "$RDIR"/success_accum.hdf5.zarr.zip
+  log "[prune] removed $RDIR/success_accum.hdf5(+zarr cache); sources success.hdf5 kept"
+fi
+
 # ---- [3/3] dyn retrain (SCOUT only; frozen past DYN_FREEZE_AFTER) -------- #
 if [ "$A" != "DP" ]; then
 if [ "$NUM" -gt "$DYN_FREEZE_AFTER" ]; then
@@ -463,6 +471,12 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="
 RC=$?; T3=$(date +%s)
 log "[3/3] dyn retrain rc=$RC in $(( (T3-T2)/60 ))m$(( (T3-T2)%60 ))s"
 [ $RC -ne 0 ] && { log "DYN RETRAIN FAILED - see $DYNLOG"; exit 1; }
+# disk hygiene (2026-08-29, POST_PRUNE=1): all_accum is rebuilt each round
+# from the per-round all.hdf5 chain (sources kept); remove + featbank caches.
+if [ "${POST_PRUNE:-0}" = "1" ] && [ -f "$RDIR/all_accum.hdf5" ]; then
+  rm -f "$RDIR"/all_accum.hdf5 "$RDIR"/all_accum.hdf5.featbank.* "$RDIR"/all_accum.hdf5.zarr.zip
+  log "[prune] removed $RDIR/all_accum.hdf5(+featbank caches); sources all.hdf5 kept"
+fi
 fi
 else
   log "[3/3] dyn retrain SKIPPED for a=DP (baseline never consumes the VIB)"
