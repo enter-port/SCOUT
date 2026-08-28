@@ -13,6 +13,7 @@
 | **shell** | 方案A | 随机 κ-壳目标后验 q\*=N(μ⁰+√(2κ)σ⁰⊙u,σ⁰²),u 每重试随机方向 | `--guide shell`,ShellTargetCostPlanner |
 | **pshell** | — | shell 但锚 (μ⁰,σ⁰) 整条重试冻结(持久外场;发现:比 chunk 重锚更窄) | `--guide rand_pshell` |
 | **ushuffle** | — | shell 且 u 逐 chunk 重抽(测宽度来源,在跑) | `--guide rand_ushuffle` |
+| **portfolio** | — | 同场景重试分工:前 K 次用 entropy cost 公式(保救回)、其余用 shell 公式(供宽度) | `--guide rand_portfolio` |
 | **dose** | — | entropy cost × 每重试随机剂量乘子 w~logU | `--guide rand_dose` |
 | **mjitter** | — | KL 参考精度随机旋转 τ²=σ⁰²/softmax(bξ) | `--guide rand_mjitter` |
 | **rshell** | — | shell 但 u 只在探针实测可达子空间采样 | `--guide rand_rshell` |
@@ -39,9 +40,9 @@
 | pshell_{r_k25,r_k5,c_k25} | pshell/chunk 对照 | 20 场景+宽度指标 | **c_k25(=shell 行为)最宽 PR 1.72/d_act 0.77;r 臂反而窄 25-30%** |
 | (在跑)ushuffle 臂 | ushuffle | 20 场景+宽度 | 分辨宽度来源:锚追踪 vs 方向重抽 |
 
-## 判读框架(2026-08-28 重定义)
+## 判读框架(2026-08-28 定稿)
 
-主指标 = **重试分布宽度**(PR/μ̄ 两两距离/d_act/终态散布);SR = 护栏(≥ placebo {9,18});旧"救回数排序"框架作废。
+主指标 = **重试分布宽度**(PR/μ̄ 两两距离/d_act/终态散布);**护栏(严格版,用户令 08-28)= 救回/pass@10 不得差于 entropy cost**(20 场景基线 4/6 {3,9,12,18}·pass 0.90;100 场景 19·0.76-0.78)——placebo 水平不再是合格线,只是运气底线参照。双目标:宽度↑ 且 SR 不降。
 
 ## 术语表(每个词首次出现都必须能在这里查到;新词入表)
 
