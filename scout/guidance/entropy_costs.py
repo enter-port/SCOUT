@@ -31,6 +31,12 @@ only ``compute_loss`` changes.
 方案三 AtypicalCostPlanner (unchanged from v1): cost =
 -min(KL(q(z|s̄,a) ‖ q(z|s̄,a^DP)), κ) with the per-chunk unguided-intent
 baseline (μ⁰, σ⁰²) captured by the select_z hook.
+
+方案A ShellTargetCostPlanner (user 2026-08-27): 方案二 abandoned (its diversity
+came only from the evolving per-scene cache -- with a fixed cache the guided
+direction is definite, same narrow-cone flaw); instead SOE's per-retry random
+direction moves INTO the cost: pull q(z|s̄,a) toward a per-retry random target
+posterior on the kappa-shell of the intent posterior.  See class docstring.
 """
 
 from __future__ import annotations
@@ -200,6 +206,101 @@ class AtypicalCostPlanner(ScoutPlanner):
             kl = 0.5 * (((mu[i] - m0) ** 2 / var0)
                         + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
             rows.append(-torch.clamp(kl, max=self.cap))
+        nll = torch.stack(rows)
+        if reduction == "mean":
+            return nll.mean()
+        if reduction == "sum":
+            return nll.sum()
+        raise ValueError(reduction)
+
+
+class ShellTargetCostPlanner(ScoutPlanner):
+    """方案A (user 2026-08-27): per-retry random target posterior on the
+    kappa-shell of the DP intent -- SOE's wide-distribution spray transplanted
+    into cost form.  Each retry (scene i, try k) draws a FIXED random unit
+    direction u(i,k) (deterministic from shell_seed, frozen across the whole
+    retry = trajectory-level coherence, SOE's z-per-trajectory analog); per
+    chunk the intent baseline (mu^0, sigma^0^2) is captured by the select_z
+    hook exactly as in 方案三, and the cost pulls the candidate posterior
+    toward
+
+        q* = N(mu^0 + sqrt(2*kappa) * sigma^0 * u,  sigma^0^2)
+
+    which sits exactly kappa nats from the intent: KL(q*||q^0) = kappa*||u||^2
+    = kappa for unit u.  N retries = N differently-tilted distributions, one
+    sample each (instead of 方案三's ONE tilted distribution sampled N times --
+    the narrow-cone critique).  cost = KL(q_a||q*) is a quadratic well centered
+    at q*: the guided density p_DP * exp(-cost) only REWEIGHTS (exp(-cost) <=
+    1, never amplifies above the DP prior, unlike 方案三's exp(+min(KL,kappa))
+    boost), and the variance term pins sigma_a to sigma^0 (sigma-escape
+    closed)."""
+
+    def __init__(self, scout_vib, bridge=None, obs_adapter=None,
+                 shell_kappa: float = 2.5, shell_seed: int = 42):
+        super().__init__(scout_vib, bridge=bridge, z=None, obs_adapter=obs_adapter)
+        self.shell_kappa = float(shell_kappa)
+        self.shell_seed = int(shell_seed)
+        self._base_mu: List[Optional[torch.Tensor]] = []
+        self._base_lv: List[Optional[torch.Tensor]] = []
+        self._row_jobs: List = []      # (init_idx, try_idx) per batch row
+        self._u_cache: dict = {}       # (init_idx, try_idx) -> unit u tensor
+
+    # -- context plumbing (rollout_vec._replan) ---------------------------- #
+    def set_row_context(self, init_ids: Sequence):
+        pass    # superseded by set_row_jobs (kept: the hook fires regardless)
+
+    def set_row_jobs(self, jobs: Sequence):
+        """Full job tuples (state, init_idx, try_idx) -- u is keyed by
+        (init_idx, try_idx), so retries may run in parallel (no job gate)."""
+        self._row_jobs = [(j[1], j[2]) for j in jobs]
+
+    def _u_for(self, key, device, dtype) -> torch.Tensor:
+        u = self._u_cache.get(key)
+        if u is None:
+            rng = np.random.default_rng([self.shell_seed,
+                                         int(key[0]), int(key[1])])
+            v = rng.standard_normal(int(self.scout_vib.style_dim))
+            n = float(np.linalg.norm(v))
+            u = torch.as_tensor(v / (n if n > 0.0 else 1.0),
+                                dtype=torch.float32)
+            self._u_cache[key] = u
+        return u.to(device=device, dtype=dtype)
+
+    def select_z(self, x0_hat: torch.Tensor, current_obs=None):
+        """Per-chunk intent baseline (mu^0, sigma^0^2) from the unguided x̂₀
+        (same hook and semantics as AtypicalCostPlanner)."""
+        with torch.no_grad():
+            s_bar_t = self._resolve_s_bar_t(current_obs)
+            a = _enc_forward(self, x0_hat)
+            mu, logvar = self.scout_vib.vib_enc(s_bar_t, a)
+        self._base_mu = [m.detach() for m in mu]
+        self._base_lv = [v.detach() for v in logvar]
+        return None
+
+    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
+                     reduction: str = "mean") -> torch.Tensor:
+        s_bar_t = self._resolve_s_bar_t(current_obs)
+        a = _enc_forward(self, x0_hat)
+        mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
+        rows = []
+        for i in range(mu.shape[0]):
+            if i >= len(self._base_mu) or self._base_mu[i] is None:
+                rows.append(x0_hat[i].sum() * 0.0)
+                continue
+            key = (self._row_jobs[i] if i < len(self._row_jobs)
+                   else (None, None))
+            if key[0] is None:
+                rows.append(x0_hat[i].sum() * 0.0)
+                continue
+            m0, lv0 = self._base_mu[i], self._base_lv[i]
+            var0 = torch.exp(lv0)
+            sig0 = torch.exp(0.5 * lv0)
+            u = self._u_for(key, mu.device, mu.dtype)
+            target_mu = m0 + (2.0 * self.shell_kappa) ** 0.5 * sig0 * u
+            var = torch.exp(logvar[i])
+            kl = 0.5 * (((mu[i] - target_mu) ** 2 / var0)
+                        + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
+            rows.append(kl)     # 0 at the target; quadratic well around it
         nll = torch.stack(rows)
         if reduction == "mean":
             return nll.mean()

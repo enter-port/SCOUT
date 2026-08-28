@@ -239,6 +239,10 @@ class _VecRunner:
             # which scene (init_idx) it belongs to -- per-scene code buffers.
             if planner is not None and hasattr(planner, "set_row_context"):
                 planner.set_row_context([s.job[1] for s in need])
+            # 方案A shell planner: full job tuples (state, init_idx, try_idx)
+            # -- u is keyed by (init_idx, try_idx), retries stay parallel.
+            if planner is not None and hasattr(planner, "set_row_jobs"):
+                planner.set_row_jobs([s.job for s in need])
             # novelty v2: record the code of the chunk that just FINISHED
             # executing (s.chunk, conditioned on s.chunk_obs) BEFORE it is
             # replaced by the new one.

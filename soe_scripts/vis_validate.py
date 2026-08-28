@@ -40,7 +40,14 @@ def demo_flags(g) -> list:
 
 
 def main() -> int:
+    # DISABLED (2026-08-26 user order): the agentview tstd thresholds were
+    # calibrated on can (healthy 3.4-14.4 / noise 27-32), but square's healthy
+    # demos measure 17.6-27.4 and straddle the >20 noise line -- its CORRUPT
+    # verdicts on square were false positives. Always pass. Restore by
+    # deleting this block (analysis code below is unchanged).
     path = sys.argv[1]
+    print(f"{path}: HEALTHY (gate disabled by user order 2026-08-26)")
+    return 0
     min_id = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     bad = []
     with h5py.File(path, "r") as f:
