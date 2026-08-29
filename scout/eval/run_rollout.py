@@ -79,7 +79,8 @@ def main():
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
     p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo", "shell"],
+                                        "atypical", "combo", "shell",
+                                        "exploit"],
                    default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
@@ -94,6 +95,10 @@ def main():
                         "'shell' = 方案A: per-retry random target posterior on "
                         "the kappa-shell of the intent posterior (SOE spray in "
                         "cost form; needs --vib-ckpt); "
+                        "'exploit' = LPB-parity attract-to-expert guidance: "
+                        "L2 NN distance from the D_s-predicted next state "
+                        "latent to the expert state-latent bank (--bank-hdf5 "
+                        "or --core-hdf5; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
     p.add_argument("--novelty-h", type=float, default=5.0,
                    help="novelty KDE kernel width floor, in units of the "
@@ -115,14 +120,21 @@ def main():
                         "solo calibration)")
     p.add_argument("--combo-att-weight", type=float, default=1.0,
                    help="combo: weight of the atypical cost term (default 1.0)")
+    p.add_argument("--exploit-latent", choices=["eye", "agentview", "visual",
+                                                "full"], default="eye",
+                   help="exploit: which slice of s_bar the NN distance is "
+                        "computed on (default 'eye' = eye-in-hand view, LPB "
+                        "Square [...512:] parity; 'visual' = both views; "
+                        "'full' = whole s_bar incl. proprio)")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
                         "no hdf5 needed -- pure DP success-rate eval of any ckpt.")
     p.add_argument("--bank-hdf5", default=None,
-                   help="expert z-bank source hdf5 (default: --core-hdf5). "
-                        "e.g. a round's success_accum.hdf5 -- the exact data "
-                        "that trained the rollout DP.")
+                   help="guidance bank source hdf5 (expert z-bank / exploit "
+                        "state-bank; default: --core-hdf5). e.g. a round's "
+                        "success_accum.hdf5 -- the exact data that trained "
+                        "the rollout DP.")
     # ---- outputs (naming: {task}_{tag}_{success_exp,all_exp,rollout_exp}{N}) ----
     p.add_argument("--exp-num", type=int, default=1,
                    help="exploration round number N for output naming (default 1)")
@@ -234,7 +246,7 @@ def main():
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell") and not args.success_only
+                            "shell", "exploit") and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -242,6 +254,11 @@ def main():
     if guided and args.guide == "expert" and args.core_hdf5 is None:
         raise SystemExit("[run_rollout] --guide expert needs --core-hdf5 "
                          "(the expert z-bank is built from it).")
+    if guided and args.guide == "exploit" \
+            and args.bank_hdf5 is None and args.core_hdf5 is None:
+        raise SystemExit("[run_rollout] --guide exploit needs --bank-hdf5 (or "
+                         "--core-hdf5) -- the expert state-latent bank is "
+                         "built from it.")
     if not args.success_only and args.core_hdf5 is None:
         raise SystemExit("[run_rollout] --core-hdf5 required for full rollout "
                          "(only --success-only may omit it).")
@@ -424,7 +441,8 @@ def main():
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
-                        "shell_seed": args.seed},
+                        "shell_seed": args.seed,
+                        "exploit_latent": args.exploit_latent},
     )
     try:
         result = pipeline.run(

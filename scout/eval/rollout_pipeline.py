@@ -142,6 +142,29 @@ class RolloutPipeline:
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
                   f"entries from {bank_src}")
+        elif self.guide_mode == "exploit":
+            # LPB-parity exploit guidance (user 2026-08-29): NN distance from
+            # the D_s-predicted next state latent to an expert STATE-latent
+            # bank (exploit_costs.py) -- attract to the expert manifold,
+            # opposite direction of the entropy-cost family.
+            from scout.guidance.exploit_costs import (
+                ExploitCostPlanner,
+                build_expert_state_bank,
+            )
+            bank_src = self.bank_hdf5 or self.cfg.dataset.path
+            bank = build_expert_state_bank(
+                bank_src, scout_vib,
+                view_names=self.view_names, proprio_keys=self.proprio_keys,
+                device=self.device,
+                stride=int(getattr(getattr(self.cfg, "exploration", {}),
+                                   "bank_stride", 1)),
+            )
+            latent = str(self.entropy_kwargs.get("exploit_latent", "eye"))
+            planner = ExploitCostPlanner(
+                scout_vib, state_bank=bank, bridge=bridge,
+                obs_adapter=obs_adapter, latent=latent)
+            print(f"[rollout] exploit state-bank guidance: bank={bank.shape} "
+                  f"latent={latent} src={bank_src}")
         elif self.guide_mode in ("novelty", "atypical", "combo", "shell"):
             # entropy-dev (user 2026-08-24 方案二/三; 2026-08-27 方案A shell):
             # only the cost changes; same injection path, same frozen dyn/VIB
