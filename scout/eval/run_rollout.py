@@ -126,6 +126,11 @@ def main():
                         "computed on (default 'eye' = eye-in-hand view, LPB "
                         "Square [...512:] parity; 'visual' = both views; "
                         "'full' = whole s_bar incl. proprio)")
+    p.add_argument("--exploit-ood-threshold", type=float, default=None,
+                   help="exploit: LPB OOD gate -- guide a chunk only when the "
+                        "CURRENT state's NN distance to the bank exceeds this "
+                        "(default None = gate off, always guide). Calibrate "
+                        "from the [exploit-gate] telemetry of a run")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
@@ -449,7 +454,8 @@ def main():
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
                         "shell_seed": args.seed,
-                        "exploit_latent": args.exploit_latent},
+                        "exploit_latent": args.exploit_latent,
+                        "exploit_ood_threshold": args.exploit_ood_threshold},
     )
     try:
         result = pipeline.run(

@@ -160,11 +160,13 @@ class RolloutPipeline:
                                    "bank_stride", 1)),
             )
             latent = str(self.entropy_kwargs.get("exploit_latent", "eye"))
+            ood = self.entropy_kwargs.get("exploit_ood_threshold", None)
             planner = ExploitCostPlanner(
                 scout_vib, state_bank=bank, bridge=bridge,
-                obs_adapter=obs_adapter, latent=latent)
+                obs_adapter=obs_adapter, latent=latent,
+                ood_threshold=(None if ood is None else float(ood)))
             print(f"[rollout] exploit state-bank guidance: bank={bank.shape} "
-                  f"latent={latent} src={bank_src}")
+                  f"latent={latent} ood_threshold={ood} src={bank_src}")
         elif self.guide_mode in ("novelty", "atypical", "combo", "shell"):
             # entropy-dev (user 2026-08-24 方案二/三; 2026-08-27 方案A shell):
             # only the cost changes; same injection path, same frozen dyn/VIB

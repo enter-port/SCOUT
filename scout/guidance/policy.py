@@ -160,6 +160,17 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             if classifier_guidance else None
         _z_selected = False
 
+        # LPB OOD gate (user 2026-08-29, exploit mode only): a planner that
+        # defines ``ood_threshold`` (ExploitCostPlanner) is guided ONLY when
+        # the CURRENT state's cost exceeds it -- computed ONCE pre-loop (the
+        # obs is fixed across the denoise loop), exactly LPB's pre-loop
+        # ``compute_current_reward`` + in-loop ``current_cost > threshold``.
+        # Planners WITHOUT the attribute (every exploration mode) skip this
+        # entirely -- their guided path is bit-for-bit unchanged.
+        _ood_cost: Optional[float] = None
+        _ood_thr = getattr(self.scout_planner, "ood_threshold", None) \
+            if classifier_guidance else None
+
         model = self.model
         scheduler = self.noise_scheduler
 
@@ -223,6 +234,10 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             # frozen ResNet every step.
             if current_obs is not None:
                 self.scout_planner.set_current_obs(current_obs)
+            # OOD gate score: pre-loop, once per chunk (needs the s̄_t cache
+            # above, so it must run AFTER set_current_obs).
+            if _ood_thr is not None and current_obs is not None:
+                _ood_cost = self.scout_planner.gate_cost(current_obs)
         for t in scheduler.timesteps:
             # 1. apply conditioning (inpaint) -- LPB L246.
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -234,7 +249,12 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             )
 
             # --- SCOUT guidance: LPB L253-259 loop body, gate (b) dropped --- #
-            if classifier_guidance and t < self.guidance_start_timestep:
+            # gate structure: ``t < guidance_start_timestep`` (the LPB "last
+            # K steps" knob; explore configs keep it at full range) AND, for
+            # planners that define ood_threshold (exploit only), the LPB OOD
+            # gate ``current_cost > threshold`` (pre-loop, see _ood_cost).
+            if (classifier_guidance and t < self.guidance_start_timestep
+                    and (_ood_thr is None or _ood_cost > _ood_thr)):
                 # cost on the one-step clean-action estimate x̂_0 (NOT on ε).
                 # ``generator=_gate_gen`` routes the spurious variance-noise
                 # draw off the main stream (see comment near _gate_gen decl).
