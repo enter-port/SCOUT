@@ -192,6 +192,12 @@ def main():
                    help="split protocol but SKIP the explore phase: run the "
                         "seed-fixed eval set once, report success_rate/jerk, "
                         "write no hdf5 (final round of a chain)")
+    p.add_argument("--skip-eval", action="store_true",
+                   help="split protocol but SKIP the pure-DP eval phase -- run "
+                        "ONLY the guided explore phase (user 2026-08-29 one-try "
+                        "guidance tests: the baseline comes from a separate "
+                        "--eval-only run; same ckpt+seed reproduces the eval "
+                        "segment bit-for-bit, so repeating it is pure waste)")
     p.add_argument("--cuda-visible-devices", default=None, help="GPU id (e.g. 0)")
     p.add_argument("--wandb-name", default=None,
                    help="default DP-{task}-{SCOUT|base}-rollout-exp{N}")
@@ -242,7 +248,8 @@ def main():
                 args.explore_try_times = int(_exp.try_times)
     rescue_mode = args.explore_mode == "rescue"
     split_mode = (not rescue_mode) and (args.explore_seed is not None
-                                        or args.eval_only)
+                                        or args.eval_only
+                                        or args.skip_eval)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
@@ -455,6 +462,7 @@ def main():
             explore_try_times=args.explore_try_times,
             eval_only=args.eval_only,
             explore_mode=args.explore_mode,
+            skip_eval=args.skip_eval,
         )
         metrics = result["metrics"]
 
@@ -513,10 +521,11 @@ def main():
             # ---- final wandb points (converged values at full scene counts) -- #
             if wandb_run is not None:
                 if split_mode:
-                    wandb_run.log({
-                        "eval/env_done": int(cfg.eval.n_init_states),
-                        "eval/success_rate": metrics["success_rate"],
-                    })
+                    if not args.skip_eval:
+                        wandb_run.log({
+                            "eval/env_done": int(cfg.eval.n_init_states),
+                            "eval/success_rate": metrics["success_rate"],
+                        })
                     if not args.eval_only:
                         wandb_run.log({
                             "explore/env_done": metrics["explore_total"],

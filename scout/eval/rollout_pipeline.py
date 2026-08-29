@@ -218,7 +218,8 @@ class RolloutPipeline:
             n_explore: Optional[int] = None,
             explore_try_times: int = 1,
             eval_only: bool = False,
-            explore_mode: str = "fresh") -> dict:
+            explore_mode: str = "fresh",
+            skip_eval: bool = False) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -251,13 +252,17 @@ class RolloutPipeline:
             return self._run_rescue(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
                 try_times=int(explore_try_times), eval_only=eval_only)
-        if explore_seed is not None or eval_only:
+        if explore_seed is not None or eval_only or skip_eval:
+            if skip_eval and eval_only:
+                raise ValueError("--skip-eval and --eval-only are mutually "
+                                 "exclusive (skip-eval drops the eval phase, "
+                                 "eval-only drops the explore phase)")
             return self._run_split(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
                 explore_seed=int(explore_seed) if explore_seed is not None else 0,
                 n_explore=int(n_explore) if n_explore is not None else 500,
                 explore_try_times=int(explore_try_times),
-                eval_only=eval_only)
+                eval_only=eval_only, skip_eval=skip_eval)
         horizon = int(self.cfg.eval.horizon)
         try_times = int(getattr(self.cfg.eval, "try_times", 5))
         n_init = int(getattr(self.cfg.eval, "n_init_states", 100))
@@ -354,7 +359,8 @@ class RolloutPipeline:
                    on_progress: Optional[Callable[..., None]] = None,
                    explore_seed: int = 1042, n_explore: int = 500,
                    explore_try_times: int = 1,
-                   eval_only: bool = False) -> dict:
+                   eval_only: bool = False,
+                   skip_eval: bool = False) -> dict:
         """experiment2 split protocol (user 2026-08-17).
 
         eval   : the seed-fixed measurement set (``cfg.eval.seed`` ->
@@ -367,6 +373,12 @@ class RolloutPipeline:
                  per ``self.guided``.
                  successes -> ``trajs`` (DP retrain data);
                  ALL explore trajs -> ``all_trajs`` (dyn retrain data).
+
+        ``skip_eval`` (user 2026-08-29): drop the pure-DP eval phase and run
+        ONLY the guided explore phase -- for one-try guidance tests where the
+        baseline number comes from a separate ``--eval-only`` run (same ckpt
+        + same seed reproduces the eval segment bit-for-bit, so the repeated
+        segment is pure waste).
         """
         horizon = int(self.cfg.eval.horizon)
         n_eval = int(self.cfg.eval.n_init_states)
@@ -383,19 +395,25 @@ class RolloutPipeline:
         n_action_steps = int(getattr(dp, "n_action_steps", 1))
 
         # ---- phase 1: eval on the seed-fixed scene set (measurement only) -- #
-        eval_states = collect_initial_states(
-            self.env_factory, n_init_states=n_eval, base_seed=self.base_seed)
-        eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
-        first_results, _, _ = evaluate_baseline_vec(
-            dp, self.env_factory, eval_states, horizon=horizon,
-            n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
-            n_tries=1, metric_prefix="eval",
-            record_obs=False,                      # eval trajs are NOT data
-            on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
-        )
-        baseline_solved = int(sum(1 for s, _ in first_results if s))
-        print(f"[rollout:split] eval: success_rate={baseline_solved}/{n_eval} "
-              f"({baseline_solved / max(n_eval, 1):.3f})")
+        first_results = None
+        baseline_solved = 0
+        if not skip_eval:
+            eval_states = collect_initial_states(
+                self.env_factory, n_init_states=n_eval, base_seed=self.base_seed)
+            eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
+            first_results, _, _ = evaluate_baseline_vec(
+                dp, self.env_factory, eval_states, horizon=horizon,
+                n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
+                n_tries=1, metric_prefix="eval",
+                record_obs=False,                      # eval trajs are NOT data
+                on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
+            )
+            baseline_solved = int(sum(1 for s, _ in first_results if s))
+            print(f"[rollout:split] eval: success_rate={baseline_solved}/{n_eval} "
+                  f"({baseline_solved / max(n_eval, 1):.3f})")
+        else:
+            print("[rollout:split] skip-eval: baseline comes from a separate "
+                  "--eval-only run; ONLY the guided explore phase runs here")
 
         # ---- phase 2: explore on FRESH scenes (data collection) ------------ #
         if eval_only:
@@ -437,10 +455,6 @@ class RolloutPipeline:
               f"scenes; collected {len(trajs)} successful trajs "
               f"({len(all_trajs)} total explore trajs -> dyn)")
         metrics = {
-            "success_rate": success_rate_per_round(first_results),
-            "jerk_baseline": jerk_of_results(first_results, only_successful=True),
-            "baseline_solved": baseline_solved,
-            "n_failed": n_eval - baseline_solved,
             "explore_seed": explore_seed,
             "n_explore": n_explore,
             "explore_try_times": explore_try_times,
@@ -450,6 +464,15 @@ class RolloutPipeline:
             "collected_trajs": len(trajs),
             "n_all_trajs": len(all_trajs),
         }
+        if skip_eval:
+            metrics["skip_eval"] = True   # baseline fields live in the eval-only run
+        else:
+            metrics.update({
+                "success_rate": success_rate_per_round(first_results),
+                "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+                "baseline_solved": baseline_solved,
+                "n_failed": n_eval - baseline_solved,
+            })
         return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
 
     # ------------------------------------------------------------------ #
