@@ -617,10 +617,18 @@ def main():
                 json.dump(summary, f, indent=2)
 
             if split_mode:
-                print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
-                      f"explore {metrics['explore_solved']}/{metrics['explore_total']} "
-                      f"avg_jerk={metrics['avg_jerk']:.4f} "
-                      f"collected={metrics['collected_trajs']}")
+                if metrics.get("skip_eval"):
+                    # explore-only run: no baseline fields (live in the
+                    # separate --eval-only run of the same ckpt+seed)
+                    print(f"\n[run_rollout] DONE (skip-eval). "
+                          f"explore {metrics['explore_solved']}/{metrics['explore_total']} "
+                          f"avg_jerk={metrics['avg_jerk']:.4f} "
+                          f"collected={metrics['collected_trajs']}")
+                else:
+                    print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
+                          f"explore {metrics['explore_solved']}/{metrics['explore_total']} "
+                          f"avg_jerk={metrics['avg_jerk']:.4f} "
+                          f"collected={metrics['collected_trajs']}")
             else:
                 print(f"\n[run_rollout] DONE. success_rate={metrics['success_rate']:.3f} "
                       f"pass@5={metrics['pass_at_5']:.3f} avg_jerk={metrics['avg_jerk']:.4f} "
