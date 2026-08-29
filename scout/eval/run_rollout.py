@@ -131,6 +131,11 @@ def main():
                         "CURRENT state's NN distance to the bank exceeds this "
                         "(default None = gate off, always guide). Calibrate "
                         "from the [exploit-gate] telemetry of a run")
+    p.add_argument("--exploit-knn", type=int, default=1,
+                   help="exploit: k of the k-NN cost -- 1 = hard argmin (LPB "
+                        "parity, default); k>1 = mean of the k nearest bank "
+                        "entries (pull toward manifold density instead of a "
+                        "single neighbour)")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
@@ -455,7 +460,8 @@ def main():
                         "shell_kappa": args.shell_kappa,
                         "shell_seed": args.seed,
                         "exploit_latent": args.exploit_latent,
-                        "exploit_ood_threshold": args.exploit_ood_threshold},
+                        "exploit_ood_threshold": args.exploit_ood_threshold,
+                        "exploit_knn": args.exploit_knn},
     )
     try:
         result = pipeline.run(
