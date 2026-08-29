@@ -565,17 +565,24 @@ def main():
                 "seed": args.seed,
                 "guided": int(guided),
                 "wandb_run_id": (wandb_run.id if wandb_run is not None else None),
-                "success_rate": metrics["success_rate"],
                 "avg_jerk": metrics.get("avg_jerk"),
-                "jerk_baseline": metrics["jerk_baseline"],
-                "baseline_solved": metrics["baseline_solved"],
-                "n_failed": metrics["n_failed"],
                 "collected_trajs": metrics.get("collected_trajs", 0),
                 "n_success_trajs": len(trajs),
                 "n_all_trajs": len(all_trajs),
-                "failed_init_indices": metrics.get("failed_init_indices"),
                 "outputs": {"success": success_path, "all": all_path},
             }
+            if metrics.get("skip_eval"):
+                # skip-eval run: no baseline fields (they live in the
+                # separate --eval-only run of the same ckpt+seed)
+                summary.update({"skip_eval": True})
+            else:
+                summary.update({
+                    "success_rate": metrics["success_rate"],
+                    "jerk_baseline": metrics["jerk_baseline"],
+                    "baseline_solved": metrics["baseline_solved"],
+                    "n_failed": metrics["n_failed"],
+                    "failed_init_indices": metrics.get("failed_init_indices"),
+                })
             if args.eval_only:
                 summary.update({"protocol": "eval_only", "eval_seed": eval_seed})
             elif split_mode:
