@@ -168,6 +168,7 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # Planners WITHOUT the attribute (every exploration mode) skip this
         # entirely -- their guided path is bit-for-bit unchanged.
         _ood_cost: Optional[float] = None
+        _ood_w: Optional[float] = None
         _ood_thr = getattr(self.scout_planner, "ood_threshold", None) \
             if classifier_guidance else None
 
@@ -235,9 +236,14 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             if current_obs is not None:
                 self.scout_planner.set_current_obs(current_obs)
             # OOD gate score: pre-loop, once per chunk (needs the s̄_t cache
-            # above, so it must run AFTER set_current_obs).
+            # above, so it must run AFTER set_current_obs). ``gate_weight``
+            # maps the score to this chunk's force multiplier: binary 1/0
+            # for the LPB gate (default, bit-identical to the original
+            # `cost > thr` compare), graded min(slope*(cost-thr)/thr, cap)
+            # when the planner enables the soft gate (exploit only).
             if _ood_thr is not None and current_obs is not None:
                 _ood_cost = self.scout_planner.gate_cost(current_obs)
+                _ood_w = self.scout_planner.gate_weight(_ood_cost)
         for t in scheduler.timesteps:
             # 1. apply conditioning (inpaint) -- LPB L246.
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -254,7 +260,7 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             # planners that define ood_threshold (exploit only), the LPB OOD
             # gate ``current_cost > threshold`` (pre-loop, see _ood_cost).
             if (classifier_guidance and t < self.guidance_start_timestep
-                    and (_ood_thr is None or _ood_cost > _ood_thr)):
+                    and (_ood_thr is None or (_ood_w or 0.0) > 0.0)):
                 # cost on the one-step clean-action estimate x̂_0 (NOT on ε).
                 # ``generator=_gate_gen`` routes the spurious variance-noise
                 # draw off the main stream (see comment near _gate_gen decl).
@@ -279,9 +285,11 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                     x0_hat, current_obs, reduction="sum"
                 )
                 cond_grad = -torch.autograd.grad(loss, trajectory)[0]
+                # _ood_w: soft-gate force multiplier (1.0 for the binary LPB
+                # gate / gate-off paths -- bit-identical to the original).
                 grad_scale = self.guidance_scale * (
                     1.0 - scheduler.alphas_cumprod[t]
-                ).sqrt()
+                ).sqrt() * (_ood_w if _ood_w is not None else 1.0)
                 trajectory = trajectory.detach() + grad_scale * cond_grad
                 # telemetry: running stats of the injected force so a
                 # numerically no-op cost is visible in stdout (reflection #2:

@@ -136,6 +136,12 @@ def main():
                         "parity, default); k>1 = mean of the k nearest bank "
                         "entries (pull toward manifold density instead of a "
                         "single neighbour)")
+    p.add_argument("--exploit-gate-slope", type=float, default=None,
+                   help="exploit: soft OOD gate -- force weight per chunk = "
+                        "min(slope*(cost-thr)/thr, cap) instead of binary "
+                        "on/off (default None = binary LPB gate)")
+    p.add_argument("--exploit-gate-cap", type=float, default=2.0,
+                   help="exploit: soft-gate weight cap (default 2.0)")
     p.add_argument("--success-only", action="store_true",
                    help="only run step2 (base-path success_rate on N seed-fixed "
                         "inits); skip explore (step3) + merge (step4). No VIB / "
@@ -461,7 +467,9 @@ def main():
                         "shell_seed": args.seed,
                         "exploit_latent": args.exploit_latent,
                         "exploit_ood_threshold": args.exploit_ood_threshold,
-                        "exploit_knn": args.exploit_knn},
+                        "exploit_knn": args.exploit_knn,
+                        "exploit_gate_slope": args.exploit_gate_slope,
+                        "exploit_gate_cap": args.exploit_gate_cap},
     )
     try:
         result = pipeline.run(

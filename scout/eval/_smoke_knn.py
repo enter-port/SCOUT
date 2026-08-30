@@ -60,6 +60,20 @@ def main():
     print(f"[_smoke_knn] OK  1-NN={float(l1):.4f} (grad |{float(g1.norm()):.3f}|)  "
           f"5-NN={float(l5):.4f} (grad |{float(g5.norm()):.3f}|)")
 
+    # soft gate weight: binary parity + graded values
+    pb = ExploitCostPlanner(vib, state_bank=bank, latent="eye",
+                            ood_threshold=1.0)
+    assert pb.gate_weight(0.5) == 0.0 and pb.gate_weight(1.5) == 1.0
+    ps = ExploitCostPlanner(vib, state_bank=bank, latent="eye",
+                            ood_threshold=1.0, gate_slope=1.0, gate_cap=2.0)
+    assert abs(ps.gate_weight(1.1) - 0.1) < 1e-9
+    assert abs(ps.gate_weight(1.5) - 0.5) < 1e-9
+    assert abs(ps.gate_weight(2.0) - 1.0) < 1e-9
+    assert ps.gate_weight(4.0) == 2.0            # capped
+    pn = ExploitCostPlanner(vib, state_bank=bank, latent="eye")
+    assert pn.gate_weight(9.9) == 1.0            # gate off -> always 1
+    print("[_smoke_knn] gate_weight OK (binary parity + soft values + cap)")
+
 
 if __name__ == "__main__":
     main()

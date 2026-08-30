@@ -162,14 +162,18 @@ class RolloutPipeline:
             latent = str(self.entropy_kwargs.get("exploit_latent", "eye"))
             ood = self.entropy_kwargs.get("exploit_ood_threshold", None)
             knn = int(self.entropy_kwargs.get("exploit_knn", 1) or 1)
+            slope = self.entropy_kwargs.get("exploit_gate_slope", None)
+            cap = float(self.entropy_kwargs.get("exploit_gate_cap", 2.0) or 2.0)
             planner = ExploitCostPlanner(
                 scout_vib, state_bank=bank, bridge=bridge,
                 obs_adapter=obs_adapter, latent=latent,
                 ood_threshold=(None if ood is None else float(ood)),
-                knn=knn)
+                knn=knn,
+                gate_slope=(None if slope is None else float(slope)),
+                gate_cap=cap)
             print(f"[rollout] exploit state-bank guidance: bank={bank.shape} "
                   f"latent={latent} ood_threshold={ood} knn={knn} "
-                  f"src={bank_src}")
+                  f"gate_slope={slope} gate_cap={cap} src={bank_src}")
         elif self.guide_mode in ("novelty", "atypical", "combo", "shell"):
             # entropy-dev (user 2026-08-24 方案二/三; 2026-08-27 方案A shell):
             # only the cost changes; same injection path, same frozen dyn/VIB
