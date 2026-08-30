@@ -207,6 +207,24 @@ class RolloutPipeline:
             print(f"[rollout] particle guidance: lambda={planner.pg_lambda} "
                   f"h_scale={planner.pg_h_scale} pg_start={planner.pg_start} "
                   f"cap={ek.get('atypical_cap', 10.0)}")
+        elif self.guide_mode == "orbit":
+            # orbit guidance (user 2026-08-31, math session): two-phase
+            # constrained control -- climb below kappa-delta (verbatim
+            # atypical), then Newton feedback + tangential noise pinned to
+            # the kappa shell. Pure per-row mechanism: no group lock, i.i.d.
+            # retries exactly as atypical; particle guidance is untouched.
+            from scout.guidance.orbit_costs import OrbitCostPlanner
+            ek = dict(self.entropy_kwargs or {})
+            planner = OrbitCostPlanner(
+                scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                cap=float(ek.get("atypical_cap", 10.0)),
+                orbit_lam=float(ek.get("orbit_lam", 0.5)),
+                orbit_delta=float(ek.get("orbit_delta", 0.25)),
+                orbit_sigma=float(ek.get("orbit_sigma", 0.25)),
+            )
+            print(f"[rollout] orbit guidance: lam={planner.orbit_lam} "
+                  f"delta={planner.orbit_delta} sigma={planner.orbit_sigma} "
+                  f"kappa={ek.get('atypical_cap', 10.0)}")
         elif self.guide_mode.startswith("rand_"):
             # entropy-random-dev registry (user 2026-08-27): idea plugins in
             # scout/guidance/rand_costs/<name>.py; auto-discovered, shared

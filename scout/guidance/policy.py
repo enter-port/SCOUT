@@ -192,6 +192,13 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # timing ablation). Duck-typed like select_z; absent -> zero overhead.
         _step_cb = (getattr(self.scout_planner, "set_denoise_step", None)
                     if classifier_guidance else None)
+        # orbit guidance (2026-08-31): planner-provided phase-2 constrained
+        # update (Newton feedback + tangential noise pinned to the kappa
+        # shell; scout/guidance/orbit_costs.py). Duck-typed like set_denoise_
+        # step; absent -> the injection below is exactly the pre-orbit line
+        # for every other guide mode.
+        _orbit_fn = (getattr(self.scout_planner, "orbit_update", None)
+                     if classifier_guidance else None)
         if classifier_guidance:
             # fix z for the whole loop (design §1: "z 整段定住"). Sampled WITHOUT
             # the `generator` so the trajectory / DDPM RNG stream is unchanged
@@ -265,11 +272,23 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                 loss = self.scout_planner.compute_loss(
                     x0_hat, current_obs, reduction="sum"
                 )
-                cond_grad = -torch.autograd.grad(loss, trajectory)[0]
-                grad_scale = self.guidance_scale * (
-                    1.0 - scheduler.alphas_cumprod[t]
-                ).sqrt()
-                trajectory = trajectory.detach() + grad_scale * cond_grad
+                cond_grad = -torch.autograd.grad(
+                    loss, trajectory, retain_graph=(_orbit_fn is not None))[0]
+                _noise_scale = (1.0 - scheduler.alphas_cumprod[t]).sqrt()
+                grad_scale = self.guidance_scale * _noise_scale
+                if _orbit_fn is None:
+                    trajectory = trajectory.detach() + grad_scale * cond_grad
+                else:
+                    # orbit: phase-2 rows (KL >= kappa - delta) swap the climb
+                    # for the constrained update -- the Newton feedback keeps
+                    # climbing below kappa, so the hand-over has no gap and no
+                    # double dose; phase-1 rows keep the climb verbatim.
+                    _disp, _p2 = _orbit_fn(trajectory, x0_hat, current_obs,
+                                           noise_scale=float(_noise_scale))
+                    _keep = (1.0 - _p2).view(
+                        -1, *([1] * (cond_grad.dim() - 1)))
+                    trajectory = (trajectory.detach()
+                                  + grad_scale * cond_grad * _keep + _disp)
                 # telemetry: running stats of the injected force so a
                 # numerically no-op cost is visible in stdout (reflection #2:
                 # novelty v1 ran 4h with force ~1/4 of DP's own sampling

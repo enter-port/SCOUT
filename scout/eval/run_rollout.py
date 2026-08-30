@@ -98,6 +98,10 @@ def main():
                         "repulsion (a scene's retries launch as ONE slot "
                         "group and repel each other's behaviour codes while "
                         "generating; needs --vib-ckpt); "
+                        "'orbit' = two-phase constrained control: climb below "
+                        "kappa-delta (verbatim atypical), then Newton feedback "
+                        "+ tangential noise pinned to the kappa shell "
+                        "(math session 2026-08-31; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
     p.add_argument("--pg-lambda", type=float, default=1.0,
                    help="particle: repulsion weight (lambda). Calibrate via "
@@ -112,6 +116,23 @@ def main():
                         "repulsion switches ON (timing ablation G1/G2/G3 = "
                         "0/50/90; before it the loss is bit-identical to "
                         "--guide atypical).")
+    p.add_argument("--orbit-lam", type=float, default=0.5,
+                   help="orbit: feedback gain lambda of the Newton term "
+                        "-lam*(KL-kappa)*grad KL/||grad KL||^2 (dimensionless "
+                        "relaxation: 1 = first-order exact projection onto "
+                        "the shell, 0.5 = damped).")
+    p.add_argument("--orbit-delta", type=float, default=0.25,
+                   help="orbit: phase-switch buffer delta -- rows with "
+                        "KL >= kappa - delta switch from the climb to the "
+                        "constrained dynamics (hand-over happens before the "
+                        "cap plateau kills the climb gradient).")
+    p.add_argument("--orbit-sigma", type=float, default=0.25,
+                   help="orbit: std of the tangential noise xi_perp (scaled "
+                        "by sqrt(1-abar_t) at injection like the climb; "
+                        "independent of --guidance-scale). Calibrate via the "
+                        "orbit-telemetry so mean|noise| lands in the climb's "
+                        "mean_inject band. 0 with lam=0/delta=0 = bit-"
+                        "identical to --guide atypical.")
     p.add_argument("--failed-set-json", default=None,
                    help="rescue mode: load the FROZEN failure set from this "
                         "json (explore-only -- the eval phase is skipped and "
@@ -231,7 +252,7 @@ def main():
     # (entropy-random-dev, 2026-08-27; free-form instead of argparse choices)
     from scout.guidance.rand_costs import REGISTRY as _RAND
     _static = ("dyn", "off", "expert", "novelty", "atypical", "combo",
-               "shell", "particle")
+               "shell", "particle", "orbit")
     if not (args.guide in _static or (args.guide.startswith("rand_")
                                       and args.guide[5:] in _RAND)):
         p.error(f"--guide must be one of {_static} or rand_<idea>, "
@@ -281,7 +302,8 @@ def main():
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                             "shell", "particle") or args.guide.startswith("rand_")
+                             "shell", "particle", "orbit")
+              or args.guide.startswith("rand_")
               ) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
@@ -476,6 +498,9 @@ def main():
                         "pg_lambda": args.pg_lambda,
                         "pg_h_scale": args.pg_h_scale,
                         "pg_start": args.pg_start,
+                        "orbit_lam": args.orbit_lam,
+                        "orbit_delta": args.orbit_delta,
+                        "orbit_sigma": args.orbit_sigma,
                         **rand_ek},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
