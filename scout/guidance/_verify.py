@@ -31,6 +31,14 @@ Checks (task verify):
      action chunk -- NOT once per trajectory) and the guided trajectory
      differs from unguided; explore mode (checks 1-5, plain planner) is
      untouched.
+  7-9. Particle guidance (2026-08-30): pg_start=never == atypical
+     bit-identical; repulsion semantics; pg_start gate counters.
+  10-12. Orbit guidance (2026-08-31): (lam, sigma, delta)=(0,0,0) ==
+     atypical bit-identical; orbit_displacement pure-math unit tests
+     (phase mask / Newton projection identity / damped overshoot formula /
+     tangential orthogonality / flat-gradient guard); policy-path
+     integration (per-step counter, determinism, forced far/equal
+     baselines through the real encoder).
 
 Run:
     python -m scout.guidance._verify
@@ -446,6 +454,164 @@ def check_expert_guidance(policy, planner, scout_vib, current_obs,
           f"guided vs unguided max|diff|={diff:.2e} (bites OK)")
 
 
+def check_orbit_guidance(policy, scout_vib, current_obs,
+                         cond_data, cond_mask, global_cond, seed=233):
+    """Checks 10-12 (orbit guidance, user 2026-08-31, math session):
+
+    (10) no-op sentinel: (lam, sigma, delta) = (0, 0, 0) is BIT-IDENTICAL to
+         --guide atypical (rows at/above kappa carry zero capped-climb
+         gradient anyway; sigma=0 draws no noise; the second backward
+         consumes no RNG). cap=0.01 forces rows across the boundary so the
+         masking branch is exercised, not just the RNG-free path.
+    (11) orbit_displacement pure math on a hand-built quadratic bowl
+         (KL = ||x||^2, grad = 2x -- analytic at every point):
+           - phase mask: rows below kappa-delta get EXACTLY zero;
+           - first-order projection identity  g.fb = -lam*(kl-kappa);
+           - lambda=1 lands on  kappa + (kl-kappa)^2/(4*kl)  (the damped-
+             Newton overshoot formula of one quadratic step);
+           - tangential noise orthogonal to g on phase-2 rows, masked rows
+             stay exactly zero;
+           - flat-gradient guard (g=0): zero feedback, finite unprojected
+             noise (no division blow-up).
+    (12) policy path through the real mock encoder:
+           - orbit_update fires exactly once per guided denoise step;
+           - same-seed determinism, and the ACTIVE orbit (sigma>0) differs
+             from its no-op partner (machinery bites);
+           - forced-FAR baseline -> phase 2 fires for every row, nonzero
+             displacement; anchor-equal input -> phase 2 never fires.
+    """
+    from scout.guidance.orbit_costs import OrbitCostPlanner, orbit_displacement
+    from scout.guidance.entropy_costs import AtypicalCostPlanner
+
+    gst = policy.noise_scheduler.config.num_train_timesteps
+
+    # ---- (10) no-op sentinel == atypical, bit-for-bit --------------------- #
+    t_out = {}
+    for name, pl in (
+            ("atypical", AtypicalCostPlanner(scout_vib, bridge=IdentityBridge(),
+                                             cap=0.01)),
+            ("orbit-off", OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                                           cap=0.01, orbit_lam=0.0,
+                                           orbit_delta=0.0, orbit_sigma=0.0))):
+        policy.initialize_scout_planner(planner=pl,
+                                        guidance_start_timestep=gst,
+                                        guidance_scale=1.0)
+        t_out[name] = _run_sample(policy, cond_data, cond_mask, None,
+                                  current_obs, z=None, seed=seed,
+                                  classifier_guidance=True,
+                                  guidance_scale=1.0)
+    diff10 = (t_out["atypical"] - t_out["orbit-off"]).abs().max().item()
+    assert diff10 == 0.0, (
+        f"(10) orbit no-op sentinel must be bit-identical to atypical; "
+        f"max|diff|={diff10:.3e}")
+
+    # ---- (11) pure-math unit tests ---------------------------------------- #
+    kappa, delta, lam = 2.5, 0.25, 0.5
+    B, T, D = 4, 2, 3
+    # r^2 = 0.64 (< 2.25, phase 1) | 2.2801 (phase 2, below shell) | 3.24,
+    # 4.84 (phase 2, above shell)
+    r = torch.tensor([0.8, 1.51, 1.8, 2.2], dtype=torch.float64)
+    x = torch.zeros(B, T, D, dtype=torch.float64)
+    x[:, 0, 0] = r
+    kl = (x ** 2).flatten(1).sum(dim=1)
+    g = 2.0 * x
+    disp0, p2, (fb_n, _) = orbit_displacement(kl, g, kappa, lam, delta,
+                                              sigma=0.0)
+    assert float(p2[0]) == 0.0 and disp0[0].abs().max().item() == 0.0, (
+        "(11) rows below kappa-delta must be exactly phase 1")
+    assert all(float(p2[i]) == 1.0 for i in (1, 2, 3)), (
+        "(11) rows at/above kappa-delta must be phase 2")
+    # first-order projection identity: g . fb == -lam * (kl - kappa)
+    dot = (g * disp0).flatten(1).sum(dim=1)
+    for i in (1, 2, 3):
+        assert abs(float(dot[i]) + lam * float(kl[i] - kappa)) < 1e-9, (
+            f"(11) Newton projection identity broken on row {i}: "
+            f"{float(dot[i])} vs {-lam * float(kl[i] - kappa)}")
+    # lambda=1 one quadratic step: ||x + fb||^2 == kappa + (kl-kappa)^2/(4kl)
+    disp1, _, _ = orbit_displacement(kl, g, kappa, 1.0, delta, sigma=0.0)
+    new_kl = ((x + disp1) ** 2).flatten(1).sum(dim=1)
+    expect = kappa + (kl - kappa) ** 2 / (4.0 * kl)
+    assert torch.allclose(new_kl[1:], expect[1:], rtol=1e-9), (
+        f"(11) damped-Newton overshoot formula mismatch: "
+        f"{new_kl.tolist()} vs {expect.tolist()}")
+    # tangential noise: deterministic fb (sigma=0) minus the sigma>0 call
+    # isolates the noise part; it must be orthogonal to g on phase-2 rows,
+    # and the phase-1 row stays exactly zero.
+    disp_n, _, _ = orbit_displacement(kl, g, kappa, lam, delta, sigma=0.3,
+                                      noise_scale=0.7)
+    noise_part = disp_n - disp0
+    assert disp_n[0].abs().max().item() == 0.0, (
+        "(11) noise must not leak into phase-1 rows")
+    dotn = (g * noise_part).flatten(1).sum(dim=1)
+    gn = g.flatten(1).norm(dim=1)
+    nn = noise_part.flatten(1).norm(dim=1)
+    for i in (1, 2, 3):
+        assert abs(float(dotn[i])) < 1e-6 * float(gn[i] * nn[i]), (
+            f"(11) tangential noise not orthogonal to grad on row {i}")
+    # flat-gradient guard: g = 0 -> no feedback blow-up, finite noise
+    dispf, p2f, (fbf, _) = orbit_displacement(kl, torch.zeros_like(g), kappa,
+                                              lam, delta, sigma=0.3)
+    assert not torch.isnan(dispf).any(), "(11) flat-gradient guard NaN"
+    assert float(fbf.abs().max()) == 0.0, "(11) flat rows must give zero fb"
+    assert float(p2f.sum()) == 3.0 and dispf[1:].abs().max().item() > 0, (
+        "(11) flat rows: phase 2 fires with unprojected noise")
+
+    # ---- (12) policy-path integration ------------------------------------- #
+    orb = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=0.01,
+                           orbit_lam=0.5, orbit_delta=0.25, orbit_sigma=0.25)
+    policy.initialize_scout_planner(planner=orb,
+                                    guidance_start_timestep=gst,
+                                    guidance_scale=1.0)
+    t1 = _run_sample(policy, cond_data, cond_mask, None, current_obs,
+                     z=None, seed=seed, classifier_guidance=True,
+                     guidance_scale=1.0)
+    assert orb._orb_calls == policy.num_inference_steps, (
+        f"(12) expected {policy.num_inference_steps} orbit_update calls, "
+        f"got {orb._orb_calls}")
+    assert orb._orb_p2_rows > 0, (
+        "(12) cap=0.01 must push some rows into phase 2 on the mock path")
+    t2 = _run_sample(policy, cond_data, cond_mask, None, current_obs,
+                     z=None, seed=seed, classifier_guidance=True,
+                     guidance_scale=1.0)
+    assert torch.equal(t1, t2), "(12) same-seed orbit runs must be identical"
+    assert (t1 - t_out["orbit-off"]).abs().max().item() > 0.0, (
+        "(12) active orbit (sigma>0) must differ from its no-op partner")
+
+    # forced-FAR baseline -> every row phase 2, nonzero displacement; the
+    # anchor-equal input -> phase 2 never fires (real encoder Jacobian path).
+    Bn = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+    orb2 = OrbitCostPlanner(scout_vib, bridge=IdentityBridge())
+    orb2.set_current_obs(current_obs)
+    x0_seed = torch.randn(Bn, H, Ad)
+    orb2.select_z(x0_seed, current_obs)
+    orb2._att._base_mu = [m + 5.0 for m in orb2._att._base_mu]
+    traj = torch.randn(Bn, H, Ad).requires_grad_(True)
+    x0h = 2.0 * traj                      # any differentiable map traj -> x0_hat
+    disp, p2r = orb2.orbit_update(traj, x0h, current_obs, noise_scale=0.5)
+    assert float(p2r.sum()) == float(Bn), (
+        "(12) far baseline must put every row in phase 2")
+    assert disp.abs().max().item() > 0.0, "(12) phase-2 displacement nonzero"
+    orb3 = OrbitCostPlanner(scout_vib, bridge=IdentityBridge())
+    orb3.set_current_obs(current_obs)
+    traj3 = torch.randn(Bn, H, Ad).requires_grad_(True)
+    x0h3 = 2.0 * traj3
+    orb3.select_z(x0h3.detach(), current_obs)   # anchor AT the input -> kl ~ 0
+    disp3, p23 = orb3.orbit_update(traj3, x0h3, current_obs, noise_scale=0.5)
+    assert float(p23.sum()) == 0.0 and disp3.abs().max().item() == 0.0, (
+        "(12) anchor-equal input must stay entirely in phase 1")
+
+    print(f"[check 10] orbit no-op (lam=sigma=delta=0) == atypical "
+          f"bit-identical (max|diff|={diff10:.1e})")
+    print(f"[check 11] orbit math: phase mask exact; Newton projection "
+          f"identity; damped overshoot formula; tangential orthogonality; "
+          f"flat-gradient guard")
+    print(f"[check 12] orbit policy path: {orb._orb_calls} calls "
+          f"({policy.num_inference_steps}/sample), p2_rows="
+          f"{orb._orb_p2_rows}/{orb._orb_rows}, deterministic, far/equal "
+          f"baselines behave as designed")
+
+
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -469,6 +635,9 @@ def main():
     # check 6 replaces the policy's planner with the expert one -- run LAST.
     check_expert_guidance(policy, planner, scout_vib, current_obs,
                           cond_data, cond_mask)
+    # orbit guidance checks (10-12) replace the planner as well; run last.
+    check_orbit_guidance(policy, scout_vib, current_obs,
+                         cond_data, cond_mask, global_cond)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

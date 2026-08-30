@@ -94,7 +94,37 @@ def main():
                         "'shell' = 方案A: per-retry random target posterior on "
                         "the kappa-shell of the intent posterior (SOE spray in "
                         "cost form; needs --vib-ckpt); "
+                        "'orbit' = two-phase constrained control: climb below "
+                        "kappa-delta (verbatim atypical), then Newton feedback "
+                        "+ tangential noise pinned to the kappa shell "
+                        "(math session 2026-08-31; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
+    p.add_argument("--orbit-lam", type=float, default=0.5,
+                   help="orbit: feedback gain lambda of the Newton term "
+                        "-lam*(KL-kappa)*grad KL/||grad KL||^2 (dimensionless "
+                        "relaxation: 1 = first-order exact projection onto "
+                        "the shell, 0.5 = damped).")
+    p.add_argument("--orbit-delta", type=float, default=0.25,
+                   help="orbit: phase-switch buffer delta -- rows with "
+                        "KL >= kappa - delta switch from the climb to the "
+                        "constrained dynamics (hand-over happens before the "
+                        "cap plateau kills the climb gradient).")
+    p.add_argument("--orbit-sigma", type=float, default=0.25,
+                   help="orbit: std of the tangential noise xi_perp (scaled "
+                        "by sqrt(1-abar_t) at injection like the climb; "
+                        "independent of --guidance-scale). Calibrate via the "
+                        "orbit-telemetry so mean|noise| lands in the climb's "
+                        "mean_inject band. 0 with lam=0/delta=0 = bit-"
+                        "identical to --guide atypical.")
+    p.add_argument("--failed-set-json", default=None,
+                   help="rescue mode: load the FROZEN failure set from this "
+                        "json (explore-only -- the eval phase is skipped and "
+                        "pass@k is measured on exactly the recorded failed "
+                        "inits).")
+    p.add_argument("--save-failed-set", default=None,
+                   help="rescue mode: save the baseline run's failed inits to "
+                        "this json (run once with the base DP, then reuse for "
+                        "every experiment via --failed-set-json).")
     p.add_argument("--novelty-h", type=float, default=5.0,
                    help="novelty KDE kernel width floor, in units of the "
                         "encoder's running per-dim sigma; width also adapts "
@@ -233,8 +263,8 @@ def main():
                                         or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
-    guided = args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell") and not args.success_only
+    guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
+                            "shell", "orbit")) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -424,7 +454,12 @@ def main():
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
-                        "shell_seed": args.seed},
+                        "shell_seed": args.seed,
+                        "orbit_lam": args.orbit_lam,
+                        "orbit_delta": args.orbit_delta,
+                        "orbit_sigma": args.orbit_sigma},
+        failed_set_json=args.failed_set_json,
+        save_failed_set=args.save_failed_set,
     )
     try:
         result = pipeline.run(
