@@ -187,6 +187,11 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # generator preserves LPB's call syntax and value exactly while keeping
         # the main ``generator`` + global RNG streams clean.
         _gate_gen = torch.Generator(device=condition_data.device)
+        # particle guidance (2026-08-30): per-step denoise-loop callback so the
+        # planner can gate its repulsion by denoise-step index (pg_start
+        # timing ablation). Duck-typed like select_z; absent -> zero overhead.
+        _step_cb = (getattr(self.scout_planner, "set_denoise_step", None)
+                    if classifier_guidance else None)
         if classifier_guidance:
             # fix z for the whole loop (design §1: "z 整段定住"). Sampled WITHOUT
             # the `generator` so the trajectory / DDPM RNG stream is unchanged
@@ -223,7 +228,9 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
             # frozen ResNet every step.
             if current_obs is not None:
                 self.scout_planner.set_current_obs(current_obs)
-        for t in scheduler.timesteps:
+        for _n, t in enumerate(scheduler.timesteps):
+            if _step_cb is not None:
+                _step_cb(_n)     # 0-based denoise-step index (pg_start gate)
             # 1. apply conditioning (inpaint) -- LPB L246.
             trajectory[condition_mask] = condition_data[condition_mask]
             trajectory = trajectory.detach().requires_grad_()

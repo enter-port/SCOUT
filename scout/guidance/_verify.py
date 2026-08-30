@@ -446,6 +446,103 @@ def check_expert_guidance(policy, planner, scout_vib, current_obs,
           f"guided vs unguided max|diff|={diff:.2e} (bites OK)")
 
 
+def check_particle_guidance(policy, scout_vib, current_obs,
+                            cond_data, cond_mask, global_cond, seed=233):
+    """Checks 7-9 (particle guidance, user 2026-08-30, idea/particle_design.md):
+
+    (7) pg_start=never -> the guided trajectory is BIT-IDENTICAL to
+        --guide atypical (repulsion is a purely additive term; the RNG
+        stream is untouched by it).
+    (8) repulsion semantics on hand-built codes:
+        - single-particle groups / cross-scene rows -> exactly the atypical
+          loss (zero repulsion);
+        - same-scene pairs add a positive symmetric term whose gradient
+          pushes the two rows APART along their separation direction.
+    (9) pg_start gate: with num_inference_steps=10 / pg_start=5 the planner
+        telemetry shows exactly 5 active of 10 compute_loss calls per
+        denoise loop (steps 5..9).
+    """
+    from scout.guidance.particle_costs import ParticleCostPlanner
+    from scout.guidance.entropy_costs import AtypicalCostPlanner
+
+    gst = policy.noise_scheduler.config.num_train_timesteps
+
+    # ---- (7) pg_start=never == atypical, bit-for-bit -------------------- #
+    t_out = {}
+    for name, pl in (
+            ("atypical", AtypicalCostPlanner(scout_vib, bridge=IdentityBridge())),
+            ("particle", ParticleCostPlanner(scout_vib, bridge=IdentityBridge(),
+                                             pg_start=10 ** 9))):
+        policy.initialize_scout_planner(planner=pl,
+                                        guidance_start_timestep=gst,
+                                        guidance_scale=1.0)
+        t_out[name] = _run_sample(policy, cond_data, cond_mask, None,
+                                  current_obs, z=None, seed=seed,
+                                  classifier_guidance=True,
+                                  guidance_scale=1.0)
+    diff7 = (t_out["atypical"] - t_out["particle"]).abs().max().item()
+    assert diff7 == 0.0, (
+        f"(7) pg_start=never must be bit-identical to atypical; "
+        f"max|diff|={diff7:.3e}")
+
+    # ---- (8) repulsion semantics ----------------------------------------- #
+    att = AtypicalCostPlanner(scout_vib, bridge=IdentityBridge())
+    part = ParticleCostPlanner(scout_vib, bridge=IdentityBridge(), pg_start=0)
+    B = current_obs["proprio"].shape[0]
+    x0 = torch.randn(B, cond_data.shape[1], cond_data.shape[2])
+    for pl in (att, part):
+        pl.set_current_obs(current_obs)
+        pl.select_z(x0, current_obs)          # anchor capture (policy path)
+    # all rows on distinct scenes -> zero repulsion == atypical rows
+    part.set_row_context([101, 202, 303, 404])
+    L_single = part.compute_loss(x0, current_obs, reduction="sum")
+    L_att = att.compute_loss(x0, current_obs, reduction="sum")
+    assert torch.allclose(L_single, L_att, atol=1e-6), (
+        f"(8) single-particle groups must equal atypical; "
+        f"{float(L_single)} vs {float(L_att)}")
+    # same-scene pairs -> strictly positive additive term
+    part.set_row_context([7, 7, 3, 3])
+    L_pair = part.compute_loss(x0, current_obs, reduction="sum")
+    assert float(L_pair - L_att) > 0, (
+        f"(8) same-scene pairs must add positive repulsion; "
+        f"delta={float(L_pair - L_att):.3e}")
+    # hand-built codes: mutual push along the separation direction
+    mu = torch.tensor([[0.0, 0.0], [0.3, 0.0], [5.0, 5.0], [5.3, 5.0]])
+    mu.requires_grad_(True)
+    part._row_keys = [7, 7, 3, 3]
+    rep = part._repulsion_rows(mu)
+    assert float(rep[0]) > 0 and abs(float(rep[0] - rep[1])) < 1e-6, (
+        "(8) same-scene pair term must be positive and symmetric")
+    rep.sum().backward()
+    g = mu.grad
+    d01 = (mu[0] - mu[1]).detach()            # separation direction row0->row1
+    # injected force is -grad; row 0 must push ALONG d01 (away from row 1),
+    # row 1 against it (away from row 0) -- mutual separation.
+    assert float(torch.dot(-g[0], d01)) > 0 and float(torch.dot(g[1], d01)) > 0, (
+        "(8) repulsion gradient must push same-scene rows apart")
+
+    # ---- (9) pg_start gate counters --------------------------------------- #
+    part3 = ParticleCostPlanner(scout_vib, bridge=IdentityBridge(), pg_start=5)
+    policy.initialize_scout_planner(planner=part3,
+                                    guidance_start_timestep=gst,
+                                    guidance_scale=1.0)
+    _run_sample(policy, cond_data, cond_mask, None, current_obs, z=None,
+                seed=seed, classifier_guidance=True, guidance_scale=1.0)
+    assert part3._rep_calls == policy.num_inference_steps, (
+        f"(9) expected {policy.num_inference_steps} compute_loss calls, "
+        f"got {part3._rep_calls}")
+    assert part3._rep_on_calls == 5, (
+        f"(9) pg_start=5 with 10 inference steps -> 5 active calls, "
+        f"got {part3._rep_on_calls}")
+
+    print(f"[check 7] pg_start=never == atypical bit-identical "
+          f"(max|diff|={diff7:.1e})")
+    print(f"[check 8] repulsion: zero on single-particle groups, positive "
+          f"symmetric on pairs, gradient pushes rows apart")
+    print(f"[check 9] pg_start gate: {part3._rep_on_calls}/"
+          f"{part3._rep_calls} calls active (pg_start=5/10 steps)")
+
+
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -469,6 +566,9 @@ def main():
     # check 6 replaces the policy's planner with the expert one -- run LAST.
     check_expert_guidance(policy, planner, scout_vib, current_obs,
                           cond_data, cond_mask)
+    # particle guidance checks (7-9) replace the planner too; run after 6.
+    check_particle_guidance(policy, scout_vib, current_obs,
+                            cond_data, cond_mask, global_cond)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

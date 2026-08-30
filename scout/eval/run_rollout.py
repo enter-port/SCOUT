@@ -94,7 +94,33 @@ def main():
                         "cost form; needs --vib-ckpt); "
                         "'rand_<idea>' = entropy-random-dev registry plugin "
                         "(scout/guidance/rand_costs/; needs --vib-ckpt); "
+                        "'particle' = entropy cost + parallel inter-particle "
+                        "repulsion (a scene's retries launch as ONE slot "
+                        "group and repel each other's behaviour codes while "
+                        "generating; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
+    p.add_argument("--pg-lambda", type=float, default=1.0,
+                   help="particle: repulsion weight (lambda). Calibrate via "
+                        "smoke so the repulsion inject magnitude lands at "
+                        "0.5-1x the entropy-cost magnitude (2026-08-30 plan).")
+    p.add_argument("--pg-h-scale", type=float, default=1.0,
+                   help="particle: bandwidth multiplier c -- h = c * median "
+                        "of the group's pairwise mu distances (median "
+                        "heuristic; per-group, per-replan).")
+    p.add_argument("--pg-start", type=int, default=0,
+                   help="particle: 0-based denoise-step index at which the "
+                        "repulsion switches ON (timing ablation G1/G2/G3 = "
+                        "0/50/90; before it the loss is bit-identical to "
+                        "--guide atypical).")
+    p.add_argument("--failed-set-json", default=None,
+                   help="rescue mode: load the FROZEN failure set from this "
+                        "json (explore-only -- the eval phase is skipped and "
+                        "pass@k is measured on exactly the recorded failed "
+                        "inits).")
+    p.add_argument("--save-failed-set", default=None,
+                   help="rescue mode: save the baseline run's failed inits to "
+                        "this json (run once with the base DP, then reuse for "
+                        "every experiment via --failed-set-json).")
     p.add_argument("--novelty-h", type=float, default=5.0,
                    help="novelty KDE kernel width floor, in units of the "
                         "encoder's running per-dim sigma; width also adapts "
@@ -204,7 +230,8 @@ def main():
     # --guide validation: static set + auto-discovered rand registry
     # (entropy-random-dev, 2026-08-27; free-form instead of argparse choices)
     from scout.guidance.rand_costs import REGISTRY as _RAND
-    _static = ("dyn", "off", "expert", "novelty", "atypical", "combo", "shell")
+    _static = ("dyn", "off", "expert", "novelty", "atypical", "combo",
+               "shell", "particle")
     if not (args.guide in _static or (args.guide.startswith("rand_")
                                       and args.guide[5:] in _RAND)):
         p.error(f"--guide must be one of {_static} or rand_<idea>, "
@@ -254,7 +281,7 @@ def main():
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                             "shell") or args.guide.startswith("rand_")
+                             "shell", "particle") or args.guide.startswith("rand_")
               ) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
@@ -446,7 +473,12 @@ def main():
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
                         "shell_seed": args.seed,
+                        "pg_lambda": args.pg_lambda,
+                        "pg_h_scale": args.pg_h_scale,
+                        "pg_start": args.pg_start,
                         **rand_ek},
+        failed_set_json=args.failed_set_json,
+        save_failed_set=args.save_failed_set,
     )
     try:
         result = pipeline.run(

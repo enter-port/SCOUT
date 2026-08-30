@@ -133,6 +133,57 @@ def main():
         f"all-failed init must contribute its FIRST retry (attempt 2), "
         f"got attempt {start_attempt}")
 
+    # ---- failed-set save/load round-trip (user 2026-08-30) ---------------- #
+    # Run 1 saves the failure set; run 2 (explore-only) loads it, skips the
+    # baseline rollouts, and must explore EXACTLY the same failed inits.
+    import json as _json
+    import os as _os
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        fs_path = _os.path.join(_td, "failed_set.json")
+        ATTEMPTS.clear()      # module-global attempt counter: fresh scenario
+        pipe2 = RolloutPipeline(
+            cfg=cfg, dp_factory=lambda ckpt: MockDP().eval(),
+            scout_vib_factory=None, env_factory=lambda: MockEnv(),
+            device=torch.device("cpu"), guided=False,
+            save_failed_set=fs_path)
+        rp.collect_initial_states = (
+            lambda ef, n_init_states, base_seed=None:
+                init_states[:int(n_init_states)])
+        try:
+            r1 = pipe2.run("mock-ckpt", explore_mode="rescue",
+                           explore_try_times=5)
+        finally:
+            rp.collect_initial_states = orig_collect
+        with open(fs_path) as f:
+            spec = _json.load(f)
+        assert spec["failed_init_indices"] == m["failed_init_indices"], spec
+        assert spec["n_eval"] == len(NEEDS) and spec["dp_ckpt"] == "mock-ckpt"
+
+        ATTEMPTS.clear()      # same: run 3 replays the identical scenario
+        pipe3 = RolloutPipeline(
+            cfg=cfg, dp_factory=lambda ckpt: MockDP().eval(),
+            scout_vib_factory=None, env_factory=lambda: MockEnv(),
+            device=torch.device("cpu"), guided=False,
+            failed_set_json=fs_path)
+        rp.collect_initial_states = (
+            lambda ef, n_init_states, base_seed=None:
+                init_states[:int(n_init_states)])
+        try:
+            r2 = pipe3.run("mock-ckpt", explore_mode="rescue",
+                           explore_try_times=5)
+        finally:
+            rp.collect_initial_states = orig_collect
+        m2 = r2["metrics"]
+        assert m2["explore_only"] is True and \
+            m2["failed_set_source"] == fs_path, m2
+        assert m2["failed_init_indices"] == m["failed_init_indices"], m2
+        assert m2["n_failed"] == m["n_failed"], m2
+        assert m2["exploration_rescued"] == m["exploration_rescued"], m2
+        assert abs(m2["pass_at_5"] - m["pass_at_5"]) < 1e-9, m2
+    print("[smoke_rescue] failed-set save/load round-trip OK "
+          "(explore-only explores exactly the frozen failure set)")
+
     print("[smoke_rescue] OK:",
           {k: m[k] for k in ("baseline_solved", "n_failed",
                              "exploration_rescued", "pass_at_5",

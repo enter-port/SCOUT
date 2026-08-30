@@ -32,6 +32,8 @@ is the sole source.
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -79,12 +81,20 @@ class RolloutPipeline:
                  guided: bool = False, guide_mode: str = "dyn",
                  bank_hdf5: Optional[str] = None,
                  log_every: Optional[int] = None,
-                 entropy_kwargs: Optional[dict] = None):
+                 entropy_kwargs: Optional[dict] = None,
+                 failed_set_json: Optional[str] = None,
+                 save_failed_set: Optional[str] = None):
         self.cfg = cfg
         self.dp_factory = dp_factory
         self.scout_vib_factory = scout_vib_factory
         self.env_factory = env_factory
         self.entropy_kwargs = entropy_kwargs or {}
+        # rescue protocol fixed-failure-set support (user 2026-08-30): the
+        # baseline eval runs ONCE, its failed inits are saved to a json, and
+        # every subsequent experiment EXPLORE-ONLY re-runs on exactly that
+        # scene set (pass@10 measured on a frozen failure set).
+        self.failed_set_json = failed_set_json
+        self.save_failed_set = save_failed_set
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.guided = bool(guided)
@@ -180,6 +190,23 @@ class RolloutPipeline:
                     att_weight=float(ek.get("combo_att_weight", 1.0)),
                 )
             print(f"[rollout] entropy cost guidance: mode={self.guide_mode} {ek}")
+        elif self.guide_mode == "particle":
+            # particle guidance (user 2026-08-30, idea/particle_design.md):
+            # entropy cost + parallel inter-particle repulsion. The planner
+            # declares GROUP_LOCK so rollout_vec schedules a scene's retries
+            # as ONE slot group (same replan batch = repulsion precondition).
+            from scout.guidance.particle_costs import ParticleCostPlanner
+            ek = dict(self.entropy_kwargs or {})
+            planner = ParticleCostPlanner(
+                scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                cap=float(ek.get("atypical_cap", 10.0)),
+                pg_lambda=float(ek.get("pg_lambda", 1.0)),
+                pg_h_scale=float(ek.get("pg_h_scale", 1.0)),
+                pg_start=int(ek.get("pg_start", 0)),
+            )
+            print(f"[rollout] particle guidance: lambda={planner.pg_lambda} "
+                  f"h_scale={planner.pg_h_scale} pg_start={planner.pg_start} "
+                  f"cap={ek.get('atypical_cap', 10.0)}")
         elif self.guide_mode.startswith("rand_"):
             # entropy-random-dev registry (user 2026-08-27): idea plugins in
             # scout/guidance/rand_costs/<name>.py; auto-discovered, shared
@@ -476,15 +503,64 @@ class RolloutPipeline:
         # ---- phase 1: eval on the seed-fixed scene set (measurement only) -- #
         eval_states = collect_initial_states(
             self.env_factory, n_init_states=n_eval, base_seed=self.base_seed)
-        eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
-        first_results, _, _ = evaluate_baseline_vec(
-            dp, self.env_factory, eval_states, horizon=horizon,
-            n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
-            n_tries=1, metric_prefix="eval",
-            record_obs=False,                      # eval trajs are NOT data
-            on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
-        )
-        baseline_solved = int(sum(1 for s, _ in first_results if s))
+        _loaded_failed_set = False
+        if (self.failed_set_json is not None
+                and os.path.exists(self.failed_set_json)):
+            # explore-only mode (user 2026-08-30): reuse the FROZEN failure
+            # set of the baseline run instead of re-rolling the eval phase.
+            # Init states are still collected (same seed -> bit-identical
+            # scenes); only the baseline rollout is skipped.
+            with open(self.failed_set_json) as f:
+                spec = json.load(f)
+            if int(spec.get("n_eval", -1)) != n_eval:
+                raise RuntimeError(
+                    f"failed-set json {self.failed_set_json} was built with "
+                    f"n_eval={spec.get('n_eval')} != {n_eval} -- refusing")
+            _bs = spec.get("base_seed")
+            if (_bs is not None and self.base_seed is not None
+                    and int(_bs) != int(self.base_seed)):
+                raise RuntimeError(
+                    f"failed-set json {self.failed_set_json} was built with "
+                    f"base_seed={_bs} != {self.base_seed} -- different scene "
+                    f"set; refusing")
+            if spec.get("dp_ckpt") != dp_ckpt:
+                print(f"[rollout:rescue] WARNING: failed set was recorded for "
+                      f"dp_ckpt={spec.get('dp_ckpt')}, this run uses "
+                      f"{dp_ckpt} (proceeding on the frozen scene set)")
+            _failed = set(int(i) for i in spec["failed_init_indices"])
+            first_results = [(i not in _failed, eval_states[i])
+                             for i in range(n_eval)]
+            baseline_solved = n_eval - len(_failed)
+            _loaded_failed_set = True
+            print(f"[rollout:rescue] explore-only: failed set loaded from "
+                  f"{self.failed_set_json} ({len(_failed)} failed inits, "
+                  f"recorded SR {baseline_solved}/{n_eval})")
+        else:
+            eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
+            first_results, _, _ = evaluate_baseline_vec(
+                dp, self.env_factory, eval_states, horizon=horizon,
+                n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
+                n_tries=1, metric_prefix="eval",
+                record_obs=False,                      # eval trajs are NOT data
+                on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
+            )
+            baseline_solved = int(sum(1 for s, _ in first_results if s))
+            if self.save_failed_set:
+                os.makedirs(os.path.dirname(self.save_failed_set) or ".",
+                            exist_ok=True)
+                _spec = {
+                    "failed_init_indices": [i for i, (s, _) in
+                                            enumerate(first_results) if not s],
+                    "n_eval": n_eval,
+                    "base_seed": self.base_seed,
+                    "dp_ckpt": dp_ckpt,
+                    "baseline_solved": baseline_solved,
+                }
+                with open(self.save_failed_set, "w") as f:
+                    json.dump(_spec, f, indent=1)
+                print(f"[rollout:rescue] failed set saved to "
+                      f"{self.save_failed_set} "
+                      f"({n_eval - baseline_solved} failed inits)")
         n_failed = n_eval - baseline_solved
         print(f"[rollout:rescue] eval: success_rate={baseline_solved}/{n_eval} "
               f"({baseline_solved / max(n_eval, 1):.3f}); "
@@ -542,7 +618,10 @@ class RolloutPipeline:
             "success_rate": success_rate_per_round(first_results),
             "pass_at_5": pass_at_k(expl, first_results, k=try_times),
             "avg_jerk": _jerk_all_explore_trajs(expl),
-            "jerk_baseline": jerk_of_results(first_results, only_successful=True),
+            # explore-only: no baseline trajs were rolled -> no baseline jerk
+            "jerk_baseline": (None if _loaded_failed_set else
+                              jerk_of_results(first_results,
+                                              only_successful=True)),
             "baseline_solved": baseline_solved,
             "n_failed": n_failed,
             "exploration_rescued": rescued,
@@ -554,6 +633,9 @@ class RolloutPipeline:
             "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
                                     if not s],
         }
+        if _loaded_failed_set:
+            metrics["explore_only"] = True
+            metrics["failed_set_source"] = self.failed_set_json
         return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
 
 

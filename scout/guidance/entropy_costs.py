@@ -191,8 +191,11 @@ class AtypicalCostPlanner(ScoutPlanner):
         self._base_lv = [v.detach() for v in logvar]
         return None
 
-    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
-                     reduction: str = "mean") -> torch.Tensor:
+    def _encode_and_row_losses(self, x0_hat: torch.Tensor,
+                               current_obs=None):
+        """Shared core (particle_costs reuses it): ONE vib_enc forward ->
+        (mu [grad-carrying], per-row capped-KL losses list). Identical math
+        to the pre-refactor compute_loss body (bit-for-bit)."""
         s_bar_t = self._resolve_s_bar_t(current_obs)
         a = _enc_forward(self, x0_hat)
         mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
@@ -206,6 +209,11 @@ class AtypicalCostPlanner(ScoutPlanner):
             kl = 0.5 * (((mu[i] - m0) ** 2 / var0)
                         + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
             rows.append(-torch.clamp(kl, max=self.cap))
+        return mu, rows
+
+    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
+                     reduction: str = "mean") -> torch.Tensor:
+        _, rows = self._encode_and_row_losses(x0_hat, current_obs)
         nll = torch.stack(rows)
         if reduction == "mean":
             return nll.mean()

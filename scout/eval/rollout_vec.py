@@ -337,27 +337,53 @@ class _VecRunner:
             self.on_done(slot)
 
     # -- main loop --------------------------------------------------------- #
-    def run(self, job_queue: Deque[tuple], record_obs: bool):
+    def run(self, job_queue: Deque[tuple], record_obs: bool,
+            group_lock: bool = False):
         """Drain ``job_queue`` across the slots. Each job is a tuple whose first
         element is the init_state; remaining elements are caller routing tags.
         ``self.job_gate`` (optional) can veto popping a job -- used to
-        serialize a scene's retries (try j waits for try j-1 to finalize)."""
+        serialize a scene's retries (try j waits for try j-1 to finalize).
+        ``group_lock=True`` (particle guidance, 2026-08-30): a scene's retry
+        jobs must reach the replan batch TOGETHER -- the inter-particle
+        repulsion only exists between rows of the same scene generated in
+        parallel. A scene's jobs are queued consecutively, so the head of the
+        queue is one whole group: launch it into consecutive slots only when
+        ALL of it fits in the idle slots (never split a group; if it does not
+        fit, wait for the next tick). Early-done particles shrink the group's
+        live rows naturally (a finalized slot frees and later joins another
+        group)."""
         tick = 0
         while job_queue or any(s.active for s in self.slots):
-            # 1. fill idle slots from the queue (first gate-passing job)
-            for s in self.slots:
-                if not s.active and job_queue:
-                    job = None
-                    if self.job_gate is None:
-                        job = job_queue.popleft()
-                    else:
-                        for qi, qj in enumerate(job_queue):
-                            if self.job_gate(qj):
-                                job = qj
-                                del job_queue[qi]
-                                break
-                    if job is not None:
-                        self._launch(s, job, record_obs)
+            # 1. fill idle slots from the queue
+            if group_lock:
+                free = [s for s in self.slots if not s.active]
+                while job_queue and free:
+                    gkey = job_queue[0][1]          # init_idx of the head group
+                    g = 0
+                    while g < len(job_queue) and job_queue[g][1] == gkey:
+                        g += 1
+                    if g > len(free):
+                        if g > len(self.slots):
+                            raise RuntimeError(
+                                f"group of {g} retries exceeds n_envs="
+                                f"{len(self.slots)} -- can never group-lock")
+                        break                       # does not fit yet -- wait
+                    for _ in range(g):
+                        self._launch(free.pop(0), job_queue.popleft(), record_obs)
+            else:
+                for s in self.slots:
+                    if not s.active and job_queue:
+                        job = None
+                        if self.job_gate is None:
+                            job = job_queue.popleft()
+                        else:
+                            for qi, qj in enumerate(job_queue):
+                                if self.job_gate(qj):
+                                    job = qj
+                                    del job_queue[qi]
+                                    break
+                        if job is not None:
+                            self._launch(s, job, record_obs)
             # 2. batched re-plan for slots needing a new chunk
             self._replan()
             # 3. step every active slot (may finalize some -> on_done)
@@ -571,17 +597,26 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                 "jerk_sum": jerk_sum, "jerk_n": jerk_n,
             })
 
+    # particle guidance (2026-08-30): the planner declares GROUP_LOCK ->
+    # schedule each scene's retries as ONE slot group so the same-scene rows
+    # share every replan batch (inter-particle repulsion precondition). The
+    # job gate (novelty's serialization) stays OFF for such planners: their
+    # repulsion is ONLINE (between currently-generating particles), not
+    # against finalized retries, so parallel launch is the requirement.
+    _planner = getattr(dp, "scout_planner", None) if guided else None
+    _group_lock = bool(getattr(_planner, "GROUP_LOCK", False))
     runner = _VecRunner(
         dp, env_factory, n_envs, n_action_steps, horizon, device,
         guided=guided, on_done=on_done, progress_cb=progress_cb,
         wandb_run=wandb_run, log_every=log_every,
         job_gate=(lambda job: job[2] == 0
                   or done_tries.get(job[1], -1) >= job[2] - 1)
-        if (guided and hasattr(dp, "scout_planner")
+        if (guided and not _group_lock
+           and hasattr(dp, "scout_planner")
            and hasattr(dp.scout_planner, "on_try_done")) else None,
     )
     try:
-        runner.run(job_queue, record_obs=True)
+        runner.run(job_queue, record_obs=True, group_lock=_group_lock)
     finally:
         runner.close()
 
@@ -770,10 +805,11 @@ def _smoke_vec():
         try_times=3, n_envs=N_ENVS, n_action_steps=N_ACTION_STEPS, device=device,
         only_failed_of=base_vec,
     )
-    # schema check
+    # schema check (first_traj added by the rescue protocol 2026-08-23)
     for r in expl_vec:
         assert set(r.keys()) == {"solved", "n_tries", "successful_trajs",
-                                 "all_trajs", "baseline_solved"}, "schema"
+                                 "all_trajs", "baseline_solved",
+                                 "first_traj"}, "schema"
         if not r["baseline_solved"]:
             assert len(r["all_trajs"]) == 3, "all try_times trajs kept (no early stop)"
             for t in r["successful_trajs"]:
@@ -833,6 +869,60 @@ def _smoke_vec():
         "rate>1 regression: numerators must only count fully-done envs")
     assert succ / max(env_done, 1) <= 1.0 and pass5 / max(env_done, 1) <= 1.0
     print("[4] rate>1 regression guard OK")
+
+    # ---- check 5: group-locked scheduling (particle, 2026-08-30) --------- #
+    # A scene's retry jobs must launch in ONE wave (never split across fill
+    # waves). Fake slots + instrumented _launch; progress_cb splits waves
+    # (log_every=1); _step_slots finalizes one active slot per tick so the
+    # next group eventually fits. Groups here: 3+3 jobs on 5 slots -> wave 1
+    # holds scene 0 only (3 of 5 free), scene 1 waits until 3 slots freed.
+    class _FakeSlot:
+        def __init__(self, i):
+            self.idx = i
+            self.active = False
+            self.job = None
+
+    runner = _VecRunner.__new__(_VecRunner)
+    runner.slots = [_FakeSlot(i) for i in range(5)]
+    runner.job_gate = None
+    runner.log_every = 1
+    waves: list = []
+
+    def _fake_launch(slot, job, ro):
+        slot.active = True
+        slot.job = job
+        waves[-1].append((slot.idx, job[1], job[2]))
+
+    runner._launch = _fake_launch
+    runner._replan = lambda: None
+
+    def _fake_step():
+        for s in runner.slots:
+            if s.active:
+                s.active = False
+                return
+
+    runner._step_slots = _fake_step
+    runner.progress_cb = lambda _t: waves.append([])
+    q = collections.deque([("s", 0, 0), ("s", 0, 1), ("s", 0, 2),
+                           ("s", 1, 0), ("s", 1, 1), ("s", 1, 2)])
+    waves.append([])
+    runner.run(q, record_obs=False, group_lock=True)
+    assert sum(len(w) for w in waves) == 6, f"expected 6 launches, got {waves}"
+    for w in waves:
+        scenes = {j[1] for j in w}
+        for sc in scenes:
+            n_in_w = sum(1 for j in w if j[1] == sc)
+            n_total = 3
+            assert n_in_w in (0, n_total), (
+                f"group split across waves: wave={w} scene={sc} has {n_in_w}")
+    w0_scene = next(j[1] for w in waves for j in w)  # first launch's scene
+    w_first = next(w for w in waves if w)
+    w_last = [w for w in waves if w][-1]
+    assert {j[1] for j in w_first} != {j[1] for j in w_last}, (
+        f"5 slots cannot hold both 3-groups at once: {waves}")
+    print(f"[5] group-lock scheduling OK (waves={[len(w) for w in waves if w]}, "
+          f"first scene {w0_scene} never split)")
 
     print("[smoke] rollout_vec.py OK")
 
