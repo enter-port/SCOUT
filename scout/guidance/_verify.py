@@ -738,7 +738,7 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
     assert orb._orb_calls == policy.num_inference_steps, (
         f"(12) expected {policy.num_inference_steps} orbit_update calls, "
         f"got {orb._orb_calls}")
-    assert orb._orb_p2_rows > 0, (
+    assert orb.p2_rows > 0, (
         "(12) cap=0.01 must push some rows into phase 2 on the mock path")
     t2 = _run_sample(policy, cond_data, cond_mask, None, current_obs,
                      z=None, seed=seed, classifier_guidance=True,
@@ -776,10 +776,16 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
     print(f"[check 11] orbit math: phase mask exact; Newton projection "
           f"identity; damped overshoot formula; tangential orthogonality; "
           f"flat-gradient guard")
+    # delta-guard (review P1): delta >= cap clamps to just under cap, so
+    # tiny-cap configs cannot silently turn into noise-everything.
+    _g = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=0.01,
+                          orbit_delta=0.25)
+    assert abs(_g.orbit_delta - 0.009999) < 1e-6, (
+        f"(12) orbit_delta must clamp under cap; got {_g.orbit_delta}")
     print(f"[check 12] orbit policy path: {orb._orb_calls} calls "
           f"({policy.num_inference_steps}/sample), p2_rows="
-          f"{orb._orb_p2_rows}/{orb._orb_rows}, deterministic, far/equal "
-          f"baselines behave as designed")
+          f"{orb.p2_rows}/{orb._orb_rows}, deterministic, far/equal "
+          f"baselines behave as designed, delta clamp OK")
 
 
 def main():
