@@ -503,7 +503,7 @@ def check_particle_guidance(policy, scout_vib, current_obs,
     # same-scene pairs -> strictly positive additive term
     part.set_row_context([7, 7, 3, 3])
     L_pair = part.compute_loss(x0, current_obs, reduction="sum")
-    assert float(L_pair - L_att) > 0, (
+    assert float((L_pair - L_att).detach()) > 0, (
         f"(8) same-scene pairs must add positive repulsion; "
         f"delta={float(L_pair - L_att):.3e}")
     # hand-built codes: mutual push along the separation direction
@@ -520,6 +520,79 @@ def check_particle_guidance(policy, scout_vib, current_obs,
     # row 1 against it (away from row 0) -- mutual separation.
     assert float(torch.dot(-g[0], d01)) > 0 and float(torch.dot(g[1], d01)) > 0, (
         "(8) repulsion gradient must push same-scene rows apart")
+
+    # vectorized == naive-loop reference on random codes / random grouping
+    torch.manual_seed(7)
+    mu_r = torch.randn(9, 4, dtype=torch.float64)
+    mu_r.requires_grad_(True)
+    part._row_keys = [1, 1, 1, 2, 2, 3, 3, 3, 3]
+    rep_v = part._repulsion_rows(mu_r)
+
+    # naive reference (the pre-vectorization implementation, verbatim math)
+    def _naive_ref(planner, m):
+        B = m.shape[0]
+        keys = [planner._row_keys[i] if i < len(planner._row_keys) else None
+                for i in range(B)]
+        m_d = m.detach()
+        dd = torch.cdist(m_d, m_d)
+        ref = []
+        for i in range(B):
+            grp = ([j for j in range(B)
+                    if j != i and keys[j] == keys[i]]
+                   if keys[i] is not None else [])
+            if not grp:
+                ref.append(m[i].sum() * 0.0)
+                continue
+            g_all = [i] + grp
+            idx = torch.as_tensor(g_all)
+            sub = dd[idx][:, idx]
+            iu = torch.triu_indices(len(g_all), len(g_all), offset=1)
+            h = max(float(planner.pg_h_scale * sub[iu[0], iu[1]].median()),
+                    1e-8)
+            di = torch.stack([torch.norm(m[i] - m_d[j]) for j in grp])
+            ref.append(torch.exp(-(di ** 2) / (2.0 * h * h)).sum())
+        return torch.stack(ref)
+
+    rep_ref = _naive_ref(part, mu_r)
+    assert torch.allclose(rep_v, rep_ref, atol=1e-8), (
+        f"(8) vectorized repulsion must match the naive reference; "
+        f"max|diff|={float((rep_v - rep_ref).abs().max()):.3e}")
+    # coverage (review P2): None keys, short key list, all-None, float32 --
+    # each must also match the reference (exact zeros for unkeyed rows).
+    for keys_c, m_c in (
+            ([1, 1, None, None, 2, 2, 2], torch.randn(7, 5)),
+            ([1, 1, 3], torch.randn(6, 5, dtype=torch.float32)),
+            ([None] * 5, torch.randn(5, 3))):
+        part._row_keys = keys_c
+        rv = part._repulsion_rows(m_c.clone().requires_grad_(True))
+        rr = _naive_ref(part, m_c)
+        assert rv.shape == rr.shape == (m_c.shape[0],), (
+            f"(8) shape mismatch for keys={keys_c}")
+        assert torch.allclose(rv, rr, atol=1e-6), (
+            f"(8) vectorized vs naive mismatch for keys={keys_c}: "
+            f"{rv.tolist()} vs {rr.tolist()}")
+    part._row_keys = [1, 1, 1, 2, 2, 3, 3, 3, 3]
+    # gradient equivalence: vectorized vs reference, each on its own clone
+    mu_a = mu_r.detach().clone().requires_grad_(True)
+    part._repulsion_rows(mu_a).sum().backward()
+    mu_b = mu_r.detach().clone().requires_grad_(True)
+    mu_d2 = mu_b.detach()
+    dd2 = torch.cdist(mu_d2, mu_d2)
+    for i in range(9):
+        grp = [j for j in range(9)
+               if j != i and part._row_keys[j] == part._row_keys[i]]
+        if not grp:
+            continue
+        g_all = [i] + grp
+        idx = torch.as_tensor(g_all)
+        sub = dd2[idx][:, idx]
+        iu = torch.triu_indices(len(g_all), len(g_all), offset=1)
+        h = max(float(part.pg_h_scale * sub[iu[0], iu[1]].median()), 1e-8)
+        di = torch.stack([torch.norm(mu_b[i] - mu_d2[j]) for j in grp])
+        torch.exp(-(di ** 2) / (2.0 * h * h)).sum().backward()
+    assert torch.allclose(mu_a.grad, mu_b.grad, atol=1e-8), (
+        f"(8) vectorized repulsion gradients must match the naive reference; "
+        f"max|diff|={float((mu_a.grad - mu_b.grad).abs().max()):.3e}")
 
     # ---- (9) pg_start gate counters --------------------------------------- #
     part3 = ParticleCostPlanner(scout_vib, bridge=IdentityBridge(), pg_start=5)
