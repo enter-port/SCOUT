@@ -32,14 +32,24 @@ Derivation chain (math session, msg 42):
               at kappa from either side (never pushes past the shell, so the
               particle-repulsion overdose cliff cannot occur by construction).
   5. The Newton step is reparametrization-invariant: computed with
-     g = df/dx_t it equals the x0_hat-space Newton step exactly (the 1/sqrt
-     (abar) Jacobian of pred_original_sample cancels between the numerator
-     and the ||g||^2 denominator). The tangential noise is scaled by
-     sqrt(1-abar_t) to match the injection convention (anneals like the DDPM
-     process noise; sigma_orb is its own dose knob, INDEPENDENT of eta).
+     g = df/dx_t it equals the x0_hat-space Newton step (the 1/sqrt(abar)
+     Jacobian of pred_original_sample cancels between the numerator and the
+     ||g||^2 denominator) -- under the frozen-eps (affine x0_hat in x_t)
+     approximation; the actual graph also differentiates through the UNet
+     Jacobian, so the equivalence is approximate to the same order as every
+     other injection here (the climb included). The tangential noise is
+     scaled by sqrt(1-abar_t) to match the injection convention (anneals
+     like the DDPM process noise; sigma_orb is its own dose knob,
+     INDEPENDENT of eta).
   6. Phase 2 REPLACES the climb on its rows (the feedback itself keeps
      climbing below kappa -- -lam*(f-kappa) is positive along grad f when
-     f < kappa), so there is no double dose at the hand-over.
+     f < kappa), so there is no double dose at the hand-over. Note the
+     hand-over is DIRECTIONAL, not force, continuity: at the boundary the
+     injected magnitude jumps from eta*sqrt(1-abar)*||grad f|| to
+     lam*|f-kappa|/||grad f||, and the Newton term deliberately carries no
+     sqrt(1-abar_t) annealing (scale-free step) -- so late-denoise feedback
+     is relatively stronger than the vanishing climb/noise. Dose calibration
+     should read the telemetry's mean|fb| and mean|noise| separately.
 
 No-op sentinel: (orbit_lam=0, orbit_sigma=0, orbit_delta=0) is bit-identical
 to --guide atypical (phase-2 rows then have zero capped-climb gradient anyway,
@@ -81,7 +91,10 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
     fb = fb_coeff[:, None, None] * g                               # (B,T,Da)
     noise = torch.zeros_like(g)
     if float(sigma) > 0.0:
-        ghat = g / safe.sqrt()[:, None, None]   # small rows -> 0 (full noise)
+        # flat rows: ghat exactly 0 -> UNPROJECTED (full) noise; near-flat
+        # rows above the threshold keep their (unit) direction (review P2).
+        ghat = torch.where(small[:, None, None], torch.zeros_like(g),
+                           g / safe.sqrt()[:, None, None])
         xi = torch.randn(g.shape, device=g.device, dtype=g.dtype)
         dot = (xi * ghat).flatten(1).sum(dim=1)
         noise = float(noise_scale) * float(sigma) * (xi - dot[:, None, None] * ghat)
@@ -112,15 +125,31 @@ class OrbitCostPlanner(ScoutPlanner):
         self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
                                         obs_adapter=obs_adapter, cap=cap)
         self.orbit_lam = float(orbit_lam)
+        # guard: kappa - delta <= 0 would put EVERY row (KL~0 included) in
+        # phase 2 and turn the run into unprojected noise-everything; clamp
+        # delta just under kappa instead (review P1).
+        if float(cap) - float(orbit_delta) <= 0.0:
+            orbit_delta = max(float(cap) - 1e-6, 0.0)
+            print(f"[orbit] WARNING: orbit_delta >= cap "
+                  f"({orbit_delta} >= {cap}); clamped to {orbit_delta} "
+                  f"-- phase 2 would otherwise swallow every row",
+                  flush=True)
         self.orbit_delta = float(orbit_delta)
         self.orbit_sigma = float(orbit_sigma)
         # telemetry (dose calibration reads this): device-side accumulators,
         # host sync only on the print tick (the pg-telemetry pattern).
         self._orb_calls = 0          # orbit_update invocations
-        self._orb_rows = 0           # rows seen
-        self._orb_p2_rows = 0        # rows that entered phase 2
+        self._orb_rows = 0           # rows seen (host int -- shape, no sync)
+        self._orb_p2_rows = 0        # rows that entered phase 2 (print tick)
+        self._p2_acc: Optional[torch.Tensor] = None    # device sum of p2
         self._fb_acc: Optional[torch.Tensor] = None    # sum per-row |fb| norm
         self._noise_acc: Optional[torch.Tensor] = None  # sum per-row noise norm
+
+    @property
+    def p2_rows(self) -> int:
+        """Phase-2 row count so far (one host sync -- tests/probes only;
+        production reads it off the orbit-telemetry print tick)."""
+        return int(self._p2_acc) if self._p2_acc is not None else 0
 
     # -- context plumbing (rollout_vec._replan hooks) ---------------------- #
     def set_row_context(self, init_ids: Sequence):
@@ -175,18 +204,22 @@ class OrbitCostPlanner(ScoutPlanner):
             delta=self.orbit_delta, sigma=self.orbit_sigma,
             noise_scale=noise_scale)
         # telemetry (norms masked to phase-2 rows -- the dose numbers must
-        # describe what was actually injected, not the pre-mask values)
+        # describe what was actually injected, not the pre-mask values).
+        # Device-side accumulation only; the host sync happens on the print
+        # tick (review P2: a per-call .item() costs ~3.7k stream
+        # serializations per guided rollout).
         self._orb_calls += 1
         self._orb_rows += int(p2.shape[0])
-        self._orb_p2_rows += int(p2.sum().item())
         for attr, val in (("_fb_acc", (fb_n * p2).sum()),
-                          ("_noise_acc", (noise_n * p2).sum())):
+                          ("_noise_acc", (noise_n * p2).sum()),
+                          ("_p2_acc", p2.sum())):
             cur = getattr(self, attr)
             if cur is None or cur.device != val.device:
                 setattr(self, attr, val.detach().clone())
             else:
                 setattr(self, attr, cur + val.detach())
         if self._orb_calls % 2500 == 0:
+            self._orb_p2_rows = int(self._p2_acc)
             n = max(self._orb_p2_rows, 1)
             print(f"[orbit-telemetry] calls={self._orb_calls} "
                   f"p2_rows={self._orb_p2_rows}/{self._orb_rows} "
