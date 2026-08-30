@@ -66,4 +66,7 @@
 | **宽度** | 主指标:同一场景重试行为分布的散布程度(PR/d_act/终态散布三口径) |
 | **mean_inject** | 引导注入幅度遥测(每 5000 次注入的均值);注意幸存者偏差:早失败的低剂量轨迹贡献步数少 |
 | **state bank(状态库)** | exploit guide 的专家库:训练该 DP 的数据(success_accum)每一帧的 E_s(s) 编码;s̄ 切片预设 eye=手眼 view 512 维(LPB Square [...512:] 同款)/agentview/visual(双 view)/full |
+| **kNN cost(k 近邻代价)** | exploit guide 的 cost 变体(2026-08-30,commit 980b4fd):k>1 时取 bank 全局 k 近邻距离的均值代替最近单点——拉向流形局部密度而非单个(可能错配的)邻居;`--exploit-knn`,默认 1=LPB hard-argmin 逐位不变 |
+| **软门(soft gate)** | exploit guide 的 OOD 门变体(2026-08-30,commit 38fb92a):开门时的力度按超限程度加权 w=min(slope·(cost−thr)/thr, cap)——近门限温和、强离群重击;默认 slope=None=LPB 二值门逐位不变;`--exploit-gate-slope/--exploit-gate-cap` |
+| **cracks / drops(实拉括注)** | 75% campaign 取证术语:crack=门真开过且该场景被引导救回;drop=门真开过且该场景被引导弄丢;门从没开过的场景翻转叫实现漂移(flips),不计入引导功劳/损伤 |
 
