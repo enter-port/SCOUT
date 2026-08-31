@@ -258,7 +258,8 @@ class RolloutPipeline:
             n_explore: Optional[int] = None,
             explore_try_times: int = 1,
             eval_only: bool = False,
-            explore_mode: str = "fresh") -> dict:
+            explore_mode: str = "fresh",
+            rescue_seed: Optional[int] = None) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -281,7 +282,10 @@ class RolloutPipeline:
         -- explore retries ONLY the failed eval inits (same initial states)
         ``explore_try_times`` each; DP data = successful retries, dyn data =
         per failed init {successful retries if any, else FIRST retry}. See
-        :meth:`_run_rescue`.
+        :meth:`_run_rescue`. ``rescue_seed`` (2026-08-31 beat-SOE confirmation
+        protocol) re-seeds the retry RNG AFTER the frozen scene set / failed
+        set are locked in, decoupling the retry stream from the scene-set
+        seed (fresh-seed confirmation vs split search on the same scenes).
 
         Returns ``{"metrics": {...},
                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
@@ -290,7 +294,8 @@ class RolloutPipeline:
         if explore_mode == "rescue":
             return self._run_rescue(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
-                try_times=int(explore_try_times), eval_only=eval_only)
+                try_times=int(explore_try_times), eval_only=eval_only,
+                rescue_seed=rescue_seed)
         if explore_seed is not None or eval_only:
             return self._run_split(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
@@ -495,7 +500,8 @@ class RolloutPipeline:
     # ------------------------------------------------------------------ #
     def _run_rescue(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
                     on_progress: Optional[Callable[..., None]] = None,
-                    try_times: int = 5, eval_only: bool = False) -> dict:
+                    try_times: int = 5, eval_only: bool = False,
+                    rescue_seed: Optional[int] = None) -> dict:
         """SOE rescue protocol (user 2026-08-23) -- explore == eval scenes.
 
         eval   : the seed-fixed measurement set (``cfg.eval.seed`` -> seeds
@@ -603,6 +609,19 @@ class RolloutPipeline:
             return {"metrics": metrics, "trajs": [], "all_trajs": []}
 
         # ---- phase 2: explore = retry FAILED eval inits -------------------- #
+        # Fresh retry RNG (2026-08-31): re-seed AFTER scenes + failed set are
+        # locked in (both derive from base_seed above), so phase-2 GLOBAL-RNG
+        # draws (DDPM denoising noise, novelty eps, orbit iid tangential noise)
+        # come from a stream independent of the frozen scene-set seed.
+        # SCOPE (subagent review): dedicated-generator draws do NOT follow this
+        # re-seed -- orbit sector=det (orbit_sector_seed), shell (shell_seed),
+        # rand_* plugins (rand_seed) replay their search streams; the CLI warns
+        # and drivers must pass matching *-seed flags. None -> bit-identical.
+        if rescue_seed is not None:
+            torch.manual_seed(int(rescue_seed))
+            np.random.seed(int(rescue_seed))
+            print(f"[rollout:rescue] retry RNG re-seeded to {rescue_seed} "
+                  f"(scene set stays base_seed={self.base_seed})")
         if self.guided:
             if self.scout_vib_factory is None:
                 raise ValueError("guided=True requires a scout_vib_factory")
@@ -651,6 +670,7 @@ class RolloutPipeline:
             "explore_solved": rescued,
             "explore_total": n_failed,
             "explore_try_times": try_times,
+            "rescue_seed": rescue_seed,
             "collected_trajs": len(trajs),
             "n_all_trajs": len(all_trajs),
             "failed_init_indices": [i for i, (s, _) in enumerate(first_results)

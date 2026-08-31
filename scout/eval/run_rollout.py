@@ -242,6 +242,17 @@ def main():
                    help="rollouts per explore scene in fresh mode / retries per "
                         "failed eval init in rescue mode (default 1; rescue "
                         "drivers pass 5)")
+    p.add_argument("--rescue-seed", type=int, default=None,
+                   help="rescue mode only (errors otherwise): re-seed the "
+                        "GLOBAL retry RNG with this AFTER the frozen scene set "
+                        "/ failed set are locked in (scene set stays --seed). "
+                        "Fresh-seed confirmation runs pass 43 to decorrelate "
+                        "from a split search done on the 42 stream; omitting "
+                        "continues the historical stream (retry RNG evolves "
+                        "from the scene-set seed, bit-identical to old runs). "
+                        "NOTE: orbit sector=det / shell / rand_* use dedicated "
+                        "generators (orbit-sector-seed / shell / rand seed) "
+                        "that do NOT follow this flag.")
     p.add_argument("--eval-only", action="store_true",
                    help="split protocol but SKIP the explore phase: run the "
                         "seed-fixed eval set once, report success_rate/jerk, "
@@ -279,6 +290,27 @@ def main():
             rand_ek[k.strip()] = float(v)
         except ValueError:
             rand_ek[k.strip()] = v.strip()
+
+    if args.rescue_seed is not None:
+        if args.explore_mode != "rescue":
+            p.error("--rescue-seed requires --explore-mode rescue "
+                    "(other modes ignore it -- refusing silently-wrong runs)")
+        if args.rescue_seed < 0:
+            p.error("--rescue-seed must be >= 0 (np.random.seed range)")
+        # dedicated-generator draws replay their search stream under this flag
+        _det = []
+        if args.guide == "shell":
+            _det.append("shell (shell_seed, derived from --seed)")
+        if args.guide == "orbit" and args.orbit_sector == "det":
+            _det.append("orbit sector=det (--orbit-sector-seed)")
+        if args.guide.startswith("rand_"):
+            _det.append(f"{args.guide} (rand seed)")
+        if _det:
+            print("[run_rollout] WARNING: --rescue-seed only re-seeds the "
+                  "GLOBAL RNG; these draws will replay their search stream: "
+                  + "; ".join(_det)
+                  + " -- pass matching *-seed flags to decorrelate",
+                  flush=True)
 
     cfg = load_cfg(args.config)
     cfg.base_dp.initial_ckpt_path = args.base_dp_ckpt
@@ -534,6 +566,7 @@ def main():
             explore_try_times=args.explore_try_times,
             eval_only=args.eval_only,
             explore_mode=args.explore_mode,
+            rescue_seed=args.rescue_seed,
         )
         metrics = result["metrics"]
 
@@ -668,6 +701,8 @@ def main():
                 })
                 if rescue_mode:
                     summary["explore_try_times"] = metrics["explore_try_times"]
+                    if args.rescue_seed is not None:
+                        summary["rescue_seed"] = args.rescue_seed
                 else:
                     summary["n_baseline_trajs"] = int(cfg.eval.n_init_states)
             with open(json_path, "w") as f:
