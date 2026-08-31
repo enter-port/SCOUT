@@ -148,6 +148,20 @@ def main():
                         "(1-abar_t)^(p/2). 1.0 = original (bit-identical); "
                         ">1 suppresses late-denoise noise harder (jerk "
                         "lever, beat-SOE campaign B3).")
+    p.add_argument("--orbit-climb", choices=["grad", "ray"], default="grad",
+                   help="orbit: phase-1 climb mode. 'grad' = steepest climb "
+                        "for every retry (original, bit-identical default). "
+                        "'ray' = retry 0 keeps the steepest climb (gamma_0), "
+                        "retry k>=1 climbs along a FIXED max-min design unit "
+                        "direction u_k with magnitude restoration "
+                        "v=||g||*sgn(<g,u_k>)*u_k (df/dt>=0 identity) -- "
+                        "retries become independent direction draws (wide "
+                        "explore; beat-SOE campaign B4, 2026-09-01, design "
+                        "in idea/escape_coverage_research.md section 7).")
+    p.add_argument("--orbit-ray-seed", type=int, default=42,
+                   help="orbit: master seed for climb='ray' design "
+                        "directions (dedicated generator -- does NOT follow "
+                        "--rescue-seed).")
     p.add_argument("--failed-set-json", default=None,
                    help="rescue mode: load the FROZEN failure set from this "
                         "json (explore-only -- the eval phase is skipped and "
@@ -303,6 +317,8 @@ def main():
             _det.append("shell (shell_seed, derived from --seed)")
         if args.guide == "orbit" and args.orbit_sector == "det":
             _det.append("orbit sector=det (--orbit-sector-seed)")
+        if args.guide == "orbit" and args.orbit_climb == "ray":
+            _det.append("orbit climb=ray (--orbit-ray-seed)")
         if args.guide.startswith("rand_"):
             _det.append(f"{args.guide} (rand seed)")
         if _det:
@@ -551,6 +567,8 @@ def main():
                         "orbit_sector": args.orbit_sector,
                         "orbit_sector_seed": args.orbit_sector_seed,
                         "orbit_noise_anneal": args.orbit_noise_anneal,
+                        "orbit_climb": args.orbit_climb,
+                        "orbit_ray_seed": args.orbit_ray_seed,
                         **rand_ek},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
@@ -703,6 +721,11 @@ def main():
                     summary["explore_try_times"] = metrics["explore_try_times"]
                     if args.rescue_seed is not None:
                         summary["rescue_seed"] = args.rescue_seed
+                    # per-scene rescue record -- pooled pass@10 across arms and
+                    # split search need scene identity; fingerprints from hdf5
+                    # are the fallback, this is the primary (2026-08-31 gap:
+                    # metrics had it, summary never did -> gate jsons read 0)
+                    summary["explore_detail"] = metrics.get("explore_detail", [])
                 else:
                     summary["n_baseline_trajs"] = int(cfg.eval.n_init_states)
             with open(json_path, "w") as f:

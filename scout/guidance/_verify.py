@@ -885,6 +885,122 @@ def check_orbit_sector(scout_vib, current_obs, cond_data, seed=233):
           "value guard OK")
 
 
+def check_orbit_ray(policy, scout_vib, current_obs, cond_data, seed=233):
+    """Check 15 (beat-SOE campaign B4, 2026-09-01): climb='ray' rotates the
+    phase-1 climb of retries k>=1 onto fixed max-min design unit directions
+    with magnitude restoration v = ||g||*sgn(<g,u_k>)*u_k.
+
+    (15a) default 'grad': ray_rotate returns the input untouched;
+    (15b) try 0 (gamma_0) row verbatim; try k row: per-row norm preserved
+          EXACTLY and direction = +/-u_k with sign = sgn(<g,u_k>);
+    (15c) flat rows (zero gradient) stay zero;
+    (15d) monotonicity identity <v, g> = ||g||*|<ghat,u>| >= 0 on random
+          gradients (the df/dt >= 0 certificate);
+    (15e) design deterministic per seed (reproduces across instances),
+          different seed differs; no-jobs -> warn-once fallback keeps g;
+          invalid climb value raises at __init__;
+    (15f) POLICY level: through guided_conditional_sample the _ray_fn hook
+          actually rotates -- k>=1 rows differ between grad and ray planners
+          (same seed/global RNG; cap=1e9 keeps every row phase 1) while the
+          gamma_0 row stays bit-identical (guards the silently-ignored-
+          rotation bug class, cf. check 13c's exact-value assertion).
+    """
+    torch.manual_seed(seed)
+    from scout.guidance.orbit_costs import OrbitCostPlanner
+    Bn = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+    jobs = [(None, 3, j) for j in range(Bn - 1)] + [(None, 7, 4)]
+
+    def _planner(**kw):
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                             cap=2.5, orbit_sigma=0.25, **kw)
+        p.set_current_obs(current_obs)
+        return p
+
+    g = torch.randn(Bn, H, Ad)
+    # (15a) default grad mode: untouched (same tensor object)
+    orb0 = _planner()
+    orb0.set_row_jobs(jobs)
+    assert orb0.ray_rotate(g) is g, "(15a) grad mode must return input as-is"
+    # (15b) ray mode
+    orb = _planner(orbit_climb="ray")
+    orb.set_row_jobs(jobs)
+    out = orb.ray_rotate(g)
+    gn = g.flatten(1).norm(dim=1)
+    on = out.flatten(1).norm(dim=1)
+    assert torch.equal(out[0], g[0]), "(15b) gamma_0 (try 0) row verbatim"
+    dirs = orb._ray_design_dirs(max(int(j[2]) for j in jobs), (H, Ad))
+    for r, j in enumerate(jobs):
+        k = int(j[2])
+        if k < 1:
+            continue
+        assert torch.allclose(on[r], gn[r], rtol=1e-6), (
+            f"(15b) row {r} norm must be preserved exactly")
+        u = dirs[k - 1]
+        cos = float((g[r].flatten() @ u.flatten()) / gn[r])
+        expect = gn[r] * (1.0 if cos >= 0.0 else -1.0) * u
+        assert torch.allclose(out[r], expect, atol=1e-5), (
+            f"(15b) row {r} must be the magnitude-restored design direction")
+        if r != 0:
+            cross = float(out[r].flatten() @ dirs[0].flatten()
+                          / (on[r] * dirs[0].flatten().norm()))
+            assert abs(cross) < 0.9 or k == 1, (
+                "(15b) design directions should be near-orthogonal")
+    # (15c) flat rows stay zero
+    gflat = g.clone(); gflat[-1] = 0.0
+    outf = orb.ray_rotate(gflat)
+    assert float(outf[-1].abs().max()) == 0.0, "(15c) flat row stays zero"
+    # (15d) monotonicity identity: <v, g> >= 0 on every rotated row
+    dots = (out[:-1] * g[:-1]).flatten(1).sum(dim=1)
+    assert bool((dots >= -1e-6).all()), "(15d) <v,g> must be >= 0 everywhere"
+    # (15e) determinism / seeds / fallback / validation
+    orb_b = _planner(orbit_climb="ray", orbit_ray_seed=42)
+    orb_b.set_row_jobs(jobs)
+    assert torch.equal(
+        orb_b.ray_rotate(g), out), "(15e) ray must reproduce across instances"
+    orb_s43 = _planner(orbit_climb="ray", orbit_ray_seed=43)
+    orb_s43.set_row_jobs(jobs)
+    assert not torch.equal(orb_s43.ray_rotate(g), out), (
+        "(15e) ray seed 43 must differ")
+    orb_nj = _planner(orbit_climb="ray")
+    assert orb_nj.ray_rotate(g) is g, "(15e) no-jobs fallback keeps g verbatim"
+    assert orb_nj.ray_rotate(g) is g, "(15e) fallback warns once, no crash"
+    try:
+        OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                         orbit_climb="bogus")
+        raise AssertionError("(15e) bogus climb must raise at __init__")
+    except ValueError:
+        pass
+    # (15f) policy level: the hook bites inside guided_conditional_sample
+    cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+    gst = policy.noise_scheduler.config.num_train_timesteps
+    tp = {}
+    for name, pl in (
+            ("grad", OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                                      cap=1e9, orbit_lam=0.0,
+                                      orbit_delta=0.0, orbit_sigma=0.0)),
+            ("ray", OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                                     cap=1e9, orbit_lam=0.0,
+                                     orbit_delta=0.0, orbit_sigma=0.0,
+                                     orbit_climb="ray"))):
+        policy.initialize_scout_planner(planner=pl,
+                                        guidance_start_timestep=gst,
+                                        guidance_scale=1.0)
+        pl.set_row_jobs(jobs)
+        tp[name] = _run_sample(policy, cond_data, cond_mask, None,
+                               current_obs, z=None, seed=seed,
+                               classifier_guidance=True, guidance_scale=1.0)
+    d15 = (tp["grad"] - tp["ray"]).abs()
+    assert float(d15[0].max()) == 0.0, (
+        "(15f) gamma_0 row must stay bit-identical through the policy path")
+    assert float(d15[1:].max()) > 0.0, (
+        "(15f) k>=1 rows must differ -- a silently-ignored ray hook fails here")
+    assert int(pl._ray_cnt) > 0, "(15f) ray telemetry must count rotated rows"
+    print("[check 15] orbit ray: gamma_0 verbatim, try-k rows = norm-preserving "
+          "+/-u_k (design det./seeded), flat rows zero, <v,g>>=0 identity, "
+          "policy hook bites OK")
+
+
 def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
     """Check 14 (beat-SOE campaign B3, 2026-08-31): orbit_noise_anneal=p
     raises the incoming sqrt(1-abar_t) noise scale to the p-th power.
@@ -991,6 +1107,7 @@ def main():
     check_orbit_sector(scout_vib, current_obs, cond_data)
     # noise-anneal check (14), planner-level only.
     check_orbit_anneal(scout_vib, current_obs, cond_data)
+    check_orbit_ray(policy, scout_vib, current_obs, cond_data)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

@@ -224,12 +224,15 @@ class RolloutPipeline:
                 orbit_sector=str(ek.get("orbit_sector", "iid")),
                 orbit_sector_seed=int(ek.get("orbit_sector_seed", 42)),
                 orbit_noise_anneal=float(ek.get("orbit_noise_anneal", 1.0)),
+                orbit_climb=str(ek.get("orbit_climb", "grad")),
+                orbit_ray_seed=int(ek.get("orbit_ray_seed", 42)),
             )
             print(f"[rollout] orbit guidance: lam={planner.orbit_lam} "
                   f"delta={planner.orbit_delta} sigma={planner.orbit_sigma} "
                   f"kappa={ek.get('atypical_cap', 10.0)} "
                   f"sector={planner.orbit_sector} "
-                  f"anneal={planner.orbit_noise_anneal}")
+                  f"anneal={planner.orbit_noise_anneal} "
+                  f"climb={planner.orbit_climb}")
         elif self.guide_mode.startswith("rand_"):
             # entropy-random-dev registry (user 2026-08-27): idea plugins in
             # scout/guidance/rand_costs/<name>.py; auto-discovered, shared
