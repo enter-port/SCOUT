@@ -788,6 +788,176 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
           f"baselines behave as designed, delta clamp OK")
 
 
+def check_orbit_sector(scout_vib, current_obs, cond_data, seed=233):
+    """Check 13 (beat-SOE campaign B2, 2026-08-31): sector='det' replaces the
+    i.i.d. tangent draw with a per-(scene, try) deterministic, cached
+    direction; default 'iid' is untouched.
+
+    (13a) determinism: two orbit_update calls with the same row jobs give
+          the same xi_override (cache hit, no redraw);
+    (13b) stratification: (init, try) pairs differ -> directions differ;
+    (13c) projection: the deterministic xi is projected against the CURRENT
+          row normal exactly like the i.i.d. draw (orthogonality on p2 rows);
+    (13d) fallback: sector='det' WITHOUT engine jobs falls back to i.i.d.
+          (warns once, no crash); invalid sector value raises at __init__.
+    """
+    torch.manual_seed(seed)
+    from scout.guidance.orbit_costs import OrbitCostPlanner
+    Bn = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+    jobs = [(None, 3, j) for j in range(Bn - 1)] + [(None, 7, 4)]
+
+    def _far_planner(**kw):
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                             cap=0.01, orbit_sigma=0.25, **kw)
+        p.set_current_obs(current_obs)
+        p.select_z(torch.randn(Bn, H, Ad), current_obs)
+        p._att._base_mu = [m + 5.0 for m in p._att._base_mu]
+        return p
+
+    orb = _far_planner(orbit_sector="det")
+    orb.set_row_jobs(jobs)
+    xi1 = orb._sector_xi(torch.zeros(Bn, H, Ad))
+    assert xi1 is not None and xi1.shape == (Bn, H, Ad), (
+        "(13a) sector xi must be stacked with the batch shape")
+    xi2 = orb._sector_xi(torch.zeros(Bn, H, Ad))     # cache hit
+    assert torch.equal(xi1, xi2), "(13a) cached sector xi must be identical"
+    # fresh planner, same jobs + seed -> same directions (cross-call repro)
+    orb_b = _far_planner(orbit_sector="det", orbit_sector_seed=42)
+    orb_b.set_row_jobs(jobs)
+    assert torch.equal(orb_b._sector_xi(torch.zeros(Bn, H, Ad)), xi1), (
+        "(13a) sector directions must reproduce across planner instances")
+    # (13b) rows 0/1 = same scene different try -> different; 0/last =
+    # different scene (7,4) -> different.
+    assert not torch.equal(xi1[0], xi1[1]), "(13b) try 0 vs try 1 must differ"
+    assert not torch.equal(xi1[0], xi1[-1]), "(13b) scene 3 vs scene 7 differ"
+    # (13c) projection: orbit_displacement with xi_override -- the sigma>0
+    # minus sigma=0 difference is the det-noise part; it must be orthogonal
+    # to g on phase-2 rows, exactly like the i.i.d. draw (fb is along g).
+    # PLUS the exact-value assertion: the noise part must equal the analytic
+    # projection of xi1 (review P1: orthogonality alone is blind to the
+    # override being ignored -- an i.i.d. draw is orthogonal too).
+    from scout.guidance.orbit_costs import orbit_displacement
+    torch.manual_seed(seed + 1)
+    klq = (torch.randn(Bn) * 0.5 + 2.0).abs()      # all rows far above cap
+    gq = torch.randn(Bn, H, Ad)
+    disp_s0, _, _ = orbit_displacement(klq, gq, 0.01, 0.5, 0.009, sigma=0.0)
+    disp_sd, _, _ = orbit_displacement(klq, gq, 0.01, 0.5, 0.009, sigma=0.25,
+                                       noise_scale=0.5, xi_override=xi1)
+    noise_part = disp_sd - disp_s0
+    dotn = (gq * noise_part).flatten(1).sum(dim=1)
+    gn = gq.flatten(1).norm(dim=1)
+    nn = noise_part.flatten(1).norm(dim=1)
+    for i in range(Bn):
+        assert abs(float(dotn[i])) < 1e-5 * float(gn[i] * nn[i]), (
+            f"(13c) det-mode noise must stay tangent (row {i})")
+    gn2 = (gq.flatten(1) ** 2).sum(dim=1).clamp(min=1e-16)
+    ghat_q = gq / gn2.sqrt()[:, None, None]
+    dot_x = (xi1 * ghat_q).flatten(1).sum(dim=1)
+    expected = 0.5 * 0.25 * (xi1 - dot_x[:, None, None] * ghat_q)
+    assert torch.allclose(noise_part, expected.to(noise_part.dtype),
+                          atol=1e-6), (
+        "(13c) det-mode noise must equal the analytic projection of xi1 "
+        "-- an ignored override (silent i.i.d. fallback) must fail here")
+    # seed actually reaches the generator (review P2): seed 43 != seed 42
+    orb_s43 = _far_planner(orbit_sector="det", orbit_sector_seed=43)
+    orb_s43.set_row_jobs(jobs)
+    xi43 = orb_s43._sector_xi(torch.zeros(Bn, H, Ad))
+    assert not torch.equal(xi43, xi1), "(13c) sector seed 43 must differ"
+    # and the full planner path still runs end-to-end in det mode
+    traj = torch.randn(Bn, H, Ad).requires_grad_(True)
+    disp, p2r = orb.orbit_update(traj, 2.0 * traj, current_obs,
+                                 noise_scale=0.5)
+    assert float(p2r.sum()) == float(Bn) and disp.abs().max().item() > 0, (
+        "(13c) det-mode orbit_update must produce phase-2 displacement")
+    # (13d) det WITHOUT jobs -> i.i.d. fallback, warns once, no crash
+    orb_nojobs = _far_planner(orbit_sector="det")
+    assert orb_nojobs._sector_xi(torch.zeros(Bn, H, Ad)) is None, (
+        "(13d) no-jobs sector must fall back to None (i.i.d.)")
+    try:
+        OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                         orbit_sector="bogus")
+        raise AssertionError("(13d) bogus sector must raise at __init__")
+    except ValueError:
+        pass
+    print("[check 13] orbit sector: det directions deterministic per "
+          "(scene,try), stratified, tangent-projected; no-jobs fallback + "
+          "value guard OK")
+
+
+def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
+    """Check 14 (beat-SOE campaign B3, 2026-08-31): orbit_noise_anneal=p
+    raises the incoming sqrt(1-abar_t) noise scale to the p-th power.
+
+    (14a) p=1.0 passes the scalar through untouched (bit-identical orbit
+          output -- no pow on the hot path);
+    (14b) p=2 squares the scale exactly: displacement's noise part scales
+          by scale^2 vs p=1 with the same RNG stream;
+    (14c) p<=0 raises at __init__.
+    """
+    torch.manual_seed(seed)
+    from scout.guidance.orbit_costs import OrbitCostPlanner
+    Bn = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+
+    def far(p_val, **kw):
+        torch.manual_seed(seed + 3)          # identical anchor across arms
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(),
+                             cap=0.01, orbit_sigma=0.25,
+                             orbit_noise_anneal=p_val, **kw)
+        p.set_current_obs(current_obs)
+        p.select_z(torch.randn(Bn, H, Ad), current_obs)
+        p._att._base_mu = [m + 5.0 for m in p._att._base_mu]
+        return p
+
+    outs = {}
+    for tag, pval in (("p1", 1.0), ("p2", 2.0)):
+        pl = far(pval)
+        torch.manual_seed(seed + 7)          # same stream for both arms
+        traj = torch.randn(Bn, H, Ad).requires_grad_(True)
+        disp, p2r = pl.orbit_update(traj, 2.0 * traj, current_obs,
+                                    noise_scale=0.6)
+        outs[tag] = (disp, p2r)
+    d1, p2r = outs["p1"]; d2, _ = outs["p2"]
+    assert float(p2r.sum()) == float(Bn), "(14) far baseline must be all p2"
+    assert d1.abs().max().item() > 0, "(14) displacement must be nonzero"
+    # (14a) bit-identity at p=1: rerun with a fresh planner, same stream
+    pl_b = far(1.0)
+    torch.manual_seed(seed + 7)
+    traj_b = torch.randn(Bn, H, Ad).requires_grad_(True)
+    disp_b, _ = pl_b.orbit_update(traj_b, 2.0 * traj_b, current_obs,
+                                  noise_scale=0.6)
+    assert torch.equal(d1, disp_b), "(14a) p=1 must be bit-identical"
+    # (14b) p=2: fb identical in both arms (same kl/g, same RNG stream), so
+    # d2 - fb = (0.36/0.6) * (d1 - fb) -> d2 == 0.6*d1 + 0.4*fb; fb is
+    # isolated by a third run at noise_scale=0 (sigma term multiplies to 0).
+    pl0 = far(1.0)
+    torch.manual_seed(seed + 7)
+    traj0 = torch.randn(Bn, H, Ad).requires_grad_(True)
+    disp0, _ = pl0.orbit_update(traj0, 2.0 * traj0, current_obs,
+                                noise_scale=0.0)     # fb only (sigma=0)
+    expect_d2 = 0.6 * d1 + 0.4 * disp0
+    assert torch.allclose(d2, expect_d2, atol=1e-6), (
+        "(14b) p=2 must square the scale exactly (d2 == s^2/s*d1+(1-s^2/s)fb)")
+    # non-integer p: 0.5 -> scale^0.5 = sqrt(0.6); same algebra via fb
+    pl_h = far(0.5)
+    torch.manual_seed(seed + 7)
+    traj_h = torch.randn(Bn, H, Ad).requires_grad_(True)
+    dh, _ = pl_h.orbit_update(traj_h, 2.0 * traj_h, current_obs,
+                              noise_scale=0.6)
+    r_h = 0.6 ** (0.5 - 1.0)     # noise ratio scale_h/scale_1 = s^(p-1)
+    assert torch.allclose(dh, r_h * d1 + (1.0 - r_h) * disp0, atol=1e-6), (
+        "(14b) non-integer p must follow scale**p exactly")
+    # (14c) invalid p raises
+    try:
+        far(0.0)
+        raise AssertionError("(14c) p=0 must raise at __init__")
+    except ValueError:
+        pass
+    print("[check 14] orbit noise anneal: p=1 bit-identical; p=2 squares "
+          "the sqrt(1-abar) scale exactly; p<=0 guard OK")
+
+
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -817,6 +987,10 @@ def main():
     # orbit guidance checks (10-12) replace the planner as well; run last.
     check_orbit_guidance(policy, scout_vib, current_obs,
                          cond_data, cond_mask, global_cond)
+    # sector mode check (13) needs no policy (planner-level only).
+    check_orbit_sector(scout_vib, current_obs, cond_data)
+    # noise-anneal check (14), planner-level only.
+    check_orbit_anneal(scout_vib, current_obs, cond_data)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

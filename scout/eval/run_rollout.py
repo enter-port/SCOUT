@@ -133,6 +133,21 @@ def main():
                         "orbit-telemetry so mean|noise| lands in the climb's "
                         "mean_inject band. 0 with lam=0/delta=0 = bit-"
                         "identical to --guide atypical.")
+    p.add_argument("--orbit-sector", choices=["iid", "det"], default="iid",
+                   help="orbit: tangential-noise mode. 'iid' = per-step i.i.d. "
+                        "draw (original, bit-identical default). 'det' = "
+                        "per-(scene,try) DETERMINISTIC direction, cached for "
+                        "the whole retry -- retries tour different great "
+                        "circles on the kappa shell (stratified angular "
+                        "coverage; beat-SOE campaign B2, 2026-08-31).")
+    p.add_argument("--orbit-sector-seed", type=int, default=42,
+                   help="orbit: master seed for sector='det' directions.")
+    p.add_argument("--orbit-noise-anneal", type=float, default=1.0,
+                   help="orbit: tangent-noise annealing exponent p on the "
+                        "sqrt(1-abar_t) scale -- the noise carries "
+                        "(1-abar_t)^(p/2). 1.0 = original (bit-identical); "
+                        ">1 suppresses late-denoise noise harder (jerk "
+                        "lever, beat-SOE campaign B3).")
     p.add_argument("--failed-set-json", default=None,
                    help="rescue mode: load the FROZEN failure set from this "
                         "json (explore-only -- the eval phase is skipped and "
@@ -501,6 +516,9 @@ def main():
                         "orbit_lam": args.orbit_lam,
                         "orbit_delta": args.orbit_delta,
                         "orbit_sigma": args.orbit_sigma,
+                        "orbit_sector": args.orbit_sector,
+                        "orbit_sector_seed": args.orbit_sector_seed,
+                        "orbit_noise_anneal": args.orbit_noise_anneal,
                         **rand_ek},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,

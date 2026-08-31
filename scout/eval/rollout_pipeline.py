@@ -221,10 +221,15 @@ class RolloutPipeline:
                 orbit_lam=float(ek.get("orbit_lam", 0.5)),
                 orbit_delta=float(ek.get("orbit_delta", 0.25)),
                 orbit_sigma=float(ek.get("orbit_sigma", 0.25)),
+                orbit_sector=str(ek.get("orbit_sector", "iid")),
+                orbit_sector_seed=int(ek.get("orbit_sector_seed", 42)),
+                orbit_noise_anneal=float(ek.get("orbit_noise_anneal", 1.0)),
             )
             print(f"[rollout] orbit guidance: lam={planner.orbit_lam} "
                   f"delta={planner.orbit_delta} sigma={planner.orbit_sigma} "
-                  f"kappa={ek.get('atypical_cap', 10.0)}")
+                  f"kappa={ek.get('atypical_cap', 10.0)} "
+                  f"sector={planner.orbit_sector} "
+                  f"anneal={planner.orbit_noise_anneal}")
         elif self.guide_mode.startswith("rand_"):
             # entropy-random-dev registry (user 2026-08-27): idea plugins in
             # scout/guidance/rand_costs/<name>.py; auto-discovered, shared
@@ -650,6 +655,15 @@ class RolloutPipeline:
             "n_all_trajs": len(all_trajs),
             "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
                                     if not s],
+            # per-failed-init rescue record (2026-08-31 budget-split design):
+            # first_success_try is the 1-based try index of the first success
+            # (= try_times when the init was never solved) -> pass@k curves and
+            # per-scene rescued sets straight from the json, no fingerprinting.
+            "explore_detail": [
+                {"init": i, "solved": bool(e["solved"]),
+                 "first_success_try": int(e["n_tries"])}
+                for i, e in enumerate(expl) if not e["baseline_solved"]
+            ],
         }
         if _loaded_failed_set:
             metrics["explore_only"] = True
