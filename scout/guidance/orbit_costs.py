@@ -68,7 +68,8 @@ from scout.guidance.planner import ScoutPlanner
 
 def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
                        lam: float, delta: float, sigma: float,
-                       noise_scale: float = 1.0):
+                       noise_scale: float = 1.0,
+                       xi_override: Optional[torch.Tensor] = None):
     """Pure phase-2 math (unit-tested directly): given the per-row UNCAPPED
     cost ``kl`` (B,) and its per-row gradient w.r.t. the trajectory ``g``
     (B, T, Da) -- block-diagonal, so row slices are per-row gradients of the
@@ -80,6 +81,11 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
               (detached; telemetry only).
 
     ``sigma=0`` draws NO random numbers (bit-identity with atypical holds).
+    ``xi_override`` (B, T, Da) replaces the i.i.d. ``randn`` draw with a
+    caller-supplied per-row direction (sector mode): it is projected against
+    the CURRENT row normal exactly like the i.i.d. draw, so a fixed vector
+    yields a persistent great-circle walk on the shell instead of a random
+    walk. ``None`` -> the original i.i.d. draw (bit-identical).
     """
     kl_d = kl.detach()
     p2 = kl_d >= (float(kappa) - float(delta))
@@ -95,7 +101,14 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
         # rows above the threshold keep their (unit) direction (review P2).
         ghat = torch.where(small[:, None, None], torch.zeros_like(g),
                            g / safe.sqrt()[:, None, None])
-        xi = torch.randn(g.shape, device=g.device, dtype=g.dtype)
+        if xi_override is None:
+            xi = torch.randn(g.shape, device=g.device, dtype=g.dtype)
+        else:
+            if tuple(xi_override.shape) != tuple(g.shape):
+                raise ValueError(
+                    f"sector xi shape {tuple(xi_override.shape)} != batch g "
+                    f"{tuple(g.shape)} -- row jobs desynced from replan batch")
+            xi = xi_override.detach().to(device=g.device, dtype=g.dtype)
         dot = (xi * ghat).flatten(1).sum(dim=1)
         noise = float(noise_scale) * float(sigma) * (xi - dot[:, None, None] * ghat)
     mask = p2.to(g.dtype)[:, None, None]
@@ -119,7 +132,9 @@ class OrbitCostPlanner(ScoutPlanner):
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
                  cap: float = 10.0,
                  orbit_lam: float = 0.5, orbit_delta: float = 0.25,
-                 orbit_sigma: float = 0.25):
+                 orbit_sigma: float = 0.25,
+                 orbit_sector: str = "iid", orbit_sector_seed: int = 42,
+                 orbit_noise_anneal: float = 1.0):
         super().__init__(scout_vib, bridge=bridge, z=None,
                          obs_adapter=obs_adapter)
         self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
@@ -136,6 +151,27 @@ class OrbitCostPlanner(ScoutPlanner):
                   flush=True)
         self.orbit_delta = float(orbit_delta)
         self.orbit_sigma = float(orbit_sigma)
+        # sector mode (B2, 2026-08-31 beat-SOE campaign): "iid" = per-step
+        # i.i.d. tangent noise (original, bit-identical default); "det" =
+        # per-(init, try) DETERMINISTIC direction vector, cached for the
+        # whole retry -- retries tour different great circles on the kappa
+        # shell (stratified angular coverage) instead of random walking a
+        # shared distribution.
+        if str(orbit_sector) not in ("iid", "det"):
+            raise ValueError(f"orbit_sector must be 'iid' or 'det', got "
+                             f"{orbit_sector!r}")
+        self.orbit_sector = str(orbit_sector)
+        self.orbit_sector_seed = int(orbit_sector_seed)
+        # B3 (beat-SOE campaign): tangent-noise annealing exponent on the
+        # sqrt(1-abar_t) scale -- 1.0 = original (bit-identical), >1 decays
+        # the noise faster through the denoise trajectory (jerk lever).
+        if float(orbit_noise_anneal) <= 0.0:
+            raise ValueError(f"orbit_noise_anneal must be > 0, got "
+                             f"{orbit_noise_anneal!r}")
+        self.orbit_noise_anneal = float(orbit_noise_anneal)
+        self._row_jobs: Optional[List] = None   # [(state, init_idx, try_idx)]
+        self._sector_vec = {}                   # (init_idx, try_idx) -> cpu tensor
+        self._sector_warned = False
         # telemetry (dose calibration reads this): device-side accumulators,
         # host sync only on the print tick (the pg-telemetry pattern).
         self._orb_calls = 0          # orbit_update invocations
@@ -154,6 +190,42 @@ class OrbitCostPlanner(ScoutPlanner):
     # -- context plumbing (rollout_vec._replan hooks) ---------------------- #
     def set_row_context(self, init_ids: Sequence):
         pass    # rows are independent; hook fires regardless (atypical idem)
+
+    def set_row_jobs(self, jobs):
+        """Per-replan row jobs ``[(state, init_idx, try_idx), ...]`` (engine
+        calls this whenever the planner exposes it). Sector mode keys its
+        deterministic direction cache on (init_idx, try_idx)."""
+        self._row_jobs = list(jobs)
+
+    def _sector_xi(self, g: torch.Tensor) -> Optional[torch.Tensor]:
+        """Per-row deterministic direction stack for sector='det', or None
+        (caller falls back to the i.i.d. draw). CPU generators -> device
+        copy; cached per (init_idx, try_idx) so the vector persists across
+        denoise steps AND chunks of the retry."""
+        if self.orbit_sector != "det":
+            return None
+        jobs = self._row_jobs
+        if not jobs:
+            if not self._sector_warned:
+                print("[orbit] WARNING: sector='det' but no row jobs from "
+                      "the engine -- falling back to i.i.d. tangent noise",
+                      flush=True)
+                self._sector_warned = True
+            return None
+        rows = []
+        shape = g.shape[1:]                     # (T, Da)
+        for j in jobs:
+            key = (int(j[1]), int(j[2]))
+            v = self._sector_vec.get(key)
+            if v is None or tuple(v.shape) != tuple(shape):
+                seed = ((self.orbit_sector_seed * 1_000_003
+                         + key[0] * 100_07 + key[1] * 7_919) & 0x7FFFFFFF)
+                gen = torch.Generator()
+                gen.manual_seed(seed)
+                v = torch.randn(shape, generator=gen)
+                self._sector_vec[key] = v
+            rows.append(v)
+        return torch.stack(rows).to(device=g.device, dtype=g.dtype)
 
     def select_z(self, x0_hat: torch.Tensor, current_obs=None):
         """Per-chunk intent anchor (mu^0, sigma^0^2) -- delegated verbatim to
@@ -195,14 +267,26 @@ class OrbitCostPlanner(ScoutPlanner):
         """Phase-2 constrained update -- called by policy.py right AFTER its
         capped-loss backward (which retains the shared x0_hat graph for this
         second backward through the UNet). Returns ``(disp, phase2)``; see
-        :func:`orbit_displacement`."""
+        :func:`orbit_displacement`.
+
+        ``noise_scale`` arriving from policy.py is the injection convention
+        sqrt(1-abar_t). ``orbit_noise_anneal=p`` (B3, beat-SOE campaign)
+        raises it to the p-th power, i.e. the tangential noise carries
+        (1-abar_t)^(p/2) instead of (1-abar_t)^(1/2): p>1 suppresses
+        late-denoise (fine action detail) noise harder -- the jerk-inflation
+        lever. p=1.0 passes the scalar through UNTOUCHED (bit-identical,
+        no floating-point pow on the hot path)."""
+        if float(self.orbit_noise_anneal) != 1.0:
+            noise_scale = float(noise_scale) ** float(self.orbit_noise_anneal)
         _, rows = self._encode_and_uncapped(x0_hat, current_obs)
         kl = torch.stack(rows)
         g = torch.autograd.grad(kl.sum(), trajectory)[0]
         disp, p2, (fb_n, noise_n) = orbit_displacement(
             kl, g, kappa=self._att.cap, lam=self.orbit_lam,
             delta=self.orbit_delta, sigma=self.orbit_sigma,
-            noise_scale=noise_scale)
+            noise_scale=noise_scale,
+            xi_override=(self._sector_xi(g) if self.orbit_sigma > 0.0
+                         else None))
         # telemetry (norms masked to phase-2 rows -- the dose numbers must
         # describe what was actually injected, not the pre-mask values).
         # Device-side accumulation only; the host sync happens on the print
