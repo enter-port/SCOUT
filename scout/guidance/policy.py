@@ -187,6 +187,12 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # generator preserves LPB's call syntax and value exactly while keeping
         # the main ``generator`` + global RNG streams clean.
         _gate_gen = torch.Generator(device=condition_data.device)
+        # ray climb (2026-09-01, B4): planner-provided climb-direction rotation
+        # for retries k>=1 (fixed design directions, magnitude preserved).
+        # Duck-typed like orbit_update; absent -> cond_grad is used verbatim
+        # for every guide mode (bit-identical).
+        _ray_fn = (getattr(self.scout_planner, "ray_rotate", None)
+                   if classifier_guidance else None)
         if classifier_guidance:
             # fix z for the whole loop (design §1: "z 整段定住"). Sampled WITHOUT
             # the `generator` so the trajectory / DDPM RNG stream is unchanged
@@ -260,6 +266,11 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                 )
                 cond_grad = -torch.autograd.grad(
                     loss, trajectory, retain_graph=(_orbit_fn is not None))[0]
+                if _ray_fn is not None:
+                    # ray mode: rotate the climb direction for retries k>=1
+                    # BEFORE any injection (phase-2 rows' climb is zeroed by
+                    # _keep below, so the rotation is a no-op for them).
+                    cond_grad = _ray_fn(cond_grad)
                 _noise_scale = (1.0 - scheduler.alphas_cumprod[t]).sqrt()
                 grad_scale = self.guidance_scale * _noise_scale
                 if _orbit_fn is None:

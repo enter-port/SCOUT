@@ -134,7 +134,8 @@ class OrbitCostPlanner(ScoutPlanner):
                  orbit_lam: float = 0.5, orbit_delta: float = 0.25,
                  orbit_sigma: float = 0.25,
                  orbit_sector: str = "iid", orbit_sector_seed: int = 42,
-                 orbit_noise_anneal: float = 1.0):
+                 orbit_noise_anneal: float = 1.0,
+                 orbit_climb: str = "grad", orbit_ray_seed: int = 42):
         super().__init__(scout_vib, bridge=bridge, z=None,
                          obs_adapter=obs_adapter)
         self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
@@ -169,9 +170,41 @@ class OrbitCostPlanner(ScoutPlanner):
             raise ValueError(f"orbit_noise_anneal must be > 0, got "
                              f"{orbit_noise_anneal!r}")
         self.orbit_noise_anneal = float(orbit_noise_anneal)
+        # B4 ray mode (2026-09-01, user-designated after the mix failed stage
+        # 2): "grad" = phase-1 climb keeps the steepest direction for EVERY
+        # retry (original, bit-identical default); "ray" = retry 0 (gamma_0)
+        # keeps the steepest climb verbatim, retry k >= 1 climbs along a FIXED
+        # unit direction u_k from a deterministic max-min design -- the
+        # rank-1 magnitude-restored field v = ||g||*sgn(<g,u_k>)*u_k keeps
+        # df/dt = ||g||*|<ghat,u_k>| >= 0 (monotone for any terrain) while
+        # making retries independent direction draws (wide explore). See
+        # idea/escape_coverage_research.md section 7.
+        if str(orbit_climb) not in ("grad", "ray"):
+            raise ValueError(f"orbit_climb must be 'grad' or 'ray', got "
+                             f"{orbit_climb!r}")
+        self.orbit_climb = str(orbit_climb)
+        self.orbit_ray_seed = int(orbit_ray_seed)
         self._row_jobs: Optional[List] = None   # [(state, init_idx, try_idx)]
         self._sector_vec = {}                   # (init_idx, try_idx) -> cpu tensor
         self._sector_warned = False
+        # ray mode (B4): deterministic max-min direction design, keyed by
+        # try_idx only (global design -- every scene's retry k climbs the SAME
+        # u_k; per-scene keying would need 100x the cache for no coverage
+        # gain). Cached per (try_idx, shape); generated from a dedicated CPU
+        # Generator (does NOT follow the global rescue-seed reseed -- pass
+        # --orbit-ray-seed to decorrelate confirmation runs, same class as
+        # sector=det).
+        self._ray_design: Optional[List] = None # try_idx -> design vector
+        self._ray_stack: Optional[torch.Tensor] = None  # on-device (K,T,Da)
+        self._ray_stack_key: Optional[tuple] = None
+        self._ray_warned = False
+        # ray telemetry: |cos(g,u_k)| sum + rotated-row count, both
+        # device-side; host sync only on the print tick (the c36e69f lesson:
+        # per-call/per-row .item() serializes the stream thousands of times
+        # per rollout).
+        self._ray_acc: Optional[torch.Tensor] = None
+        self._ray_cnt: Optional[torch.Tensor] = None
+        self._ray_calls = 0
         # telemetry (dose calibration reads this): device-side accumulators,
         # host sync only on the print tick (the pg-telemetry pattern).
         self._orb_calls = 0          # orbit_update invocations
@@ -226,6 +259,98 @@ class OrbitCostPlanner(ScoutPlanner):
                 self._sector_vec[key] = v
             rows.append(v)
         return torch.stack(rows).to(device=g.device, dtype=g.dtype)
+
+    def _ray_design_dirs(self, n_dirs: int, shape) -> List:
+        """Deterministic unit-vector design in the (T, Da) climb space:
+        normalized Gaussian candidates + greedy max-min-angle sieve
+        (section-7 'normalized Gaussian + max-min sieve' option; Fibonacci /
+        t-design are low-dim luxuries). Design indices map to retries k>=1
+        (k=0 is gamma_0 = the gradient itself). Cached; regenerated if the
+        replan shape changes (should never happen within a run)."""
+        if (self._ray_design is not None
+                and len(self._ray_design) >= n_dirs
+                and tuple(self._ray_design[0].shape) == tuple(shape)):
+            return self._ray_design[:n_dirs]
+        gen = torch.Generator()
+        gen.manual_seed(int(self.orbit_ray_seed))
+        cand = torch.randn((256,) + tuple(shape), generator=gen)
+        cand = cand / cand.flatten(1).norm(dim=1).clamp(
+            min=1e-12)[:, None, None]
+        d = cand.flatten(1)                       # (256, T*Da), unit rows
+        chosen = [int(torch.randint(d.shape[0], (1,), generator=gen))]
+        for _ in range(n_dirs - 1):
+            sims = d @ d[chosen].t()              # cosine to each chosen
+            chosen.append(int(sims.max(dim=1).values.argmin()))
+        self._ray_design = [cand[i] for i in chosen]
+        return self._ray_design
+
+    def ray_rotate(self, cond_grad: torch.Tensor) -> torch.Tensor:
+        """Climb-direction hook (duck-typed, consumed by policy.py right
+        before the injection): retries k >= 1 climb along the fixed unit
+        direction u_k with the magnitude-restored rank-1 field
+
+            v_i = ||g_i|| * sgn(<ghat_i, u_k>) * u_k
+
+        (identity: df/dt = ||g||*|<ghat, u>| >= 0 -- monotone on any terrain;
+        full injection strength preserved). Retry 0 (gamma_0) and rows
+        without row-jobs keep g verbatim; per-row norm is preserved exactly
+        so the mean_inject dose telemetry stays comparable across modes.
+        Phase-2 rows are unaffected semantically (policy.py zeroes their
+        climb via _keep and swaps in the constrained update). Fully
+        vectorized + device-side telemetry (no per-row host sync)."""
+        if self.orbit_climb != "ray":
+            return cond_grad
+        jobs = self._row_jobs
+        if not jobs:
+            if not self._ray_warned:
+                print("[orbit] WARNING: climb='ray' but no row jobs from the "
+                      "engine -- keeping the gradient climb everywhere",
+                      flush=True)
+                self._ray_warned = True
+            return cond_grad
+        if len(jobs) != cond_grad.shape[0]:
+            raise ValueError(f"ray row jobs {len(jobs)} != batch "
+                             f"{cond_grad.shape[0]} -- replan batch desynced")
+        self._ray_calls += 1
+        g = cond_grad
+        gnorm = g.detach().flatten(1).norm(dim=1)             # (B,)
+        max_try = max(int(j[2]) for j in jobs)
+        if max_try < 1:
+            return g                                        # all gamma_0
+        shape = tuple(g.shape[1:])
+        dirs = self._ray_design_dirs(max_try, shape)
+        key = (max_try, g.device, g.dtype, shape)
+        if self._ray_stack is None or self._ray_stack_key != key:
+            self._ray_stack = torch.stack(list(dirs)).to(
+                device=g.device, dtype=g.dtype)
+            self._ray_stack_key = key
+        U = self._ray_stack
+        kidx = torch.tensor([max(int(j[2]) - 1, -1) for j in jobs],
+                            device=g.device)                 # -1 = gamma_0
+        rot = (kidx >= 0) & (gnorm > 0)                      # (B,)
+        U_sel = U[kidx.clamp(min=0)]                         # (B,T,Da)
+        dot = (g.detach() * U_sel).flatten(1).sum(dim=1)     # (B,)
+        sgn = torch.where(dot >= 0, torch.ones_like(dot),
+                          -torch.ones_like(dot))
+        rotated = gnorm[:, None, None] * sgn[:, None, None] * U_sel
+        out = torch.where(rot[:, None, None], rotated, g)
+        with torch.no_grad():
+            # empty selection (all gamma_0 / all flat) sums to 0 -- no host
+            # sync anywhere off the print tick.
+            cos_abs = (dot.abs() / gnorm.clamp(min=1e-12))[rot].sum()
+            n_rot = rot.sum().to(g.dtype)
+            self._ray_acc = (cos_abs if self._ray_acc is None
+                             or self._ray_acc.device != cos_abs.device
+                             else self._ray_acc + cos_abs)
+            self._ray_cnt = (n_rot if self._ray_cnt is None
+                             or self._ray_cnt.device != n_rot.device
+                             else self._ray_cnt + n_rot)
+        if self._ray_calls % 2500 == 0 and self._ray_cnt is not None:
+            print(f"[ray-telemetry] calls={self._ray_calls} "
+                  f"rotated_rows={int(self._ray_cnt)} "
+                  f"mean|cos(g,u_k)|={float(self._ray_acc) / max(int(self._ray_cnt), 1):.4g}",
+                  flush=True)
+        return out
 
     def select_z(self, x0_hat: torch.Tensor, current_obs=None):
         """Per-chunk intent anchor (mu^0, sigma^0^2) -- delegated verbatim to
