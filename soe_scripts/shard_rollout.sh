@@ -78,3 +78,12 @@ $PY_BIN -m scout.eval.merge_sharded \
     --all-hdf5s "${SUFFIXED_A[@]}" --out-all "$OUT_ALL" \
     --core-hdf5 "$CORE"
 echo "[shard_rollout] merged -> $OUT_JSON $OUT_SUCCESS $OUT_ALL"
+
+# CLEANUP_SHARDS=1: after a successful merge, delete the workers' intermediate
+# outputs (suffixed files/dirs/stdouts) so the sharded run leaves only the
+# merged three-piece set -- same disk footprint as a monolithic run. Use
+# CLEANUP_SHARDS=dry to print the deletion plan without touching anything.
+if [ "${CLEANUP_SHARDS:-0}" = "1" ] || [ "${CLEANUP_SHARDS:-}" = "dry" ]; then
+  bash "$(dirname "$0")/_shard_cleanup.sh" "$P" "$OUT_JSON" "$OUT_SUCCESS" \
+      "$OUT_ALL" $([ "${CLEANUP_SHARDS:-}" = "dry" ] && echo dry)
+fi
