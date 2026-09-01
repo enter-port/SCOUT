@@ -46,13 +46,17 @@ P=$1; OUT_JSON=$2; OUT_SUCCESS=$3; OUT_ALL=$4; CORE=$5
 [ "$6" = "--" ] || { echo "expected '--' separator after CORE_HDF5"; exit 2; }
 shift 6
 ARGS="$@"
+PY_BIN="${PYTHON:-python}"
 mkdir -p "$(dirname "$OUT_JSON")" "$(dirname "$OUT_SUCCESS")" "$(dirname "$OUT_ALL")"
 
 PIDS=()
 for i in $(seq 0 $((P - 1))); do
   echo "[shard_rollout] launching shard $i/$P"
-  python -m scout.eval.run_rollout --scene-slice "$i:$P" \
-      --output-json "$OUT_JSON" "$ARGS" \
+  # NOTE: $ARGS intentionally UNQUOTED -- the driver's arg string must
+  # word-split into argv elements (quoting passes the whole string as ONE
+  # argument; caught in the server A/B).
+  $PY_BIN -m scout.eval.run_rollout --scene-slice "$i:$P" \
+      --output-json "$OUT_JSON" $ARGS \
       > "$(dirname "$OUT_JSON")/shard$i.stdout" 2>&1 &
   PIDS+=($!)
 done
@@ -68,7 +72,7 @@ for i in $(seq 0 $((P - 1))); do
   SUFFIXED_S+=("${OUT_SUCCESS%.*}-shard${i}of${P}.${OUT_SUCCESS##*.}")
   SUFFIXED_A+=("${OUT_ALL%.*}-shard${i}of${P}.${OUT_ALL##*.}")
 done
-python -m scout.eval.merge_sharded \
+$PY_BIN -m scout.eval.merge_sharded \
     --jsons "${SUFFIXED_JSON[@]}" --out-json "$OUT_JSON" \
     --success-hdf5s "${SUFFIXED_S[@]}" --out-success "$OUT_SUCCESS" \
     --all-hdf5s "${SUFFIXED_A[@]}" --out-all "$OUT_ALL" \
