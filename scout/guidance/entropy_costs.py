@@ -58,6 +58,52 @@ def _enc_forward(planner: ScoutPlanner, x0_hat: torch.Tensor) -> torch.Tensor:
     return a.reshape(x0_hat.shape[0], chunk_dim)
 
 
+def _kl_rows(mu: torch.Tensor, logvar: torch.Tensor,
+             base_mu: Sequence[Optional[torch.Tensor]],
+             base_lv: Sequence[Optional[torch.Tensor]],
+             x0_hat: torch.Tensor) -> torch.Tensor:
+    """Vectorized per-row UNCAPPED KL(q(z|s̄,a) ‖ q(z|s̄,a⁰)) -> (B,).
+
+    Exact batched rewrite of the historical per-row loop (perf 2026-09-01,
+    方案二: the loop cost ~6 kernel launches x B per call on the guided hot
+    path -- py-spy on the running orbit chain showed the guidance section at
+    ~55% of wall clock, kernel-launch bound). Elementwise ops are
+    per-element identical to the loop; the ``style_dim``-sized last-dim
+    reduction replaces B per-row ``.sum()`` calls (CPU: bitwise-identical,
+    asserted by verify check 16d; CUDA: a batched row-reduce may reorder the
+    16-element accumulation vs the standalone per-row sum, so cross-version
+    GPU bit-replay of pre-refactor runs is not guaranteed -- ulp-level,
+    science-neutral). Rows without a captured baseline (missing/None in
+    EITHER list -- only possible on direct calls before ``select_z``, which
+    sets both atomically) keep the loop's graph-connected-zero contract via
+    ``torch.where`` on a zero branch built from ``x0_hat`` (value AND
+    gradient contribution exactly zero, as ``x0_hat[i].sum() * 0.0`` was;
+    the pre-vectorization loop crashed loudly on an asymmetric None, the
+    new code zeroes the row instead -- unreachable via the public API).
+    """
+    B = mu.shape[0]
+
+    def _has(it, i):
+        return i < len(it) and it[i] is not None
+
+    m0 = torch.stack([
+        (base_mu[i] if _has(base_mu, i) else torch.zeros_like(mu[i]))
+        for i in range(B)])
+    lv0 = torch.stack([
+        (base_lv[i] if _has(base_lv, i) else torch.zeros_like(mu[i]))
+        for i in range(B)])
+    var, var0 = torch.exp(logvar), torch.exp(lv0)
+    kl = 0.5 * (((mu - m0) ** 2 / var0)
+                + (var / var0) - 1.0 - (logvar - lv0)).sum(dim=-1)
+    if any(not (_has(base_mu, i) and _has(base_lv, i)) for i in range(B)):
+        valid = torch.tensor(
+            [_has(base_mu, i) and _has(base_lv, i)
+             for i in range(B)], device=mu.device)
+        kl = torch.where(valid, kl,
+                         x0_hat.flatten(1).sum(dim=1).to(kl.dtype) * 0.0)
+    return kl
+
+
 class NoveltyCostPlanner(ScoutPlanner):
     """方案二 v2: minimize the KDE density of the candidate code among the
     EXECUTED codes of earlier retries of the same scene."""
@@ -191,21 +237,26 @@ class AtypicalCostPlanner(ScoutPlanner):
         self._base_lv = [v.detach() for v in logvar]
         return None
 
-    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
-                     reduction: str = "mean") -> torch.Tensor:
+    def _encode_and_row_losses(self, x0_hat: torch.Tensor,
+                               current_obs=None):
+        """Shared core: ONE vib_enc forward -> (mu [grad-carrying], per-row
+        capped-KL losses list). Vectorized (2026-09-01, 方案二): the per-row
+        python loop cost ~6 kernel launches x B per call on the guided hot
+        path; the batched form via :func:`_kl_rows` is math-identical
+        (elementwise per element; the ``style_dim`` last-dim reduction
+        replaces B per-row ``.sum()`` calls), and ``unbind`` keeps the
+        historical 0-dim-tensor-per-row list contract. Clamp/cap semantics
+        unchanged: the row VALUE caps at ``-cap``, the row GRADIENT is
+        masked to zero at/above cap (torch clamp(max) backward)."""
         s_bar_t = self._resolve_s_bar_t(current_obs)
         a = _enc_forward(self, x0_hat)
         mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
-        rows = []
-        for i in range(mu.shape[0]):
-            if i >= len(self._base_mu) or self._base_mu[i] is None:
-                rows.append(x0_hat[i].sum() * 0.0)
-                continue
-            m0, lv0 = self._base_mu[i], self._base_lv[i]
-            var, var0 = torch.exp(logvar[i]), torch.exp(lv0)
-            kl = 0.5 * (((mu[i] - m0) ** 2 / var0)
-                        + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
-            rows.append(-torch.clamp(kl, max=self.cap))
+        kl = _kl_rows(mu, logvar, self._base_mu, self._base_lv, x0_hat)
+        return mu, list((-torch.clamp(kl, max=self.cap)).unbind(0))
+
+    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
+                     reduction: str = "mean") -> torch.Tensor:
+        _, rows = self._encode_and_row_losses(x0_hat, current_obs)
         nll = torch.stack(rows)
         if reduction == "mean":
             return nll.mean()
