@@ -45,6 +45,13 @@ Checks (task verify):
      the historical per-row loop (values + gradients, incl. missing
      baselines).
 
+orbit-dev note (2026-09-01): this branch carries ONLY the orbit line
+extracted from entropy-random-dev (cherry-picks of f639e4b/c36e69f/
+d293f1a/283ef17/e4d7cc4/4211d97 onto main). Particle guidance and the
+rand-cost registry are NOT on this branch -- checks 7-9 (particle) are
+absent by construction and the check numbering keeps their slots empty
+for cross-branch comparability of the check names.
+
 Run:
     python -m scout.guidance._verify
 """

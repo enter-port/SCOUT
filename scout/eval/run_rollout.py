@@ -243,7 +243,7 @@ def main():
                         "from a split search done on the 42 stream; omitting "
                         "continues the historical stream (retry RNG evolves "
                         "from the scene-set seed, bit-identical to old runs). "
-                        "NOTE: orbit sector=det / shell / rand_* use dedicated "
+                        "NOTE: orbit sector=det and shell use dedicated "
                         "generators (orbit-sector-seed / shell / rand seed) "
                         "that do NOT follow this flag.")
     p.add_argument("--eval-only", action="store_true",

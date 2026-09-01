@@ -185,7 +185,7 @@ class RolloutPipeline:
             # constrained control -- climb below kappa-delta (verbatim
             # atypical), then Newton feedback + tangential noise pinned to
             # the kappa shell. Pure per-row mechanism: no group lock, i.i.d.
-            # retries exactly as atypical; particle guidance is untouched.
+            # retries exactly as atypical.
             from scout.guidance.orbit_costs import OrbitCostPlanner
             ek = dict(self.entropy_kwargs or {})
             planner = OrbitCostPlanner(
@@ -528,8 +528,8 @@ class RolloutPipeline:
         # draws (DDPM denoising noise, novelty eps, orbit iid tangential noise)
         # come from a stream independent of the frozen scene-set seed.
         # SCOPE (subagent review): dedicated-generator draws do NOT follow this
-        # re-seed -- orbit sector=det (orbit_sector_seed), shell (shell_seed),
-        # rand_* plugins (rand_seed) replay their search streams; the CLI warns
+        # re-seed -- orbit sector=det (orbit_sector_seed) and shell
+        # (shell_seed) replay their search streams; the CLI warns
         # and drivers must pass matching *-seed flags. None -> bit-identical.
         if rescue_seed is not None:
             torch.manual_seed(int(rescue_seed))
