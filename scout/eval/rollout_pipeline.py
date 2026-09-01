@@ -581,7 +581,7 @@ class RolloutPipeline:
             sel = list(range(slot, n_eval, shards))
             eval_states = [eval_states[i] for i in sel]
             first_results = [first_results[i] for i in sel]
-            baseline_solved = int(sum(1 for s, _ in first_results))
+            baseline_solved = int(sum(1 for s, _ in first_results if s))
             n_failed = len(first_results) - baseline_solved
             print(f"[rollout:rescue] scene slice {slot}/{shards}: "
                   f"{len(sel)} scenes (original indices {sel[0]}..{sel[-1]}); "
