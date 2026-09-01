@@ -262,7 +262,8 @@ class RolloutPipeline:
             explore_try_times: int = 1,
             eval_only: bool = False,
             explore_mode: str = "fresh",
-            rescue_seed: Optional[int] = None) -> dict:
+            rescue_seed: Optional[int] = None,
+            scene_slice: Optional[tuple] = None) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -298,7 +299,11 @@ class RolloutPipeline:
             return self._run_rescue(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
                 try_times=int(explore_try_times), eval_only=eval_only,
-                rescue_seed=rescue_seed)
+                rescue_seed=rescue_seed, scene_slice=scene_slice)
+        if scene_slice is not None:
+            raise ValueError(
+                "scene_slice is only implemented for explore_mode='rescue' "
+                f"(got {explore_mode!r})")
         if explore_seed is not None or eval_only:
             return self._run_split(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
@@ -504,7 +509,8 @@ class RolloutPipeline:
     def _run_rescue(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
                     on_progress: Optional[Callable[..., None]] = None,
                     try_times: int = 5, eval_only: bool = False,
-                    rescue_seed: Optional[int] = None) -> dict:
+                    rescue_seed: Optional[int] = None,
+                    scene_slice: Optional[tuple] = None) -> dict:
         """SOE rescue protocol (user 2026-08-23) -- explore == eval scenes.
 
         eval   : the seed-fixed measurement set (``cfg.eval.seed`` -> seeds
@@ -594,8 +600,25 @@ class RolloutPipeline:
                       f"{self.save_failed_set} "
                       f"({n_eval - baseline_solved} failed inits)")
         n_failed = n_eval - baseline_solved
-        print(f"[rollout:rescue] eval: success_rate={baseline_solved}/{n_eval} "
-              f"({baseline_solved / max(n_eval, 1):.3f}); "
+        # ---- scene slicing (multicore sharding, 2026-09-01) ---------------- #
+        # Worker SLOT of SHARDS keeps scenes with original index %% SHARDS ==
+        # SLOT (the frozen seed-fixed set is cut AFTER it is fully determined,
+        # so every worker sees bit-identical scenes; original indices are
+        # preserved through sel for failed_init_indices / explore_detail).
+        sel = list(range(n_eval))
+        if scene_slice is not None:
+            slot, shards = scene_slice
+            sel = list(range(slot, n_eval, shards))
+            eval_states = [eval_states[i] for i in sel]
+            first_results = [first_results[i] for i in sel]
+            baseline_solved = int(sum(1 for s, _ in first_results))
+            n_failed = len(first_results) - baseline_solved
+            print(f"[rollout:rescue] scene slice {slot}/{shards}: "
+                  f"{len(sel)} scenes (original indices {sel[0]}..{sel[-1]}); "
+                  f"slice SR {baseline_solved}/{len(sel)}")
+        print(f"[rollout:rescue] eval: success_rate={baseline_solved}/"
+              f"{len(first_results)} "
+              f"({baseline_solved / max(len(first_results), 1):.3f}); "
               f"{n_failed} failed inits -> explore")
 
         if eval_only:
@@ -604,9 +627,13 @@ class RolloutPipeline:
                 "jerk_baseline": jerk_of_results(first_results, only_successful=True),
                 "baseline_solved": baseline_solved,
                 "n_failed": n_failed,
-                "failed_init_indices": [i for i, (s, _) in
+                "failed_init_indices": [sel[i] for i, (s, _) in
                                         enumerate(first_results) if not s],
                 "eval_only": True,
+                "scene_slice": (list(scene_slice)
+                                if scene_slice is not None else None),
+                "n_eval_global": n_eval,
+                "n_slice": len(sel),
             }
             print("[rollout:rescue] eval-only round -- skipping explore phase")
             return {"metrics": metrics, "trajs": [], "all_trajs": []}
@@ -631,7 +658,8 @@ class RolloutPipeline:
             scout_vib = (self.scout_vib_factory(vib_ckpt)
                          if vib_ckpt is not None else self.scout_vib_factory())
             self._attach_planner(dp, scout_vib)
-        expl_cb = (lambda p: on_progress("explore", p, baseline_solved, n_eval)
+        expl_cb = (lambda p: on_progress(
+            "explore", p, baseline_solved, len(first_results))
                    ) if on_progress else None
         expl = evaluate_exploration_vec(
             dp, self.env_factory, eval_states, horizon=horizon,
@@ -659,10 +687,12 @@ class RolloutPipeline:
         print(f"[rollout:rescue] explore: rescued {rescued}/{n_failed} "
               f"failed inits; {len(trajs)} successful trajs -> DP retrain; "
               f"{len(all_trajs)} selected trajs -> dyn retrain")
+        _avg_jerk, _jerk_n = _jerk_all_explore_stats(expl)
         metrics = {
             "success_rate": success_rate_per_round(first_results),
             "pass_at_5": pass_at_k(expl, first_results, k=try_times),
-            "avg_jerk": _jerk_all_explore_trajs(expl),
+            "avg_jerk": _avg_jerk,
+            "explore_jerk_n": _jerk_n,
             # explore-only: no baseline trajs were rolled -> no baseline jerk
             "jerk_baseline": (None if _loaded_failed_set else
                               jerk_of_results(first_results,
@@ -676,17 +706,21 @@ class RolloutPipeline:
             "rescue_seed": rescue_seed,
             "collected_trajs": len(trajs),
             "n_all_trajs": len(all_trajs),
-            "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
+            "failed_init_indices": [sel[i] for i, (s, _) in enumerate(first_results)
                                     if not s],
             # per-failed-init rescue record (2026-08-31 budget-split design):
             # first_success_try is the 1-based try index of the first success
             # (= try_times when the init was never solved) -> pass@k curves and
             # per-scene rescued sets straight from the json, no fingerprinting.
             "explore_detail": [
-                {"init": i, "solved": bool(e["solved"]),
+                {"init": sel[i], "solved": bool(e["solved"]),
                  "first_success_try": int(e["n_tries"])}
                 for i, e in enumerate(expl) if not e["baseline_solved"]
             ],
+            "scene_slice": (list(scene_slice)
+                            if scene_slice is not None else None),
+            "n_eval_global": n_eval,
+            "n_slice": len(sel),
         }
         if _loaded_failed_set:
             metrics["explore_only"] = True
@@ -697,19 +731,27 @@ class RolloutPipeline:
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def _jerk_all_explore_stats(exploration_results):
+    """(mean, count) companion of :func:`_jerk_all_explore_trajs` -- the
+    count feeds the scene-shard merge's EXACT weighted mean (T<4 trajs are
+    skipped from the mean in both; weighting by n_failed*try_times would be
+    approximate whenever skips differ across shards)."""
+    jerks: List[float] = []
+    for e in exploration_results:
+        for traj in e.get("all_trajs", []):
+            j = jerk(traj["actions"])
+            if j > 0.0:
+                jerks.append(j)
+    return (float(np.mean(jerks)) if jerks else 0.0), len(jerks)
+
+
 def _jerk_all_explore_trajs(exploration_results) -> float:
     """Mean SOE jerk over EVERY exploration trajectory (``all_trajs``: success
     + failure), T<4 skipped. Same caliber as the engine's per-tick running
     ``avg_jerk`` (:func:`scout.eval.rollout_vec` accumulates jerk over every
     finalized traj). Used for the final JSON value.
     """
-    jerks: List[float] = []
-    for e in exploration_results:
-        for traj in e.get("all_trajs", []):
-            j = jerk(traj["actions"])
-            if j > 0.0:                               # T<4 -> 0.0, skipped
-                jerks.append(j)
-    return float(np.mean(jerks)) if jerks else 0.0
+    return _jerk_all_explore_stats(exploration_results)[0]
 
 
 def _assemble_all_trajs(first_results, exploration_results) -> List[dict]:

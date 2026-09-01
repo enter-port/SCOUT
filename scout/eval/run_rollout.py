@@ -286,6 +286,19 @@ def main():
                         "pre-registers the DP/loss and dyn/KL-loss, dyn/mse-loss "
                         "axes for the retrain stages that resume this run")
     p.add_argument("--device", default=None)
+    p.add_argument("--scene-slice", default=None, metavar="SLOT:SHARDS",
+                   help="rescue mode: this worker handles ONLY scenes with "
+                        "index %% SHARDS == SLOT of the frozen seed-fixed set "
+                        "(original indices preserved in the json). Launch SHARDS "
+                        "processes with the same --output-* prefix on one GPU "
+                        "for multicore CPU use (the rollout is single-core "
+                        "per process; see the 2026-09-01 py-spy profile). "
+                        "Outputs get a -shard{SLOT}of{SHARDS} suffix; merge "
+                        "with scout.eval.merge_sharded. NOTE: each worker "
+                        "draws from its own RNG stream, so results are "
+                        "statistically equivalent to (not bit-identical "
+                        "with) the monolithic run -- same protocol, same "
+                        "scenes, deterministic per (seed, SHARDS, SLOT).")
     args = p.parse_args()
 
     # --guide validation: static set + auto-discovered rand registry
@@ -304,6 +317,19 @@ def main():
             rand_ek[k.strip()] = float(v)
         except ValueError:
             rand_ek[k.strip()] = v.strip()
+
+    scene_slice = None
+    if args.scene_slice is not None:
+        if args.explore_mode != "rescue":
+            p.error("--scene-slice requires --explore-mode rescue "
+                    "(split/fresh modes have a different scene semantics)")
+        try:
+            _slot, _shards = args.scene_slice.split(":")
+            scene_slice = (int(_slot), int(_shards))
+        except ValueError:
+            p.error("--scene-slice must be SLOT:SHARDS, e.g. 0:4")
+        if scene_slice[1] < 1 or not (0 <= scene_slice[0] < scene_slice[1]):
+            p.error("--scene-slice needs 1 <= SHARDS and 0 <= SLOT < SHARDS")
 
     if args.rescue_seed is not None:
         if args.explore_mode != "rescue":
@@ -393,6 +419,26 @@ def main():
 
     # ---- output paths (convention: {task}_{a}_{...}) ----
     out_dir = args.output_dir or os.path.join("data", args.task, "rollout")
+
+    # scene slicing (multicore sharding, 2026-09-01): suffix every output
+    # identity so P worker processes launched with the same --output-* prefix
+    # never clobber each other; merge_sharded.py consumes the suffixed set.
+    if scene_slice is not None:
+        _tag = f"-shard{scene_slice[0]}of{scene_slice[1]}"
+        out_dir += _tag
+        wandb_name += _tag
+
+        def _suffix_path(pth):
+            low = pth.lower()
+            if low.endswith(".hdf5") or low.endswith(".json"):
+                return pth[: pth.rfind(".")] + _tag + pth[pth.rfind("."):]
+            return pth + _tag
+        args.output_success = (_suffix_path(args.output_success)
+                               if args.output_success else None)
+        args.output_all = (_suffix_path(args.output_all)
+                           if args.output_all else None)
+        args.output_json = (_suffix_path(args.output_json)
+                            if args.output_json else None)
     os.makedirs(out_dir, exist_ok=True)
     log_dir = os.path.join(out_dir, "log")
     os.makedirs(log_dir, exist_ok=True)
@@ -403,7 +449,7 @@ def main():
     if args.success_only:
         json_path = args.output_json or os.path.join(log_dir, f"{wandb_name}.json")
     else:
-        json_path = os.path.join(log_dir, f"{args.task}_{tag}_rollout_exp{args.exp_num}.json")
+        json_path = args.output_json or os.path.join(log_dir, f"{args.task}_{tag}_rollout_exp{args.exp_num}.json")
 
     # ---- wandb (live progress; x-axis = completed-init-count) ------------ #
     wcfg = cfg.get("wandb", {}) or {}
@@ -585,6 +631,7 @@ def main():
             eval_only=args.eval_only,
             explore_mode=args.explore_mode,
             rescue_seed=args.rescue_seed,
+            scene_slice=scene_slice,
         )
         metrics = result["metrics"]
 
@@ -698,7 +745,10 @@ def main():
                 "outputs": {"success": success_path, "all": all_path},
             }
             if args.eval_only:
-                summary.update({"protocol": "eval_only", "eval_seed": eval_seed})
+                summary.update({"protocol": "eval_only", "eval_seed": eval_seed,
+                                "scene_slice": metrics.get("scene_slice"),
+                                "n_eval_global": metrics.get("n_eval_global"),
+                                "n_slice": metrics.get("n_slice")})
             elif split_mode:
                 summary.update({
                     "protocol": "split",
@@ -726,6 +776,12 @@ def main():
                     # are the fallback, this is the primary (2026-08-31 gap:
                     # metrics had it, summary never did -> gate jsons read 0)
                     summary["explore_detail"] = metrics.get("explore_detail", [])
+                    # scene-slice identity (multicore sharding, 2026-09-01):
+                    # merge_sharded.py needs the slot/count to aggregate.
+                    summary["scene_slice"] = metrics.get("scene_slice")
+                    summary["n_eval_global"] = metrics.get("n_eval_global")
+                    summary["n_slice"] = metrics.get("n_slice")
+                    summary["explore_jerk_n"] = metrics.get("explore_jerk_n")
                 else:
                     summary["n_baseline_trajs"] = int(cfg.eval.n_init_states)
             with open(json_path, "w") as f:
