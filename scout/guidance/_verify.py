@@ -39,6 +39,11 @@ Checks (task verify):
      tangential orthogonality / flat-gradient guard); policy-path
      integration (per-step counter, determinism, forced far/equal
      baselines through the real encoder).
+  16. Merged single-backward orbit_step (perf 方案一+二, 2026-09-01):
+     bit-identical to the pre-merge two-backward algorithm (planner +
+     policy level, telemetry parity); vectorized atypical row core equals
+     the historical per-row loop (values + gradients, incl. missing
+     baselines).
 
 Run:
     python -m scout.guidance._verify
@@ -644,7 +649,7 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
            - flat-gradient guard (g=0): zero feedback, finite unprojected
              noise (no division blow-up).
     (12) policy path through the real mock encoder:
-           - orbit_update fires exactly once per guided denoise step;
+           - orbit_step fires exactly once per guided denoise step;
            - same-seed determinism, and the ACTIVE orbit (sigma>0) differs
              from its no-op partner (machinery bites);
            - forced-FAR baseline -> phase 2 fires for every row, nonzero
@@ -736,7 +741,7 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
                      z=None, seed=seed, classifier_guidance=True,
                      guidance_scale=1.0)
     assert orb._orb_calls == policy.num_inference_steps, (
-        f"(12) expected {policy.num_inference_steps} orbit_update calls, "
+        f"(12) expected {policy.num_inference_steps} orbit_step calls, "
         f"got {orb._orb_calls}")
     assert orb.p2_rows > 0, (
         "(12) cap=0.01 must push some rows into phase 2 on the mock path")
@@ -758,7 +763,8 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
     orb2._att._base_mu = [m + 5.0 for m in orb2._att._base_mu]
     traj = torch.randn(Bn, H, Ad).requires_grad_(True)
     x0h = 2.0 * traj                      # any differentiable map traj -> x0_hat
-    disp, p2r = orb2.orbit_update(traj, x0h, current_obs, noise_scale=0.5)
+    _cg2, disp, p2r, _rl2 = orb2.orbit_step(traj, x0h, current_obs,
+                                            noise_scale=0.5)
     assert float(p2r.sum()) == float(Bn), (
         "(12) far baseline must put every row in phase 2")
     assert disp.abs().max().item() > 0.0, "(12) phase-2 displacement nonzero"
@@ -767,7 +773,8 @@ def check_orbit_guidance(policy, scout_vib, current_obs,
     traj3 = torch.randn(Bn, H, Ad).requires_grad_(True)
     x0h3 = 2.0 * traj3
     orb3.select_z(x0h3.detach(), current_obs)   # anchor AT the input -> kl ~ 0
-    disp3, p23 = orb3.orbit_update(traj3, x0h3, current_obs, noise_scale=0.5)
+    _cg3, disp3, p23, _rl3 = orb3.orbit_step(traj3, x0h3, current_obs,
+                                             noise_scale=0.5)
     assert float(p23.sum()) == 0.0 and disp3.abs().max().item() == 0.0, (
         "(12) anchor-equal input must stay entirely in phase 1")
 
@@ -793,7 +800,7 @@ def check_orbit_sector(scout_vib, current_obs, cond_data, seed=233):
     i.i.d. tangent draw with a per-(scene, try) deterministic, cached
     direction; default 'iid' is untouched.
 
-    (13a) determinism: two orbit_update calls with the same row jobs give
+    (13a) determinism: two orbit_step calls with the same row jobs give
           the same xi_override (cache hit, no redraw);
     (13b) stratification: (init, try) pairs differ -> directions differ;
     (13c) projection: the deterministic xi is projected against the CURRENT
@@ -866,10 +873,10 @@ def check_orbit_sector(scout_vib, current_obs, cond_data, seed=233):
     assert not torch.equal(xi43, xi1), "(13c) sector seed 43 must differ"
     # and the full planner path still runs end-to-end in det mode
     traj = torch.randn(Bn, H, Ad).requires_grad_(True)
-    disp, p2r = orb.orbit_update(traj, 2.0 * traj, current_obs,
-                                 noise_scale=0.5)
+    _cgc, disp, p2r, _rlc = orb.orbit_step(traj, 2.0 * traj, current_obs,
+                                           noise_scale=0.5)
     assert float(p2r.sum()) == float(Bn) and disp.abs().max().item() > 0, (
-        "(13c) det-mode orbit_update must produce phase-2 displacement")
+        "(13c) det-mode orbit_step must produce phase-2 displacement")
     # (13d) det WITHOUT jobs -> i.i.d. fallback, warns once, no crash
     orb_nojobs = _far_planner(orbit_sector="det")
     assert orb_nojobs._sector_xi(torch.zeros(Bn, H, Ad)) is None, (
@@ -1031,8 +1038,8 @@ def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
         pl = far(pval)
         torch.manual_seed(seed + 7)          # same stream for both arms
         traj = torch.randn(Bn, H, Ad).requires_grad_(True)
-        disp, p2r = pl.orbit_update(traj, 2.0 * traj, current_obs,
-                                    noise_scale=0.6)
+        _cg, disp, p2r, _rl = pl.orbit_step(traj, 2.0 * traj, current_obs,
+                                            noise_scale=0.6)
         outs[tag] = (disp, p2r)
     d1, p2r = outs["p1"]; d2, _ = outs["p2"]
     assert float(p2r.sum()) == float(Bn), "(14) far baseline must be all p2"
@@ -1041,8 +1048,8 @@ def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
     pl_b = far(1.0)
     torch.manual_seed(seed + 7)
     traj_b = torch.randn(Bn, H, Ad).requires_grad_(True)
-    disp_b, _ = pl_b.orbit_update(traj_b, 2.0 * traj_b, current_obs,
-                                  noise_scale=0.6)
+    _cgb, disp_b, _p2b, _rlb = pl_b.orbit_step(traj_b, 2.0 * traj_b,
+                                               current_obs, noise_scale=0.6)
     assert torch.equal(d1, disp_b), "(14a) p=1 must be bit-identical"
     # (14b) p=2: fb identical in both arms (same kl/g, same RNG stream), so
     # d2 - fb = (0.36/0.6) * (d1 - fb) -> d2 == 0.6*d1 + 0.4*fb; fb is
@@ -1050,8 +1057,8 @@ def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
     pl0 = far(1.0)
     torch.manual_seed(seed + 7)
     traj0 = torch.randn(Bn, H, Ad).requires_grad_(True)
-    disp0, _ = pl0.orbit_update(traj0, 2.0 * traj0, current_obs,
-                                noise_scale=0.0)     # fb only (sigma=0)
+    _cg0, disp0, _p20, _rl0 = pl0.orbit_step(traj0, 2.0 * traj0, current_obs,
+                                             noise_scale=0.0)     # fb only (sigma=0)
     expect_d2 = 0.6 * d1 + 0.4 * disp0
     assert torch.allclose(d2, expect_d2, atol=1e-6), (
         "(14b) p=2 must square the scale exactly (d2 == s^2/s*d1+(1-s^2/s)fb)")
@@ -1059,8 +1066,8 @@ def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
     pl_h = far(0.5)
     torch.manual_seed(seed + 7)
     traj_h = torch.randn(Bn, H, Ad).requires_grad_(True)
-    dh, _ = pl_h.orbit_update(traj_h, 2.0 * traj_h, current_obs,
-                              noise_scale=0.6)
+    _cgh, dh, _p2h, _rlh = pl_h.orbit_step(traj_h, 2.0 * traj_h, current_obs,
+                                           noise_scale=0.6)
     r_h = 0.6 ** (0.5 - 1.0)     # noise ratio scale_h/scale_1 = s^(p-1)
     assert torch.allclose(dh, r_h * d1 + (1.0 - r_h) * disp0, atol=1e-6), (
         "(14b) non-integer p must follow scale**p exactly")
@@ -1072,6 +1079,223 @@ def check_orbit_anneal(scout_vib, current_obs, cond_data, seed=233):
         pass
     print("[check 14] orbit noise anneal: p=1 bit-identical; p=2 squares "
           "the sqrt(1-abar) scale exactly; p<=0 guard OK")
+
+
+def check_orbit_merged(policy, scout_vib, current_obs, cond_data, seed=233):
+    """Check 16 (perf 2026-09-01, 方案一+二 user-approved): the merged
+    single-backward ``orbit_step`` is BIT-IDENTICAL to the pre-merge
+    two-backward algorithm, and the vectorized atypical row core matches the
+    historical per-row loop.
+
+    (16a) planner level: on identical inputs (same RNG stream for the xi
+          draw) orbit_step's (cond_grad, disp, p2, row_losses) equal the
+          legacy path's exactly (torch.equal) -- cond_grad from a separate
+          capped compute_loss backward (retain_graph) + a second uncapped
+          row-loop forward and backward -- on a fixture that straddles the
+          cap boundary AND both phases (baseline-at-query rows sit at KL=0;
+          nudged rows sit far above kappa);
+    (16b) policy level: same-seed guided samples through the real
+          guided_conditional_sample are bit-identical between a merged
+          planner and a legacy-subclass planner (guards RNG ordering and
+          the injection-line rewiring);
+    (16c) telemetry parity: the policy's mean/max injected-force
+          accumulators advance identically on both arms (dose-calibration
+          continuity);
+    (16d) vectorized atypical rows: _encode_and_row_losses equals the
+          per-row loop reference exactly (values AND gradients), including
+          missing-baseline rows (graph-connected zeros) and a mixed list.
+    """
+    from scout.guidance.orbit_costs import (OrbitCostPlanner,
+                                            orbit_displacement)
+    from scout.guidance.entropy_costs import AtypicalCostPlanner, _enc_forward
+
+    class _LegacyOrbit(OrbitCostPlanner):
+        """Pre-merge reference algorithm, verbatim structure: capped
+        compute_loss backward (retain_graph) + second uncapped row-loop
+        forward and backward. Telemetry counters are NOT incremented (the
+        comparison reads returned values and the policy-side accumulators
+        only)."""
+
+        def orbit_step(self, trajectory, x0_hat, current_obs=None,
+                       noise_scale=1.0):
+            if float(self.orbit_noise_anneal) != 1.0:
+                noise_scale = float(noise_scale) ** float(self.orbit_noise_anneal)
+            loss = self._att.compute_loss(x0_hat, current_obs,
+                                          reduction="sum")
+            cond_grad = -torch.autograd.grad(loss, trajectory,
+                                             retain_graph=True)[0]
+            s_bar_t = self._att._resolve_s_bar_t(current_obs)
+            a = _enc_forward(self, x0_hat)
+            mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
+            rows = []
+            for i in range(mu.shape[0]):
+                if (i >= len(self._att._base_mu)
+                        or self._att._base_mu[i] is None):
+                    rows.append(x0_hat[i].sum() * 0.0)
+                    continue
+                m0, lv0 = self._att._base_mu[i], self._att._base_lv[i]
+                var, var0 = torch.exp(logvar[i]), torch.exp(lv0)
+                kl = 0.5 * (((mu[i] - m0) ** 2 / var0)
+                            + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
+                rows.append(kl)
+            kl = torch.stack(rows)
+            g = torch.autograd.grad(kl.sum(), trajectory)[0]
+            disp, p2, _ = orbit_displacement(
+                kl, g, kappa=self._att.cap, lam=self.orbit_lam,
+                delta=self.orbit_delta, sigma=self.orbit_sigma,
+                noise_scale=noise_scale,
+                xi_override=(self._sector_xi(g) if self.orbit_sigma > 0.0
+                             else None))
+            row_losses = -torch.clamp(kl.detach(), max=float(self._att.cap))
+            return cond_grad, disp, p2, row_losses
+
+    B = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+
+    # ---- (16a) planner-level equivalence --------------------------------- #
+    # cap=2.5 / delta=0.25 (standard): odd-row baselines captured AT the
+    # query -> KL = 0 exactly (phase 1, uncapped); even rows nudged +3.0 ->
+    # KL far above kappa (capped climb + phase 2). The fixture exercises the
+    # cap mask boundary region and both phases; the [kappa-delta, kappa)
+    # band itself is covered at the pure-math level by check 11 (both
+    # algorithms compute band rows with identical formulas).
+    merged = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=2.5,
+                              orbit_lam=0.5, orbit_delta=0.25,
+                              orbit_sigma=0.25)
+    legacy = _LegacyOrbit(scout_vib, bridge=IdentityBridge(), cap=2.5,
+                          orbit_lam=0.5, orbit_delta=0.25, orbit_sigma=0.25)
+    for p in (merged, legacy):
+        p.set_current_obs(current_obs)
+    torch.manual_seed(seed + 12)
+    traj0 = torch.randn(B, H, Ad)
+    merged.select_z(2.0 * traj0, current_obs)   # anchor AT the query
+    legacy._att._base_mu = [m.clone() for m in merged._att._base_mu]
+    legacy._att._base_lv = [v.clone() for v in merged._att._base_lv]
+    with torch.no_grad():
+        for i in range(0, B, 2):                # even rows far above kappa
+            merged._att._base_mu[i] = merged._att._base_mu[i] + 3.0
+            legacy._att._base_mu[i] = legacy._att._base_mu[i] + 3.0
+    outs = {}
+    for name, p in (("merged", merged), ("legacy", legacy)):
+        torch.manual_seed(seed + 12)            # redraws traj0 bit-exactly;
+        traj = torch.randn(B, H, Ad).requires_grad_(True)  # xi stream shared
+        outs[name] = p.orbit_step(traj, 2.0 * traj, current_obs,
+                                  noise_scale=0.6)
+    cg_m, disp_m, p2_m, rl_m = outs["merged"]
+    cg_l, disp_l, p2_l, rl_l = outs["legacy"]
+    assert torch.equal(cg_m, cg_l), (
+        f"(16a) merged cond_grad != legacy (max|diff|="
+        f"{(cg_m - cg_l).abs().max().item():.3e})")
+    assert torch.equal(disp_m, disp_l), "(16a) merged disp != legacy"
+    assert torch.equal(p2_m, p2_l), "(16a) merged p2 != legacy"
+    assert torch.equal(rl_m, rl_l), "(16a) merged row_losses != legacy"
+    climb_zero = (cg_m.flatten(1).abs().sum(dim=1) == 0)
+    assert int(climb_zero.sum()) > 0 and float(p2_m.sum()) > 0 \
+        and float(p2_m.sum()) < float(B), (
+        f"(16a) fixture must mix phases and capped rows; climb-zero rows="
+        f"{int(climb_zero.sum())}, p2={float(p2_m.sum())}/{B}")
+
+    # ---- (16b/16c) policy-level bit-identity + telemetry parity ---------- #
+    gst = policy.noise_scheduler.config.num_train_timesteps
+    cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+    tp, dacc = {}, {}
+    for name, Pl in (("merged", OrbitCostPlanner), ("legacy", _LegacyOrbit)):
+        pl = Pl(scout_vib, bridge=IdentityBridge(), cap=2.5,
+                orbit_lam=0.5, orbit_delta=0.25, orbit_sigma=0.25)
+        policy.initialize_scout_planner(planner=pl,
+                                        guidance_start_timestep=gst,
+                                        guidance_scale=1.0)
+        g0 = (policy._g_acc.clone()
+              if getattr(policy, "_g_acc", None) is not None else None)
+        n0 = getattr(policy, "_g_n", 0)
+        tp[name] = _run_sample(policy, cond_data, cond_mask, None,
+                               current_obs, z=None, seed=seed,
+                               classifier_guidance=True, guidance_scale=1.0)
+        dacc[name] = (None if (policy._g_acc is None or g0 is None)
+                      else policy._g_acc - g0, policy._g_n - n0)
+    assert torch.equal(tp["merged"], tp["legacy"]), (
+        "(16b) merged vs legacy must be bit-identical through the policy "
+        "path (RNG ordering / injection rewiring)")
+    dm, dl = dacc["merged"][0], dacc["legacy"][0]
+    assert (dm is None and dl is None) or torch.equal(dm, dl), (
+        "(16c) injected-force telemetry must advance identically")
+    assert dacc["merged"][1] == dacc["legacy"][1], "(16c) step counts differ"
+
+    # orbit arm's cost-curve branch (review P2-5b: previously untested --
+    # a typo there would pass silently): curve length == guided steps, all
+    # finite, values match the historical atypical-equivalent scale.
+    pl = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=2.5,
+                          orbit_lam=0.5, orbit_delta=0.25, orbit_sigma=0.25)
+    policy.initialize_scout_planner(planner=pl,
+                                    guidance_start_timestep=gst,
+                                    guidance_scale=1.0)
+    _, curve = _run_sample(policy, cond_data, cond_mask, None,
+                           current_obs, z=None, seed=seed,
+                           classifier_guidance=True, guidance_scale=1.0,
+                           return_cost_curve=True)
+    assert len(curve) == policy.num_inference_steps, (
+        f"(16b) orbit cost curve must have one entry per guided step; "
+        f"got {len(curve)}")
+    assert all(c == c and abs(c) != float("inf") for c in curve), (
+        "(16b) orbit cost curve must be finite")
+    assert max(abs(c) for c in curve) <= pl._att.cap + 1e-6, (
+        "(16b) orbit cost curve values must live in [-cap, 0] "
+        f"(atypical-equivalent scale); got {curve[:3]}")
+
+    # ---- (16d) vectorized atypical rows vs the loop reference ------------- #
+    att = AtypicalCostPlanner(scout_vib, bridge=IdentityBridge(), cap=0.05)
+    att.set_current_obs(current_obs)
+    torch.manual_seed(seed + 13)
+    x0 = torch.randn(B, H, Ad)
+    att.select_z(x0, current_obs)
+
+    def _loop_reference(planner, x0_hat):
+        s_bar_t = planner._resolve_s_bar_t(current_obs)
+        a = _enc_forward(planner, x0_hat)
+        mu, logvar = planner.scout_vib.vib_enc(s_bar_t.detach(), a)
+        rows = []
+        for i in range(mu.shape[0]):
+            if (i >= len(planner._base_mu) or planner._base_mu[i] is None):
+                rows.append(x0_hat[i].sum() * 0.0)
+                continue
+            m0, lv0 = planner._base_mu[i], planner._base_lv[i]
+            var, var0 = torch.exp(logvar[i]), torch.exp(lv0)
+            kl = 0.5 * (((mu[i] - m0) ** 2 / var0)
+                        + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
+            rows.append(-torch.clamp(kl, max=planner.cap))
+        return torch.stack(rows)
+
+    _, rows_v = att._encode_and_row_losses(x0, current_obs)
+    assert torch.equal(torch.stack(rows_v), _loop_reference(att, x0)), (
+        "(16d) vectorized atypical rows must equal the loop reference")
+    # gradients through compute_loss vs the reference graph
+    xa = x0.clone().requires_grad_(True)
+    ga, = torch.autograd.grad(att.compute_loss(xa, current_obs,
+                                               reduction="sum"), xa)
+    xb = x0.clone().requires_grad_(True)
+    gb, = torch.autograd.grad(_loop_reference(att, xb).sum(), xb)
+    assert torch.equal(ga, gb), (
+        f"(16d) gradients must equal the loop reference (max|diff|="
+        f"{(ga - gb).abs().max().item():.3e})")
+    # missing baselines -> graph-connected zeros (empty + mixed)
+    att2 = AtypicalCostPlanner(scout_vib, bridge=IdentityBridge(), cap=0.05)
+    att2.set_current_obs(current_obs)
+    _, rows_e = att2._encode_and_row_losses(x0, current_obs)   # no select_z
+    assert torch.equal(torch.stack(rows_e), torch.zeros(B)), (
+        "(16d) empty-baseline rows must be exact zeros")
+    att3 = AtypicalCostPlanner(scout_vib, bridge=IdentityBridge(), cap=0.05)
+    att3.set_current_obs(current_obs)
+    att3.select_z(x0, current_obs)
+    att3._base_mu[1] = None
+    _, rows3 = att3._encode_and_row_losses(x0, current_obs)
+    stacked3 = torch.stack(rows3)
+    assert torch.equal(stacked3, _loop_reference(att3, x0)) \
+        and float(stacked3[1]) == 0.0, (
+        "(16d) mixed-baseline rows must match the reference (None -> 0)")
+
+    print(f"[check 16] merged orbit_step == legacy two-backward "
+          f"bit-identical (planner + policy level, telemetry parity); "
+          f"atypical rows vectorized == loop reference (values + grads)")
 
 
 def main():
@@ -1108,6 +1332,8 @@ def main():
     # noise-anneal check (14), planner-level only.
     check_orbit_anneal(scout_vib, current_obs, cond_data)
     check_orbit_ray(policy, scout_vib, current_obs, cond_data)
+    # merged single-backward equivalence (16) -- perf 方案一+二, 2026-09-01.
+    check_orbit_merged(policy, scout_vib, current_obs, cond_data)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

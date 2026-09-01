@@ -62,7 +62,8 @@ from typing import List, Optional, Sequence
 
 import torch
 
-from scout.guidance.entropy_costs import AtypicalCostPlanner, _enc_forward
+from scout.guidance.entropy_costs import (AtypicalCostPlanner, _enc_forward,
+                                          _kl_rows)
 from scout.guidance.planner import ScoutPlanner
 
 
@@ -121,12 +122,14 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
 class OrbitCostPlanner(ScoutPlanner):
     """Entropy cost + two-phase constrained control (orbit).
 
-    The phase-1 climb (per-chunk KL-to-own-intent, capped) is DELEGATED to an
-    internal :class:`AtypicalCostPlanner` -- ``compute_loss`` is verbatim
-    atypical, and ``orbit_update`` (duck-typed hook consumed by policy.py's
-    injection line) supplies the phase-2 displacement. Rows are INDEPENDENT
-    (no inter-particle coupling) -- no group lock, i.i.d. retries exactly as
-    atypical.
+    The phase-1 climb (per-chunk KL-to-own-intent, capped) and the phase-2
+    constrained update are computed TOGETHER by :meth:`orbit_step` -- the
+    duck-typed hook consumed by policy.py's injection line -- from ONE
+    encoder forward and ONE backward through the shared graph (merged
+    2026-09-01; the pre-merge code ran a capped compute_loss backward PLUS a
+    second uncapped forward+backward, both traversing the UNet, per guided
+    denoise step). Rows are INDEPENDENT (no inter-particle coupling) -- no
+    group lock, i.i.d. retries exactly as atypical.
     """
 
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
@@ -207,7 +210,7 @@ class OrbitCostPlanner(ScoutPlanner):
         self._ray_calls = 0
         # telemetry (dose calibration reads this): device-side accumulators,
         # host sync only on the print tick (the pg-telemetry pattern).
-        self._orb_calls = 0          # orbit_update invocations
+        self._orb_calls = 0          # orbit_step invocations
         self._orb_rows = 0           # rows seen (host int -- shape, no sync)
         self._orb_p2_rows = 0        # rows that entered phase 2 (print tick)
         self._p2_acc: Optional[torch.Tensor] = None    # device sum of p2
@@ -365,34 +368,45 @@ class OrbitCostPlanner(ScoutPlanner):
                      reduction: str = "mean") -> torch.Tensor:
         return self._att.compute_loss(x0_hat, current_obs, reduction)
 
-    # -- the constrained update (phase 2) ----------------------------------- #
-    def _encode_and_uncapped(self, x0_hat: torch.Tensor, current_obs=None):
-        """ONE extra encoder forward -> per-row UNCapped KL list
-        (grad-carrying). Kept separate from AtypicalCostPlanner._
-        encode_and_row_losses so that class (shared with particle guidance)
-        stays untouched; the encoder is a tiny MLP on top of the cached s_bar,
-        negligible next to the UNet backward this shares the graph with."""
-        s_bar_t = self._att._resolve_s_bar_t(current_obs)
-        a = _enc_forward(self, x0_hat)
-        mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
-        rows: List[torch.Tensor] = []
-        for i in range(mu.shape[0]):
-            if i >= len(self._att._base_mu) or self._att._base_mu[i] is None:
-                rows.append(x0_hat[i].sum() * 0.0)   # graph-connected zero
-                continue
-            m0, lv0 = self._att._base_mu[i], self._att._base_lv[i]
-            var, var0 = torch.exp(logvar[i]), torch.exp(lv0)
-            kl = 0.5 * (((mu[i] - m0) ** 2 / var0)
-                        + (var / var0) - 1.0 - (logvar[i] - lv0)).sum()
-            rows.append(kl)
-        return mu, rows
+    # -- the merged guided step (phase 1 + phase 2) ------------------------- #
+    def orbit_step(self, trajectory: torch.Tensor, x0_hat: torch.Tensor,
+                   current_obs=None, noise_scale: float = 1.0):
+        """ONE encoder forward + ONE backward through the shared graph serve
+        BOTH guidance consumers (perf 2026-09-01, 方案一; replaces the
+        pre-merge compute_loss backward + a second ``_encode_and_uncapped``
+        forward + second backward -- the guided denoise loop used to run 2
+        VIB forwards and 2 UNet-traversing backwards per step; py-spy on the
+        running s233 square orbit chain put ~55% of wall clock inside
+        guided_conditional_sample, kernel-launch bound).
 
-    def orbit_update(self, trajectory: torch.Tensor, x0_hat: torch.Tensor,
-                     current_obs=None, noise_scale: float = 1.0):
-        """Phase-2 constrained update -- called by policy.py right AFTER its
-        capped-loss backward (which retains the shared x0_hat graph for this
-        second backward through the UNet). Returns ``(disp, phase2)``; see
-        :func:`orbit_displacement`.
+        Returns ``(cond_grad, disp, phase2, row_losses)``:
+
+          * ``cond_grad`` -- the CAPPED atypical climb gradient, exactly what
+            ``-autograd.grad(compute_loss(..., reduction="sum"))`` yielded
+            pre-merge. Equivalence: the cap's gradient mask is
+            ``1[KL <= kappa]`` (torch clamp(max) backward PASSES gradient at
+            input == max -- empirically confirmed, review P1-1), and
+            applying it AFTER the uncapped backward is exact because rows
+            are block-diagonal -- a row's vjp never mixes with other rows,
+            so a row at/below kappa keeps its full uncapped gradient
+            (bitwise: ``where`` returns ``g`` verbatim on the selected
+            branch), and a row above kappa gets exact zeros (the old
+            zero-upstream backward; ``where`` additionally avoids the
+            ``0 * inf = NaN`` pathology of a post-multiply). Only
+            sub-kappa rows' cond_grad survives the policy's ``_keep``
+            anyway (phase-2 rows swap the climb for ``disp``), and those
+            are precisely the uncapped rows.
+          * ``disp, phase2`` -- the constrained update, computed from the
+            UNCAPPED ``(kl, g)`` verbatim as the pre-merge ``orbit_update``
+            did; see :func:`orbit_displacement`.
+          * ``row_losses`` -- detached per-row capped cost
+            ``-min(KL, kappa)`` (B,) so the policy's optional cost-curve
+            keeps its historical atypical-equivalent scale without a second
+            forward.
+
+        RNG streams are untouched (neither backward nor the mask consumes
+        randomness; the xi tangent draw keeps its position as the step's
+        only global-RNG draw, after the backward exactly as before).
 
         ``noise_scale`` arriving from policy.py is the injection convention
         sqrt(1-abar_t). ``orbit_noise_anneal=p`` (B3, beat-SOE campaign)
@@ -403,9 +417,15 @@ class OrbitCostPlanner(ScoutPlanner):
         no floating-point pow on the hot path)."""
         if float(self.orbit_noise_anneal) != 1.0:
             noise_scale = float(noise_scale) ** float(self.orbit_noise_anneal)
-        _, rows = self._encode_and_uncapped(x0_hat, current_obs)
-        kl = torch.stack(rows)
+        s_bar_t = self._att._resolve_s_bar_t(current_obs)
+        a = _enc_forward(self, x0_hat)
+        mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
+        kl = _kl_rows(mu, logvar, self._att._base_mu, self._att._base_lv,
+                      x0_hat)
         g = torch.autograd.grad(kl.sum(), trajectory)[0]
+        cap_mask = (kl.detach() <= float(self._att.cap)).view(
+            -1, *([1] * (g.dim() - 1)))
+        cond_grad = torch.where(cap_mask, g, torch.zeros_like(g))
         disp, p2, (fb_n, noise_n) = orbit_displacement(
             kl, g, kappa=self._att.cap, lam=self.orbit_lam,
             delta=self.orbit_delta, sigma=self.orbit_sigma,
@@ -435,4 +455,5 @@ class OrbitCostPlanner(ScoutPlanner):
                   f"mean|fb|/p2row={float(self._fb_acc) / n:.4g} "
                   f"mean|noise|/p2row={float(self._noise_acc) / n:.4g}",
                   flush=True)
-        return disp, p2
+        row_losses = -torch.clamp(kl.detach(), max=float(self._att.cap))
+        return cond_grad, disp, p2, row_losses

@@ -192,16 +192,20 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # timing ablation). Duck-typed like select_z; absent -> zero overhead.
         _step_cb = (getattr(self.scout_planner, "set_denoise_step", None)
                     if classifier_guidance else None)
-        # orbit guidance (2026-08-31): planner-provided phase-2 constrained
-        # update (Newton feedback + tangential noise pinned to the kappa
-        # shell; scout/guidance/orbit_costs.py). Duck-typed like set_denoise_
-        # step; absent -> the injection below is exactly the pre-orbit line
-        # for every other guide mode.
-        _orbit_fn = (getattr(self.scout_planner, "orbit_update", None)
+        # orbit guidance (2026-08-31; merged single-backward step 2026-09-01):
+        # planner-provided combined guided step -- capped climb gradient +
+        # phase-2 constrained update (Newton feedback + tangential noise on
+        # the kappa shell) computed from ONE encoder forward and ONE backward
+        # through the shared graph (scout/guidance/orbit_costs.py
+        # ``orbit_step``; pre-merge this line consumed two separate
+        # UNet-traversing backwards per guided denoise step). Duck-typed
+        # like set_denoise_step; absent -> the injection below is exactly the
+        # pre-orbit line for every other guide mode.
+        _orbit_fn = (getattr(self.scout_planner, "orbit_step", None)
                      if classifier_guidance else None)
         # ray climb (2026-09-01, B4): planner-provided climb-direction rotation
         # for retries k>=1 (fixed design directions, magnitude preserved).
-        # Duck-typed like orbit_update; absent -> cond_grad is used verbatim
+        # Duck-typed like orbit_step; absent -> cond_grad is used verbatim
         # for every guide mode (bit-identical).
         _ray_fn = (getattr(self.scout_planner, "ray_rotate", None)
                    if classifier_guidance else None)
@@ -268,34 +272,40 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                     self.scout_planner.set_z(
                         _select_fn(x0_hat, current_obs))
                     _z_selected = True
-                # reduction="sum": rows are block-diagonal independent, so the
-                # gradient of the SUMMED cost gives each row its full unscaled
-                # gradient -- the injected force no longer depends on how many
-                # envs share this replan call. Pre-fix the mean reduction
-                # divided every row's force by B (effective guidance =
-                # guidance_scale/B, B = concurrent envs of the moment); see
-                # idea/guidance_batch_scaling_bug.md.
-                loss = self.scout_planner.compute_loss(
-                    x0_hat, current_obs, reduction="sum"
-                )
-                cond_grad = -torch.autograd.grad(
-                    loss, trajectory, retain_graph=(_orbit_fn is not None))[0]
+                _noise_scale = (1.0 - scheduler.alphas_cumprod[t]).sqrt()
+                if _orbit_fn is None:
+                    # reduction="sum": rows are block-diagonal independent, so the
+                    # gradient of the SUMMED cost gives each row its full unscaled
+                    # gradient -- the injected force no longer depends on how many
+                    # envs share this replan call. Pre-fix the mean reduction
+                    # divided every row's force by B (effective guidance =
+                    # guidance_scale/B, B = concurrent envs of the moment); see
+                    # idea/guidance_batch_scaling_bug.md.
+                    loss = self.scout_planner.compute_loss(
+                        x0_hat, current_obs, reduction="sum"
+                    )
+                    cond_grad = -torch.autograd.grad(loss, trajectory)[0]
+                else:
+                    # orbit: ONE forward + ONE backward supply both the capped
+                    # climb gradient and the phase-2 constrained update
+                    # (orbit_costs.orbit_step; equivalence with the old two-
+                    # backward path is asserted by verify check 16). Phase-2
+                    # rows (KL >= kappa - delta) swap the climb for the
+                    # constrained update -- the Newton feedback keeps
+                    # climbing below kappa, so the hand-over has no gap and no
+                    # double dose; phase-1 rows keep the climb verbatim.
+                    cond_grad, _disp, _p2, _row_losses = _orbit_fn(
+                        trajectory, x0_hat, current_obs,
+                        noise_scale=float(_noise_scale))
                 if _ray_fn is not None:
                     # ray mode: rotate the climb direction for retries k>=1
                     # BEFORE any injection (phase-2 rows' climb is zeroed by
                     # _keep below, so the rotation is a no-op for them).
                     cond_grad = _ray_fn(cond_grad)
-                _noise_scale = (1.0 - scheduler.alphas_cumprod[t]).sqrt()
                 grad_scale = self.guidance_scale * _noise_scale
                 if _orbit_fn is None:
                     trajectory = trajectory.detach() + grad_scale * cond_grad
                 else:
-                    # orbit: phase-2 rows (KL >= kappa - delta) swap the climb
-                    # for the constrained update -- the Newton feedback keeps
-                    # climbing below kappa, so the hand-over has no gap and no
-                    # double dose; phase-1 rows keep the climb verbatim.
-                    _disp, _p2 = _orbit_fn(trajectory, x0_hat, current_obs,
-                                           noise_scale=float(_noise_scale))
                     _keep = (1.0 - _p2).view(
                         -1, *([1] * (cond_grad.dim() - 1)))
                     trajectory = (trajectory.detach()
@@ -318,8 +328,14 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                           f"max_inject={float(self._g_acc[1]):.4g}", flush=True)
                 if return_cost_curve:
                     # log per-row mean (historical scale of the E2 metric),
-                    # not the B-aggregated sum.
-                    cost_curve.append(float(loss.item()) / x0_hat.shape[0])
+                    # not the B-aggregated sum. Orbit arm: the merged step
+                    # already returned the equivalent capped rows (detached)
+                    # -- same value as the old compute_loss scalar / B.
+                    denom = x0_hat.shape[0]
+                    if _orbit_fn is None:
+                        cost_curve.append(float(loss.item()) / denom)
+                    else:
+                        cost_curve.append(float(_row_losses.sum()) / denom)
 
             # 3. DDPM reverse step x_t -> x_{t-1} -- LPB L262-266.
             trajectory = scheduler.step(
