@@ -489,6 +489,19 @@ class OrbitCostPlanner(ScoutPlanner):
                     & (row_norms > 1e-4)).to(g.dtype)              # (B,)
             g_med = (row_norms * live).sum() / live.sum().clamp(min=1.0)
             cond_grad = cond_grad / g_med.clamp(min=1e-4)
+            # Per-row cap at 3x nominal dose (2026-09-02, telemetry round):
+            # the divisor describes EARLY-COMB climb rows (small norms);
+            # handover-band rows [cap-delta, cap) keep nonzero cond_grad
+            # with LARGER norms and would normalize to 10-50x nominal --
+            # they do not inject (policy's _keep zeroes them) but they
+            # dominate the injection telemetry and any future consumer
+            # (ray_rotate). Clamp every normalized row to <= 3x so the
+            # statistic, the telemetry and the (possible) injection all
+            # stay in the eta_tilde band; normal rows (ratio ~1) are
+            # untouched. Bit-identity of the OFF path is unaffected.
+            row_ratio = cond_grad.detach().flatten(1).norm(dim=1)
+            row_scale = (3.0 / row_ratio.clamp(min=1e-12)).clamp(max=1.0)
+            cond_grad = cond_grad * row_scale.view(-1, *([1] * (g.dim() - 1)))
             self._last_g_med = g_med.clamp(min=1e-4).detach()
             self._gmed_acc = (self._last_g_med
                               if self._gmed_acc is None
