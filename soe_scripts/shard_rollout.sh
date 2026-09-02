@@ -59,6 +59,7 @@ for i in $(seq 0 $((P - 1))); do
       --output-json "$OUT_JSON" $ARGS \
       > "$(dirname "$OUT_JSON")/shard$i.stdout" 2>&1 &
   PIDS+=($!)
+  echo "[shard_rollout] shard $i/$P pid=$!"
 done
 RC=0
 for pid in "${PIDS[@]}"; do
