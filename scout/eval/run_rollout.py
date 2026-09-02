@@ -168,6 +168,16 @@ def main():
                         "the retrained VIB stack settles onto the rescue "
                         "ridge and late-round tangential noise only kicks "
                         "retries off it. 1 = no decay (bit-identical).")
+    p.add_argument("--orbit-fb-clamp", choices=["none", "soft"], default="none",
+                   help="orbit: soft-clamp the Newton feedback residual "
+                        "(kl-kappa) -> delta*tanh((kl-kappa)/delta) and "
+                        "restrict the tangential noise to the band "
+                        "[kappa-delta, kappa+delta] (user 2026-09-02 option "
+                        "C). Saturates the far-off-shell pull at "
+                        "lam*delta/||g|| -- the unbounded residual made "
+                        "shell-saturated rows jerk (sqR5 fb=0.55, canR2 "
+                        "fb=0.61 vs healthy 0.24-0.33). 'none' (default) = "
+                        "bit-identical legacy.")
     p.add_argument("--orbit-sigma-decay", type=float, default=1.0,
                    help="orbit: per-round decay factor of the sigma ceiling, "
                         "in (0,1]. 0.5 halves the noise every round. "
@@ -610,7 +620,8 @@ def main():
                         "orbit_ray_seed": args.orbit_ray_seed,
                         "orbit_grad_norm": bool(args.orbit_eta_dimless),
                         "orbit_round": args.orbit_round,
-                        "orbit_sigma_decay": args.orbit_sigma_decay},
+                        "orbit_sigma_decay": args.orbit_sigma_decay,
+                        "orbit_fb_clamp": args.orbit_fb_clamp},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -751,6 +762,7 @@ def main():
                         "orbit_sigma_eff": _sig_eff,
                         "orbit_round": args.orbit_round,
                         "orbit_sigma_decay": args.orbit_sigma_decay,
+                        "orbit_fb_clamp": args.orbit_fb_clamp,
                         "orbit_sector": args.orbit_sector,
                         "orbit_noise_anneal": args.orbit_noise_anneal,
                         "orbit_climb": args.orbit_climb,

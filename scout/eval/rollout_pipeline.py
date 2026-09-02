@@ -212,6 +212,7 @@ class RolloutPipeline:
                 orbit_grad_norm=bool(ek.get("orbit_grad_norm", False)),
                 orbit_round=int(ek.get("orbit_round", 1)),
                 orbit_sigma_decay=float(ek.get("orbit_sigma_decay", 1.0)),
+                orbit_fb_clamp=str(ek.get("orbit_fb_clamp", "none")),
             )
             print(f"[rollout] orbit guidance: lam={planner.orbit_lam} "
                   f"delta={planner.orbit_delta} sigma={planner.orbit_sigma} "
@@ -222,7 +223,8 @@ class RolloutPipeline:
                   f"eta_dimless={planner.orbit_grad_norm} "
                   f"round={planner.orbit_round} "
                   f"sigma_eff={planner.orbit_sigma_eff:.4g} "
-                  f"(decay={planner.orbit_sigma_decay})")
+                  f"(decay={planner.orbit_sigma_decay}) "
+                  f"fb_clamp={planner.orbit_fb_clamp}")
         else:
             planner = ScoutPlanner(scout_vib, bridge=bridge,
                                    obs_adapter=obs_adapter, z=None)

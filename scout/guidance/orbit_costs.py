@@ -70,7 +70,8 @@ from scout.guidance.planner import ScoutPlanner
 def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
                        lam: float, delta: float, sigma: float,
                        noise_scale: float = 1.0,
-                       xi_override: Optional[torch.Tensor] = None):
+                       xi_override: Optional[torch.Tensor] = None,
+                       fb_clamp: str = "none"):
     """Pure phase-2 math (unit-tested directly): given the per-row UNCAPPED
     cost ``kl`` (B,) and its per-row gradient w.r.t. the trajectory ``g``
     (B, T, Da) -- block-diagonal, so row slices are per-row gradients of the
@@ -87,14 +88,37 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
     the CURRENT row normal exactly like the i.i.d. draw, so a fixed vector
     yields a persistent great-circle walk on the shell instead of a random
     walk. ``None`` -> the original i.i.d. draw (bit-identical).
+
+    ``fb_clamp`` (user 2026-09-02, option C): "soft" soft-clamps the Newton
+    residual  (kl - kappa) -> delta * tanh((kl - kappa)/delta)  so the
+    feedback pull saturates at lam*delta/||g|| far off the shell instead of
+    growing with the shell-saturated KL (chain VIB KL distributions drift
+    right -- late-round rows sit far above kappa and the unbounded residual
+    turned the feedback into large per-step jerks: sqR5 fb=0.55, canR2
+    fb=0.61 vs the healthy 0.24-0.33). In-band (|kl-kappa| << delta) tanh is
+    linear to O(x^3/delta^2) -- the cold-start regime is untouched
+    analytically. The tangential NOISE is additionally restricted to the
+    band [kappa-delta, kappa+delta] (off-band rows are not on the shell;
+    touring there is meaningless) -- the randn is still DRAWN and the
+    component zeroed afterwards, so the RNG stream stays identical to the
+    other modes (bit-comparability across arms). "none" (default) is
+    bit-identical legacy.
     """
     kl_d = kl.detach()
     p2 = kl_d >= (float(kappa) - float(delta))
     gnorm2 = (g.detach() ** 2).flatten(1).sum(dim=1)             # (B,)
     small = gnorm2 < 1e-16            # flat rows: Newton direction undefined
     safe = gnorm2.clamp(min=1e-16)
+    if str(fb_clamp) == "soft":
+        resid = float(delta) * torch.tanh(
+            (kl_d - float(kappa)) / float(delta))
+    elif str(fb_clamp) == "none":
+        resid = kl_d - float(kappa)
+    else:
+        raise ValueError(f"fb_clamp must be 'none' or 'soft', got "
+                         f"{fb_clamp!r}")
     fb_coeff = torch.where(small, torch.zeros_like(kl_d),
-                           -float(lam) * (kl_d - float(kappa)) / safe)
+                           -float(lam) * resid / safe)
     fb = fb_coeff[:, None, None] * g                               # (B,T,Da)
     noise = torch.zeros_like(g)
     if float(sigma) > 0.0:
@@ -112,6 +136,10 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
             xi = xi_override.detach().to(device=g.device, dtype=g.dtype)
         dot = (xi * ghat).flatten(1).sum(dim=1)
         noise = float(noise_scale) * float(sigma) * (xi - dot[:, None, None] * ghat)
+        if str(fb_clamp) == "soft":
+            band = ((kl_d >= float(kappa) - float(delta))
+                    & (kl_d <= float(kappa) + float(delta)))
+            noise = noise * band.to(noise.dtype)[:, None, None]
     mask = p2.to(g.dtype)[:, None, None]
     disp = (fb + noise) * mask
     stats = ((fb_coeff.abs() * safe.sqrt()).detach(),
@@ -141,7 +169,8 @@ class OrbitCostPlanner(ScoutPlanner):
                  orbit_climb: str = "grad", orbit_ray_seed: int = 42,
                  orbit_grad_norm: bool = False,
                  orbit_round: int = 1,
-                 orbit_sigma_decay: float = 1.0):
+                 orbit_sigma_decay: float = 1.0,
+                 orbit_fb_clamp: str = "none"):
         super().__init__(scout_vib, bridge=bridge, z=None,
                          obs_adapter=obs_adapter)
         self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
@@ -195,6 +224,13 @@ class OrbitCostPlanner(ScoutPlanner):
         self.orbit_sigma_decay = float(orbit_sigma_decay)
         self.orbit_sigma_eff = float(orbit_sigma) * (
             self.orbit_sigma_decay ** (self.orbit_round - 1))
+        # fb soft-clamp (user 2026-09-02, option C): saturate the Newton
+        # residual at delta (tanh) + restrict the tangential noise to the
+        # band -- see orbit_displacement. "none" (default) = bit-identical.
+        if str(orbit_fb_clamp) not in ("none", "soft"):
+            raise ValueError(f"orbit_fb_clamp must be 'none' or 'soft', "
+                             f"got {orbit_fb_clamp!r}")
+        self.orbit_fb_clamp = str(orbit_fb_clamp)
         if 0.0 < self.orbit_sigma_eff < 1e-12:
             # the round schedule switched the noise OFF numerically -- snap
             # to exact 0.0 so orbit_displacement draws NO randn (a residual
@@ -265,6 +301,10 @@ class OrbitCostPlanner(ScoutPlanner):
         # eta-dimless: last divisor + running mean (debug/probe surface)
         self._last_g_med: Optional[torch.Tensor] = None
         self._gmed_acc: Optional[torch.Tensor] = None
+        # fb soft-clamp diagnostics (device-side; sync on print tick)
+        self._sat_acc: Optional[torch.Tensor] = None
+        self._gsh_n_acc: Optional[torch.Tensor] = None
+        self._gsh_s_acc: Optional[torch.Tensor] = None
 
     @property
     def p2_rows(self) -> int:
@@ -539,7 +579,8 @@ class OrbitCostPlanner(ScoutPlanner):
             delta=self.orbit_delta, sigma=self.orbit_sigma_eff,
             noise_scale=noise_scale,
             xi_override=(self._sector_xi(g) if self.orbit_sigma_eff > 0.0
-                         else None))
+                         else None),
+            fb_clamp=self.orbit_fb_clamp)
         # telemetry (norms masked to phase-2 rows -- the dose numbers must
         # describe what was actually injected, not the pre-mask values).
         # Device-side accumulation only; the host sync happens on the print
@@ -547,6 +588,30 @@ class OrbitCostPlanner(ScoutPlanner):
         # serializations per guided rollout).
         self._orb_calls += 1
         self._orb_rows += int(p2.shape[0])
+        if self.orbit_fb_clamp != "none":
+            # diagnostics for the soft clamp: rows saturated past the band
+            # (|kl-kappa| >= 2*delta, where tanh(x/delta) >= 0.964) and the
+            # mean ||g|| of phase-2 rows -- the shell-saturation readout the
+            # fb dose analysis needs (lam*delta/||g||_shell is the soft
+            # asymptotic pull). Device-side accumulators, host sync on the
+            # print tick only.
+            with torch.no_grad():
+                _kl = kl.detach()
+                _gn = g.detach().flatten(1).norm(dim=1)
+                _p2m = p2.detach() > 0.5
+                _sat = ((_kl >= float(self._att.cap) + 2.0 * self.orbit_delta)
+                        & _p2m).to(g.dtype).sum()
+                _gsh_n = _p2m.to(g.dtype).sum()
+                _gsh_s = (_gn * _p2m.to(g.dtype)).sum()
+                self._sat_acc = (_sat if self._sat_acc is None
+                                 or self._sat_acc.device != _sat.device
+                                 else self._sat_acc + _sat)
+                self._gsh_n_acc = (_gsh_n if self._gsh_n_acc is None
+                                   or self._gsh_n_acc.device != _gsh_n.device
+                                   else self._gsh_n_acc + _gsh_n)
+                self._gsh_s_acc = (_gsh_s if self._gsh_s_acc is None
+                                   or self._gsh_s_acc.device != _gsh_s.device
+                                   else self._gsh_s_acc + _gsh_s)
         for attr, val in (("_fb_acc", (fb_n * p2).sum()),
                           ("_noise_acc", (noise_n * p2).sum()),
                           ("_p2_acc", p2.sum())):
@@ -563,7 +628,11 @@ class OrbitCostPlanner(ScoutPlanner):
                   f"mean|fb|/p2row={float(self._fb_acc) / n:.4g} "
                   f"mean|noise|/p2row={float(self._noise_acc) / n:.4g}"
                   + ("" if self._gmed_acc is None
-                     else f" mean_g_med={float(self._gmed_acc) / self._orb_calls:.4g}"),
+                     else f" mean_g_med={float(self._gmed_acc) / self._orb_calls:.4g}")
+                  + ("" if self.orbit_fb_clamp == "none"
+                     else (f" fbclamp={self.orbit_fb_clamp}"
+                           f" sat_rows={int(self._sat_acc) if self._sat_acc is not None else 0}"
+                           f" g_shell={float(self._gsh_s_acc) / max(int(self._gsh_n_acc), 1) if self._gsh_s_acc is not None else 0:.4g}")),
                   flush=True)
         row_losses = -torch.clamp(kl.detach(), max=float(self._att.cap))
         return cond_grad, disp, p2, row_losses

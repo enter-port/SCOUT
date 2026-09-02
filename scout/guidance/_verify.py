@@ -1350,6 +1350,181 @@ def check_orbit_sigma_schedule(scout_vib, current_obs, cond_data, seed=233):
     print("[check 18] sigma round-schedule: defaults bit-identical; "
           "round=2/decay=0.5 halves only the noise; numerical-zero draws no "
           "randn; guards OK")
+
+
+def _probe_row1_offset(scout_vib, current_obs, cond_data, target_kl,
+                       seed=233, kappa=2.5):
+    """Scan the row-1 anchor offset so its KL lands in-band (~target_kl)
+    -- a vacuous in-band assertion was shipped once (review P1): without
+    this, no fixture row sat in [kappa-delta/2 band] and the approximation
+    check silently skipped."""
+    from scout.guidance.entropy_costs import _enc_forward, _kl_rows
+    from scout.guidance.orbit_costs import OrbitCostPlanner
+    B = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+    torch.manual_seed(seed + 12)
+    traj0 = torch.randn(B, H, Ad)
+    for off in (0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6):
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=kappa)
+        p.set_current_obs(current_obs)
+        p.select_z(2.0 * traj0, current_obs)
+        with torch.no_grad():
+            p._att._base_mu[1] = p._att._base_mu[1] + off
+        torch.manual_seed(seed + 19)
+        t = torch.randn(B, H, Ad)
+        s_bar = p._att._resolve_s_bar_t(current_obs)
+        a = _enc_forward(p, 2.0 * t)
+        mu, lv = p.scout_vib.vib_enc(s_bar.detach(), a)
+        kl = _kl_rows(mu, lv, p._att._base_mu, p._att._base_lv, 2.0 * t)
+        k1 = float(kl[1].detach())
+        if abs(k1 - target_kl) <= 0.12:
+            return off
+    raise AssertionError("no row-1 offset lands in-band; fixture drift")
+
+
+def check_orbit_fb_clamp(scout_vib, current_obs, cond_data, seed=233):
+    """Check 19 (2026-09-02, orbit-hparam-dev): fb soft-clamp (user option C)
+    -- Newton residual (kl-kappa) -> delta*tanh((kl-kappa)/delta), tangential
+    noise masked to the band [kappa-delta, kappa+delta].
+
+    (19a) fb_clamp='none' (default) is bit-identical to a planner constructed
+          without the kwarg (same RNG stream, mixed-phase fixture);
+    (19b) soft fb equals the analytic formula per row (independent
+          recomputation), and in-band rows (|kl-kappa| <= delta/2) match the
+          none-arm's fb within the tanh linearity bound (rel err <=
+          (x/delta)^2/3 + eps ~ 9%);
+    (19c) far-off-shell rows (|kl-kappa| >= 8*delta) have fb norm ==
+          lam*delta/||g|| exactly (tanh saturated to 1 within float);
+    (19d) noise band: off-band rows (kl > kappa+delta) carry ZERO noise in
+          the soft arm while band rows keep it; the RNG stream is IDENTICAL
+          across modes (randn is drawn then zeroed -- compare torch RNG
+          state after one orbit_step in each mode);
+    (19e) invalid fb_clamp raises at __init__ / orbit_displacement.
+    """
+    from scout.guidance.orbit_costs import (OrbitCostPlanner,
+                                            orbit_displacement)
+    from scout.guidance.entropy_costs import _enc_forward, _kl_rows
+
+    B = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+    KAP, DEL, LAM = 2.5, 0.25, 0.5
+    _ROW1_OFF = _probe_row1_offset(scout_vib, current_obs, cond_data,
+                                   KAP - DEL / 2, seed)
+
+    torch.manual_seed(seed + 12)
+    traj0 = torch.randn(B, H, Ad)
+
+    def mk(_sigma=0.25, **kw):
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=KAP,
+                             orbit_lam=LAM, orbit_delta=DEL,
+                             orbit_sigma=_sigma, **kw)
+        p.set_current_obs(current_obs)
+        p.select_z(2.0 * traj0, current_obs)
+        with torch.no_grad():
+            for i in range(0, B, 2):            # even rows far above kappa
+                p._att._base_mu[i] = p._att._base_mu[i] + 3.0
+            if B > 2:                           # row 2: just above the band
+                p._att._base_mu[2] = p._att._base_mu[2] + 3.0 + DEL * 8
+            if B > 1:                           # row 1: IN-BAND row
+                p._att._base_mu[1] = p._att._base_mu[1] + _ROW1_OFF
+        return p
+
+    def run(p, ns=0.6):
+        torch.manual_seed(seed + 19)
+        traj = torch.randn(B, H, Ad).requires_grad_(True)
+        return p.orbit_step(traj, 2.0 * traj, current_obs, noise_scale=ns)
+
+    # (19a) none == planner constructed without the kwarg
+    a_none_default = run(mk())
+    a_none_kw = run(mk(orbit_fb_clamp="none"))
+    assert torch.equal(a_none_default[1], a_none_kw[1]), (
+        "(19a) fb_clamp='none' must be bit-identical to the default")
+
+    # soft arm + independent recomputation of (kl, g) on the same fixture
+    p_soft = mk(orbit_fb_clamp="soft")
+    out_soft = run(p_soft)
+    disp_soft, p2_soft = out_soft[1], out_soft[2]
+    torch.manual_seed(seed + 19)
+    traj_r = torch.randn(B, H, Ad).requires_grad_(True)
+    s_bar = p_soft._att._resolve_s_bar_t(current_obs)
+    a_r = _enc_forward(p_soft, 2.0 * traj_r)
+    mu_r, lv_r = p_soft.scout_vib.vib_enc(s_bar.detach(), a_r)
+    kl_r = _kl_rows(mu_r, lv_r, p_soft._att._base_mu, p_soft._att._base_lv,
+                    2.0 * traj_r)
+    g_r = torch.autograd.grad(kl_r.sum(), traj_r)[0]
+    kl_d = kl_r.detach()
+    gn2 = g_r.detach().flatten(1).norm(dim=1) ** 2
+    safe = gn2.clamp(min=1e-16)
+    nonflat = gn2 >= 1e-16
+
+    # (19b) analytic formula, row-wise: fb = lam*delta*tanh((kl-kappa)/delta)
+    #       / ||g||^2 * g, masked by p2
+    ref_coeff = torch.where(nonflat, -LAM * DEL * torch.tanh(
+        (kl_d - KAP) / DEL) / safe, torch.zeros_like(kl_d))
+    ref_fb = ref_coeff[:, None, None] * g_r.detach()
+    ref_disp_fb = ref_fb * p2_soft.detach()[:, None, None]
+    # isolate fb from the soft disp via a sigma=0 soft run (shares RNG --
+    # sigma=0 draws nothing)
+    p_soft0 = mk(orbit_fb_clamp="soft", _sigma=0.0)
+    out_soft0 = run(p_soft0)
+    fb_isolated = out_soft0[1]                       # sigma=0 -> fb only
+    assert torch.allclose(fb_isolated, ref_disp_fb, atol=1e-6), (
+        "(19b) soft fb must equal the analytic tanh formula per row")
+    # in-band approximation vs the none arm
+    inband = (kl_d <= KAP) & (kl_d >= KAP - DEL / 2) & nonflat
+    assert bool(inband.any()), (
+        "(19b) fixture must contain an in-band row (anti-vacuity, review P1)")
+    p_none0 = mk(_sigma=0.0)
+    out_none0 = run(p_none0)
+    fb_none = out_none0[1]
+    rel = ((fb_isolated[inband] - fb_none[inband])
+           .norm() / fb_none[inband].norm().clamp(min=1e-12))
+    assert float(rel) <= 0.10, (
+        f"(19b) in-band soft-vs-none rel err {float(rel):.3f} > 10% "
+        f"(tanh linearity broken)")
+
+    # (19c) far-off-shell rows: fb norm == lam*delta/||g||
+    far = (kl_d >= KAP + 8 * DEL) & nonflat
+    if bool(far.any()):
+        got = fb_isolated[far].flatten(1).norm(dim=1)
+        want = (LAM * DEL / gn2[far].clamp(min=1e-16).sqrt())
+        assert torch.allclose(got, want, atol=1e-5), (
+            "(19c) saturated fb pull must equal lam*delta/||g|| exactly")
+
+    # (19d) noise band: off-band rows carry zero noise; RNG stream identical
+    offband = (kl_d > KAP + DEL)
+    bandkeep = (kl_d >= KAP - DEL) & (kl_d <= KAP + DEL)
+    noise_soft = (disp_soft - fb_isolated)
+    if bool(offband.any()):
+        assert float(noise_soft[offband].abs().max()) == 0.0, (
+            "(19d) off-band rows must carry ZERO noise in the soft arm")
+    assert bool(bandkeep.any()) and float(
+        noise_soft[bandkeep].abs().max()) > 0.0, (
+        "(19d) in-band rows must KEEP their noise (band-keep branch)")
+    st0 = torch.get_rng_state()
+    run(mk(orbit_fb_clamp="none"))
+    st_none = torch.get_rng_state()
+    torch.set_rng_state(st0)
+    run(mk(orbit_fb_clamp="soft"))
+    st_soft = torch.get_rng_state()
+    assert torch.equal(st_none, st_soft), (
+        "(19d) RNG stream must be identical across fb_clamp modes")
+
+    # (19e) guards
+    try:
+        mk(orbit_fb_clamp="band")
+        raise AssertionError("(19e) fb_clamp='band' must raise")
+    except ValueError:
+        pass
+    # P2-1: force the telemetry tick print path (2500-call threshold is
+    # never reached by the suite otherwise) -- must not crash.
+    p_tick = mk(orbit_fb_clamp="soft")
+    p_tick._orb_calls = 2499
+    run(p_tick)
+    print("[check 19] fb soft-clamp: none bit-identical; soft == analytic "
+          "tanh formula; in-band ~legacy (<=10%); saturated pull == "
+          "lam*delta/||g||; off-band noise zeroed with RNG stream preserved; "
+          "band-keep exercised; telemetry tick OK; guards OK")
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -1387,6 +1562,8 @@ def main():
     check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data)
     # round-dependent sigma ceiling (18) -- orbit-hparam-dev, 2026-09-02.
     check_orbit_sigma_schedule(scout_vib, current_obs, cond_data)
+    # fb soft-clamp (19) -- orbit-hparam-dev, 2026-09-02.
+    check_orbit_fb_clamp(scout_vib, current_obs, cond_data)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")
