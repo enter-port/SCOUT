@@ -691,7 +691,15 @@ def main():
             with open(json_path, "w") as f:
                 json.dump(summary, f, indent=2)
 
-            if split_mode:
+            if metrics.get("eval_only"):
+                # eval-only rounds carry neither explore nor pass@k keys (and
+                # split-eval-only carries no avg_jerk either) -- the two DONE
+                # branches below would KeyError (2026-09-02 tool_hang r1 crash).
+                _j = metrics.get("avg_jerk", metrics.get("jerk_baseline", 0.0))
+                print(f"\n[run_rollout] DONE (eval-only). "
+                      f"success_rate={metrics['success_rate']:.3f} "
+                      f"avg_jerk={_j:.4f}")
+            elif split_mode:
                 if metrics.get("skip_eval"):
                     # explore-only run: no baseline fields (live in the
                     # separate --eval-only run of the same ckpt+seed)
