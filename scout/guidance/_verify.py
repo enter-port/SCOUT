@@ -1135,6 +1135,128 @@ def check_orbit_merged(policy, scout_vib, current_obs, cond_data, seed=233):
           f"atypical rows vectorized == loop reference (values + grads)")
 
 
+def check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data,
+                            seed=233):
+    """Check 17 (2026-09-02, orbit-hparam-dev): eta-dimless climb
+    normalization.
+
+    (17a) OFF (default) is bit-identical to the pre-change orbit_step --
+          same fixture as check 16 (odd-row zero-KL / even-row far
+          baselines), two fresh planners, same RNG stream -> torch.equal;
+    (17b) ON divides cond_grad by exactly the batch-median per-row
+          ||grad|| (manual reference), and disp / p2 / row_losses are
+          UNTOUCHED (phase 2 has no eta dependence);
+    (17c) policy-level: normalization BITES at equal scale (trajectory
+          differs, finite) -- full bit-identity is not assertable because
+          g_med is a per-step online median; the planner-level identity
+          (17b) + check 16b's RNG-path guarantee cover the wiring.
+    """
+    from scout.guidance.orbit_costs import OrbitCostPlanner
+
+    B = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+
+    torch.manual_seed(seed + 12)
+    traj0 = torch.randn(B, H, Ad)
+
+    def mk(norm_on):
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=2.5,
+                             orbit_lam=0.5, orbit_delta=0.25,
+                             orbit_sigma=0.25, orbit_grad_norm=norm_on)
+        p.set_current_obs(current_obs)
+        p.select_z(2.0 * traj0, current_obs)      # B baseline anchors
+        return p
+
+    def armed(p):
+        with torch.no_grad():
+            for i in range(0, B, 2):              # even rows far above kappa
+                p._att._base_mu[i] = p._att._base_mu[i] + 3.0
+            if B > 1:                             # row 1: mid-band (0<KL<cap)
+                p._att._base_mu[1] = p._att._base_mu[1] + 0.4
+        return p
+
+    outs = {}
+    for name, on in (("off1", False), ("off2", False), ("on", True)):
+        p = armed(mk(on))
+        torch.manual_seed(seed + 12)
+        traj = torch.randn(B, H, Ad).requires_grad_(True)
+        outs[name] = p.orbit_step(traj, 2.0 * traj, current_obs,
+                                  noise_scale=0.6)
+    cg_off1, disp_off1, p2_off1, rl_off1 = outs["off1"]
+    cg_off2, _, _, _ = outs["off2"]
+    cg_on, disp_on, p2_on, rl_on = outs["on"]
+    # (17a) OFF determinism == pre-change semantics (16a already pins OFF to
+    # the legacy two-backward reference; here two fresh OFF planners agree).
+    assert torch.equal(cg_off1, cg_off2), "(17a) OFF must be deterministic"
+    # fixture sanity (review P1-3): row 1 must be a LIVE climb row -- mid-band
+    # KL with an O(1) gradient, not at-anchor roundoff -- otherwise the
+    # division below is verified on numerical noise only.
+    assert cg_off1[1].abs().max().item() > 1e-3, (
+        "(17a) fixture row 1 must carry a real mid-band climb gradient")
+    # (17b) ON == OFF / median(||g_row||) over ALL rows. The production
+    # median runs over the uncapped gradient g; recover it with a cap=inf
+    # clone of the fixture (capped rows of cg_off1 are zeroed, so their
+    # norms cannot be read off cg_off1 directly). NOTE: with cap=inf the
+    # clone's disp is inf/NaN garbage (kl - inf) -- only cg_unc is read.
+    p_unc = armed(mk(False))
+    p_unc._att.cap = float("inf")
+    torch.manual_seed(seed + 12)
+    traj_u = torch.randn(B, H, Ad).requires_grad_(True)
+    cg_unc, _, _, _ = p_unc.orbit_step(traj_u, 2.0 * traj_u, current_obs,
+                                       noise_scale=0.6)
+    row_norms = cg_unc.detach().flatten(1).norm(dim=1)
+    g_med = row_norms.median().clamp(min=1e-4)
+    assert torch.allclose(cg_on, cg_off1 / g_med, atol=1e-6), (
+        "(17b) ON must divide cond_grad by the batch-median row ||grad||")
+    # roundoff amplification guard (review P0-1): a batch of PURE at-anchor
+    # rows (KL==0 exactly, roundoff grads ~1e-8) must stay near-zero after
+    # normalization -- the 1e-4 floor prevents the median from amplifying
+    # noise into a full-dose kick.
+    p_anchor = mk(False)                          # NO arming: every row at-anchor
+    p_dim = mk(True)
+    torch.manual_seed(seed + 12)
+    traj_a = torch.randn(B, H, Ad).requires_grad_(True)
+    cga, _, _, _ = p_anchor.orbit_step(traj_a, 2.0 * traj_a, current_obs,
+                                       noise_scale=0.6)
+    torch.manual_seed(seed + 12)
+    traj_d = torch.randn(B, H, Ad).requires_grad_(True)
+    cgd, _, _, _ = p_dim.orbit_step(traj_d, 2.0 * traj_d, current_obs,
+                                    noise_scale=0.6)
+    assert cgd.abs().max().item() < 1e-3, (
+        f"(17b) at-anchor roundoff amplified after normalization "
+        f"(max|cg|={cgd.abs().max().item():.3e} vs legacy "
+        f"{cga.abs().max().item():.3e})")
+    assert torch.equal(disp_on, disp_off1), \
+        "(17b) phase-2 disp must not depend on the normalization"
+    assert torch.equal(p2_on, p2_off1) and torch.equal(rl_on, rl_off1), \
+        "(17b) p2/row_losses must not depend on the normalization"
+
+    # (17c) policy-level: normalization BITES (trajectory differs from the
+    # OFF arm at equal scale) and the dose telemetry stays finite/positive.
+    # Full-trajectory bit-identity at eta_tilde = eta*g_med is NOT asserted:
+    # g_med is a PER-STEP batch median (by design -- the online-adaptive
+    # semantics), so a fixed scale cannot reproduce the OFF arm step-by-step
+    # unless every step's median is identical; the planner-level identity
+    # (17b) plus check 16b's policy RNG-path guarantee cover the wiring.
+    gst = policy.noise_scheduler.config.num_train_timesteps
+    cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+    tp = {}
+    for name, on, sc in (("off", False, 0.7), ("on", True, 0.7)):
+        pl = armed(mk(on))
+        policy.initialize_scout_planner(planner=pl,
+                                        guidance_start_timestep=gst,
+                                        guidance_scale=sc)
+        tp[name] = _run_sample(policy, cond_data, cond_mask, None,
+                               current_obs, z=None, seed=seed,
+                               classifier_guidance=True, guidance_scale=sc)
+    assert not torch.equal(tp["on"], tp["off"]), (
+        "(17c) normalization must change the trajectory at equal scale")
+    assert torch.isfinite(tp["on"]).all(), "(17c) ON arm produced NaN/Inf"
+    print(f"[check 17] eta-dimless: OFF deterministic; ON == OFF/g_med "
+          f"(disp/p2 untouched, g_med={float(g_med):.4g}); "
+          f"policy-level bite + finite telemetry OK")
+
+
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -1168,6 +1290,8 @@ def main():
     check_orbit_ray(policy, scout_vib, current_obs, cond_data)
     # merged single-backward equivalence (16) -- perf 方案一+二, 2026-09-01.
     check_orbit_merged(policy, scout_vib, current_obs, cond_data)
+    # eta-dimless normalization (17) -- orbit-hparam-dev, 2026-09-02.
+    check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

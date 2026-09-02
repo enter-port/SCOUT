@@ -145,6 +145,20 @@ def main():
                    help="orbit: master seed for climb='ray' design "
                         "directions (dedicated generator -- does NOT follow "
                         "--rescue-seed).")
+    p.add_argument("--orbit-eta-dimless", action="store_true",
+                   help="orbit: eta-dimless mode (2026-09-02 orbit-hparam-"
+                        "dev) -- normalize the climb gradient by the batch-"
+                        "median per-row ||grad||, so --guidance-scale carries "
+                        "eta_tilde (a fixed per-step ACTION-SPACE injection "
+                        "magnitude that transfers across tasks with "
+                        "different VIB gradient scales). OFF = bit-identical "
+                        "legacy injection (scale = eta in gradient units).")
+    p.add_argument("--guidance-scale", type=float, default=None,
+                   help="override cfg.exploration.guidance_scale (the "
+                        "multiplier on the injected gradient). With "
+                        "--orbit-eta-dimless this is eta_tilde in action-"
+                        "space units per sqrt(1-abar_t); without it, eta in "
+                        "gradient units (legacy semantics).")
     p.add_argument("--failed-set-json", default=None,
                    help="rescue mode: load the FROZEN failure set from this "
                         "json (explore-only -- the eval phase is skipped and "
@@ -410,6 +424,17 @@ def main():
         json_path = args.output_json or os.path.join(log_dir, f"{args.task}_{tag}_rollout_exp{args.exp_num}.json")
 
     # ---- wandb (live progress; x-axis = completed-init-count) ------------ #
+    # CLI scale override goes into cfg BEFORE wandb.init so the logged config
+    # carries the EFFECTIVE scale (review P1-4: a stale cfg.exploration value
+    # in the wandb panel would mislead any eta sweep), and RolloutPipeline
+    # reads the same attribute at construction.
+    if args.guidance_scale is not None:
+        if not guided:
+            p.error("--guidance-scale requires a guided mode (--guide != off)")
+        cfg.exploration.guidance_scale = float(args.guidance_scale)
+        print(f"[run_rollout] guidance_scale override: "
+              f"{cfg.exploration.guidance_scale}"
+              f"{' (eta_tilde, --orbit-eta-dimless)' if args.orbit_eta_dimless else ''}")
     wcfg = cfg.get("wandb", {}) or {}
     use_wandb = bool(wcfg.get("use_wandb", True)) and not args.no_wandb
     wandb_run = None
@@ -569,7 +594,8 @@ def main():
                         "orbit_sector_seed": args.orbit_sector_seed,
                         "orbit_noise_anneal": args.orbit_noise_anneal,
                         "orbit_climb": args.orbit_climb,
-                        "orbit_ray_seed": args.orbit_ray_seed},
+                        "orbit_ray_seed": args.orbit_ray_seed,
+                        "orbit_grad_norm": bool(args.orbit_eta_dimless)},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -696,6 +722,19 @@ def main():
                 "n_success_trajs": len(trajs),
                 "n_all_trajs": len(all_trajs),
                 "failed_init_indices": metrics.get("failed_init_indices"),
+                "guidance": {
+                    "guide": args.guide,
+                    "guidance_scale": float(cfg.exploration.guidance_scale),
+                    "eta_dimless": int(bool(args.orbit_eta_dimless)),
+                    **({"orbit_lam": args.orbit_lam,
+                        "orbit_delta": args.orbit_delta,
+                        "orbit_sigma": args.orbit_sigma,
+                        "orbit_sector": args.orbit_sector,
+                        "orbit_noise_anneal": args.orbit_noise_anneal,
+                        "orbit_climb": args.orbit_climb,
+                        "atypical_cap": args.atypical_cap}
+                       if args.guide == "orbit" else {}),
+                },
                 "outputs": {"success": success_path, "all": all_path},
             }
             if args.eval_only:

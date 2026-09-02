@@ -138,7 +138,8 @@ class OrbitCostPlanner(ScoutPlanner):
                  orbit_sigma: float = 0.25,
                  orbit_sector: str = "iid", orbit_sector_seed: int = 42,
                  orbit_noise_anneal: float = 1.0,
-                 orbit_climb: str = "grad", orbit_ray_seed: int = 42):
+                 orbit_climb: str = "grad", orbit_ray_seed: int = 42,
+                 orbit_grad_norm: bool = False):
         super().__init__(scout_vib, bridge=bridge, z=None,
                          obs_adapter=obs_adapter)
         self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
@@ -155,6 +156,22 @@ class OrbitCostPlanner(ScoutPlanner):
                   flush=True)
         self.orbit_delta = float(orbit_delta)
         self.orbit_sigma = float(orbit_sigma)
+        # eta-dimless mode (2026-09-02, orbit-hparam-dev): normalize the
+        # climb gradient by the BATCH MEDIAN per-row gradient norm before the
+        # policy's guidance_scale multiplies it. The injected climb becomes
+        #   eta_tilde * sqrt(1-abar_t) * (g / g_med)
+        # i.e. a fixed ACTION-SPACE displacement per step, so one eta_tilde
+        # transfers across tasks whose VIB gradient scales differ (tool_hang
+        # needed eta=12 vs 3.0 on square/can -- a per-task hand calibration
+        # the median absorbs automatically). Telemetry: the policy's
+        # mean_inject (batch-flattened F-norm of the injection) becomes
+        # eta_tilde * sqrt(1-abar_t) * ||g||_g_med-scaled -- on the task used
+        # for calibration it lands at the legacy value when
+        # eta_tilde = eta_legacy * g_med_task. OFF (default) = bit-identical
+        # legacy injection. Phase 2 is untouched: the Newton term carries its
+        # own ||grad||^2 normalization and the tangent noise is sigma-scaled,
+        # both already dimensionless w.r.t. the gradient scale.
+        self.orbit_grad_norm = bool(orbit_grad_norm)
         # sector mode (B2, 2026-08-31 beat-SOE campaign): "iid" = per-step
         # i.i.d. tangent noise (original, bit-identical default); "det" =
         # per-(init, try) DETERMINISTIC direction vector, cached for the
@@ -426,6 +443,40 @@ class OrbitCostPlanner(ScoutPlanner):
         cap_mask = (kl.detach() <= float(self._att.cap)).view(
             -1, *([1] * (g.dim() - 1)))
         cond_grad = torch.where(cap_mask, g, torch.zeros_like(g))
+        if self.orbit_grad_norm:
+            # eta-dimless: divide by the batch-median per-row gradient norm
+            # (detached scalar; consumes no RNG, so streams stay aligned with
+            # the legacy path). Rows are block-diagonal -> the median over
+            # per-row L2 norms is the natural batch summary. Two guards
+            # (review 2026-09-02):
+            #   * NaN containment: torch.median propagates NaN from ANY row,
+            #     which would poison every concurrent env's climb. Map NaN
+            #     row-norms to +inf first: a minority of bad rows leaves the
+            #     median finite, a majority degenerates to inf -> zero climb
+            #     (safe no-injection direction), never NaN -- the same row
+            #     isolation legacy has.
+            #   * Absolute floor 1e-4: at the FIRST guided step of every
+            #     chunk select_z anchors the baseline AT the query, so KL==0
+            #     exactly and the "gradients" are float roundoff (~1e-8);
+            #     normalizing by that would amplify roundoff into a
+            #     full-dose kick along an arbitrary direction (P0-1). Real
+            #     working-point row norms are O(0.1) (square/can chain
+            #     telemetry), six orders above the floor. Division by a
+            #     larger-than-true median only under-injects.
+            # ray_rotate runs AFTER this in policy.py and preserves per-row
+            # norms, so the normalized semantics survive the ray mode.
+            # Calibration notes (review P2): the median includes phase-2 /
+            # capped rows whose climb is zeroed downstream (deliberate --
+            # the median describes the batch's gradient SCALE, not which
+            # rows inject), and at B=1 the row is its own median -> the
+            # injection is exactly eta_tilde*sqrt(1-abar_t)*unit direction,
+            # i.e. injected magnitudes are batch-coupled through the median
+            # even though directions/RNG stay row-independent.
+            row_norms = g.detach().flatten(1).norm(dim=1)
+            row_norms = torch.nan_to_num(row_norms, nan=float("inf"),
+                                         posinf=float("inf"), neginf=0.0)
+            g_med = row_norms.median().clamp(min=1e-4)
+            cond_grad = cond_grad / g_med
         disp, p2, (fb_n, noise_n) = orbit_displacement(
             kl, g, kappa=self._att.cap, lam=self.orbit_lam,
             delta=self.orbit_delta, sigma=self.orbit_sigma,
