@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import time
 from typing import Any, Callable, Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -82,6 +83,42 @@ def _wandb_log(wandb_run, payload: dict, step: Optional[int] = None):
         wandb_run.log(payload, step=step)
     else:
         wandb_run.log(payload)
+
+
+def _proc_mem_gb():
+    """``(self_rss_gb, sys_available_gb)`` from /proc (Linux; None entries
+    elsewhere). Powers the always-on heartbeat prints -- sharded explore
+    workers run with --no-wandb, so stdout is their ONLY progress/memory
+    signal (2026-09-02 OOM incident: workers died silently hours before
+    anyone noticed)."""
+    rss = avail = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) / 1e6   # kB -> GB
+                    break
+    except OSError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) / 1e6  # kB -> GB
+                    break
+    except OSError:
+        pass
+    return rss, avail
+
+
+def _hb_line(tag: str, done: int, total: int, extra: str, t0: float):
+    """One-line heartbeat: progress + CPU memory + elapsed, flush=True so it
+    reaches the (block-buffered) shard stdout promptly."""
+    rss, avail = _proc_mem_gb()
+    mem = (f"rss={rss:.1f}G" if rss is not None else "rss=?") + \
+          (f" avail={avail:.1f}G" if avail is not None else " avail=?")
+    print(f"[{tag}-hb] {done}/{total} {extra} {mem} "
+          f"elapsed={time.time() - t0:.0f}s", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -440,6 +477,9 @@ def evaluate_baseline_vec(dp, env_factory: Callable[[], Any],
     any_succ_flags: List[bool] = [False] * n
     tries_done_per_env: List[int] = [0] * n   # for env-level progress
     success_trajs: List[dict] = []            # EVERY successful traj (flat)
+    _hb_t0 = time.time()
+    _hb_total = n * n_tries
+    _hb_n = 0
 
     def on_done(slot: _VecSlot):
         _, init_idx, try_idx = slot.job
@@ -451,6 +491,7 @@ def evaluate_baseline_vec(dp, env_factory: Callable[[], Any],
             success_trajs.append(slot.traj)   # keep ALL (SOE-style)
 
     def progress_cb(tick: int):
+        nonlocal _hb_n
         # env-level progress: an env counts as done when ALL its tries finished.
         # CRITICAL: the numerators must count ONLY fully-done envs -- first_results
         # / any_succ_flags are written the moment try_0 (or any try) finishes, so
@@ -483,6 +524,10 @@ def evaluate_baseline_vec(dp, env_factory: Callable[[], Any],
             })
         if on_progress is not None:
             on_progress({"completed": env_done, "successes": succ})
+        _hb_n += 1
+        if _hb_n % 10 == 0:   # every 10th cb (log_every ticks each) -> ~100 ticks
+            _hb_line(f"{metric_prefix}", sum(tries_done_per_env), _hb_total,
+                     f"succ={succ}", _hb_t0)
 
     runner = _VecRunner(
         dp, env_factory, n_envs, n_action_steps, horizon, device,
@@ -541,6 +586,10 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
     # SOE 3rd-difference norm (scout.eval.metrics.jerk); T<4 -> 0.0, skipped.
     jerk_sum = 0.0
     jerk_n = 0
+    # always-on heartbeat state (stdout works even under --no-wandb shards)
+    _hb_t0 = time.time()
+    _hb_total = len(job_queue)    # snapshot BEFORE runner.run consumes it
+    _hb_n = 0
     # novelty planners serialize a scene's retries (try j waits for j-1 so
     # the scene's executed-code buffer is complete before the next attempt).
     done_tries: dict = {}
@@ -567,6 +616,7 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
             entry["successful_trajs"].append(slot.traj)   # keep ALL (SOE-style)
 
     def progress_cb(tick: int):
+        nonlocal _hb_n
         # tries done = completed episodes; collected = successful ones.
         done = runner.completed
         collected = runner.successes
@@ -596,6 +646,10 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                 "solved_failed": solved_failed,
                 "jerk_sum": jerk_sum, "jerk_n": jerk_n,
             })
+        _hb_n += 1
+        if _hb_n % 10 == 0:   # every 10th cb (log_every ticks each) -> ~100 ticks
+            _hb_line("explore", done, _hb_total,
+                     f"collected={collected}", _hb_t0)
 
     # particle guidance (2026-08-30): the planner declares GROUP_LOCK ->
     # schedule each scene's retries as ONE slot group so the same-scene rows
