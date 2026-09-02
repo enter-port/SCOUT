@@ -242,6 +242,15 @@ def main():
                         "statistically equivalent to (not bit-identical "
                         "with) the monolithic run -- same protocol, same "
                         "scenes, deterministic per (seed, SHARDS, SLOT).")
+    p.add_argument("--failed-set-json", default=None,
+                   help="rescue mode: load the FROZEN failure set from this "
+                        "json (explore-only -- the eval phase is skipped and "
+                        "pass@k is measured on exactly the recorded failed "
+                        "inits).")
+    p.add_argument("--save-failed-set", default=None,
+                   help="rescue mode: save the baseline run's failed inits to "
+                        "this json (run once with the base DP, then reuse for "
+                        "every experiment via --failed-set-json).")
     args = p.parse_args()
 
     scene_slice = None
@@ -516,6 +525,8 @@ def main():
                         "exploit_knn": args.exploit_knn,
                         "exploit_gate_slope": args.exploit_gate_slope,
                         "exploit_gate_cap": args.exploit_gate_cap},
+        failed_set_json=args.failed_set_json,
+        save_failed_set=args.save_failed_set,
     )
     try:
         result = pipeline.run(
