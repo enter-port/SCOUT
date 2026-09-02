@@ -61,7 +61,6 @@ ATT_CAP=${ATT_CAP:-2.5}         # entropy cost: KL-bonus cap kappa (calibrated)
 SHARD_P=${SHARD_P:-2}           # explore shard workers (user 2026-09-02: 4x25 OOM-killed at ~870G RAM with 16 workers; 2x25 per chain)
 SHARD_ENVS=${SHARD_ENVS:-25}    # envs per shard worker (user 2026-09-01)
 EVALNENV=${EVALNENV:-25}        # eval-phase (monolithic) n_envs
-RAM_GATE_GB=${RAM_GATE_GB:-500} # phase-B entry gate: wait until MemAvailable >= this (OOM guard)
 SEED=42                       # eval phase: FIXED scene set every round (42..141)
 # XMODE=soe (2026-08-23): explore = retry ONLY the failed eval inits (the SAME
 # scenes/initial states as eval) x ETRIES each; DP data = successful retries;
@@ -322,23 +321,8 @@ else
   fi
 
   # -- phase B: sharded rescue explore (P workers x SHARD_ENVS envs, one GPU)
-  # Global heavy-phase gate (2026-09-02 OOM incident: 16 concurrent workers
-  # pushed ~870G RAM over the edge and the kernel SIGKILLed two chains):
-  # enter phase B only when (a) MemAvailable >= RAM_GATE_GB AND (b) this
-  # chain holds the global phase-B flock -- one chain's rescue at a time.
-  # flock is crash-safe: the kernel releases it if the chain dies.
-  LOCK=/root/workspace/baojiachun/scout-orbit/data/.phaseB_global.lock
-  if [ "${DRY_RUN:-0}" != 1 ]; then
-    exec 9>>"$LOCK"
-    while :; do
-      AV=$(free -g | awk '/^Mem:/{print $7}')
-      if [ "${AV:-0}" -ge "$RAM_GATE_GB" ] && flock -n 9; then
-        break
-      fi
-      log "[1/3b] heavy-phase gate: MemAvailable=${AV:-?}G (need >=${RAM_GATE_GB}G) + free phase-B slot -- waiting"
-      sleep 300
-    done
-  fi
+  # (2026-09-02 user order: the global phase-B flock + the MemAvailable gate
+  # were REMOVED -- phase B now starts unconditionally, right after phase A.)
   log "[1/3b] explore phase: $SHARD_P workers x n_envs=$SHARD_ENVS guide=$GUIDE failed-of-eval(x$ETRIES) -> merged $EXPLORE_JSON"
   # -- heartbeat reporter (2026-09-02 user order): during sharded phase B the
   # workers are --no-wandb, so progress/CPU-memory were invisible for hours
@@ -367,12 +351,11 @@ PYEOF
       # into the same run. Pattern includes "$RDIR " (pkill joins argv with
       # spaces) so other arms/rounds are never caught by prefix.
       pkill -f "shard_heartbeat.py.*--match $RDIR " 2>/dev/null && sleep 2
-      # 9>&- 3>&-: do NOT inherit the phase-B flock fd (9) / DRY_RUN fd (3) --
-      # a SIGKILLed driver must not leave the global lock held by the heartbeat.
+      # 3>&-: do not inherit the DRY_RUN argv fd.
       nohup $PY soe_scripts/shard_heartbeat.py --project "$WPROJ" --run-id "$RID_HB" \
         --shard-glob "$RDIR/log/shard*.stdout" --match "$RDIR" \
         --stop-file "$RDIR/all.hdf5" --log-file "$RDIR/heartbeat.log" \
-        >> "$RDIR/heartbeat.stdout" 2>&1 9>&- 3>&- &
+        >> "$RDIR/heartbeat.stdout" 2>&1 3>&- &
       HB_PID=$!
       log "[1/3-hb] heartbeat pid=$HB_PID -> $RDIR/heartbeat.log + wandb explore_hb/* (run $RID_HB)"
     else
@@ -407,7 +390,6 @@ PYEOF
   fi
   [ $RC -ne 0 ] && { log "[1/3b] sharded explore rc=$RC -- see $RDIR/shard*.stdout"; exit 1; }
   [ -f "$RDIR/all.hdf5" ] || [ "${DRY_RUN:-0}" = 1 ] || { log "[1/3b] FATAL: merged all.hdf5 missing"; exit 1; }
-  [ "${DRY_RUN:-0}" != 1 ] && flock -u 9   # release the global phase-B slot
 
   # -- wandb backfill: explore/pass@10 into the phase-A run (7-key contract)
   RID=$($PY - "$RDIR/log" <<'PYEOF'
