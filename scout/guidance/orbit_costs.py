@@ -157,15 +157,17 @@ class OrbitCostPlanner(ScoutPlanner):
         self.orbit_delta = float(orbit_delta)
         self.orbit_sigma = float(orbit_sigma)
         # eta-dimless mode (2026-09-02, orbit-hparam-dev): normalize the
-        # climb gradient by the BATCH MEDIAN per-row gradient norm before the
-        # policy's guidance_scale multiplies it. The injected climb becomes
+        # climb gradient by the LIVE-CLIMB MEAN per-row gradient norm
+        # (rows with kl < cap - delta and norm > 1e-4; see orbit_step for
+        # the guards) before the policy's guidance_scale multiplies it. The
+        # injected climb becomes
         #   eta_tilde * sqrt(1-abar_t) * (g / g_med)
         # i.e. a fixed ACTION-SPACE displacement per step, so one eta_tilde
         # transfers across tasks whose VIB gradient scales differ (tool_hang
         # needed eta=12 vs 3.0 on square/can -- a per-task hand calibration
-        # the median absorbs automatically). Telemetry: the policy's
+        # the live-climb mean absorbs automatically). Telemetry: the policy's
         # mean_inject (batch-flattened F-norm of the injection) becomes
-        # eta_tilde * sqrt(1-abar_t) * ||g||_g_med-scaled -- on the task used
+        # eta_tilde * sqrt(1-abar_t) * ||g||/g_med-scaled -- on the task used
         # for calibration it lands at the legacy value when
         # eta_tilde = eta_legacy * g_med_task. OFF (default) = bit-identical
         # legacy injection. Phase 2 is untouched: the Newton term carries its
@@ -233,6 +235,9 @@ class OrbitCostPlanner(ScoutPlanner):
         self._p2_acc: Optional[torch.Tensor] = None    # device sum of p2
         self._fb_acc: Optional[torch.Tensor] = None    # sum per-row |fb| norm
         self._noise_acc: Optional[torch.Tensor] = None  # sum per-row noise norm
+        # eta-dimless: last divisor + running mean (debug/probe surface)
+        self._last_g_med: Optional[torch.Tensor] = None
+        self._gmed_acc: Optional[torch.Tensor] = None
 
     @property
     def p2_rows(self) -> int:
@@ -444,39 +449,51 @@ class OrbitCostPlanner(ScoutPlanner):
             -1, *([1] * (g.dim() - 1)))
         cond_grad = torch.where(cap_mask, g, torch.zeros_like(g))
         if self.orbit_grad_norm:
-            # eta-dimless: divide by the batch-median per-row gradient norm
-            # (detached scalar; consumes no RNG, so streams stay aligned with
-            # the legacy path). Rows are block-diagonal -> the median over
-            # per-row L2 norms is the natural batch summary. Two guards
-            # (review 2026-09-02):
-            #   * NaN containment: torch.median propagates NaN from ANY row,
-            #     which would poison every concurrent env's climb. Map NaN
-            #     row-norms to +inf first: a minority of bad rows leaves the
-            #     median finite, a majority degenerates to inf -> zero climb
-            #     (safe no-injection direction), never NaN -- the same row
-            #     isolation legacy has.
-            #   * Absolute floor 1e-4: at the FIRST guided step of every
-            #     chunk select_z anchors the baseline AT the query, so KL==0
-            #     exactly and the "gradients" are float roundoff (~1e-8);
-            #     normalizing by that would amplify roundoff into a
-            #     full-dose kick along an arbitrary direction (P0-1). Real
-            #     working-point row norms are O(0.1) (square/can chain
-            #     telemetry), six orders above the floor. Division by a
-            #     larger-than-true median only under-injects.
-            # ray_rotate runs AFTER this in policy.py and preserves per-row
-            # norms, so the normalized semantics survive the ray mode.
-            # Calibration notes (review P2): the median includes phase-2 /
-            # capped rows whose climb is zeroed downstream (deliberate --
-            # the median describes the batch's gradient SCALE, not which
-            # rows inject), and at B=1 the row is its own median -> the
-            # injection is exactly eta_tilde*sqrt(1-abar_t)*unit direction,
-            # i.e. injected magnitudes are batch-coupled through the median
-            # even though directions/RNG stay row-independent.
-            row_norms = g.detach().flatten(1).norm(dim=1)
-            row_norms = torch.nan_to_num(row_norms, nan=float("inf"),
-                                         posinf=float("inf"), neginf=0.0)
-            g_med = row_norms.median().clamp(min=1e-4)
-            cond_grad = cond_grad / g_med
+            # eta-dimless: divide by the MEAN per-row gradient norm over the
+            # LIVE CLIMB rows (detached scalar; consumes no RNG, so streams
+            # stay aligned with the legacy path). Three guards (review
+            # 2026-09-02 + 20k-call can telemetry: an all-batch median let
+            # the shell rows -- phase 2, LARGE norms -- inflate the divisor
+            # and starve the climb 3x on can where p2=58%):
+            #   * climb-only: a row injects only when kl < cap - delta
+            #     (phase 2 swaps the climb for the constrained update, and
+            #     policy's _keep zeroes it) -- the divisor must describe
+            #     the rows that actually inject. Handover-band rows
+            #     [cap-delta, cap) are excluded too (review round 2).
+            #   * roundoff exclusion: rows with norm <= 1e-4 (at-anchor
+            #     first-step rows: KL==0 exactly, gradients ~1e-8 roundoff)
+            #     are dropped from the MEAN as well as floored in the
+            #     division -- otherwise they drag the divisor down and
+            #     re-amplify noise.
+            #   * NaN containment: map NaN row-norms to 0 so they drop out
+            #     of the weighted mean; if EVERY climb row is NaN the count
+            #     clamps to 1 and g_med -> 0 -> floor -> zero climb (safe
+            #     no-injection direction), never batch-wide NaN.
+            #   * MEAN, not median: after normalization the per-row norm
+            #     ||g_i||/mean is bounded by B (mean >= ||g_i||/B), so a
+            #     single finite outlier row can only cause batch-wide
+            #     UNDER-injection (safe: the DP prior dominates, and the
+            #     mean_g_med telemetry makes it visible). A median divisor
+            #     would allow unbounded over-injection of rows below it.
+            # Real working-point row norms are O(0.1) (square/can chain
+            # telemetry), three orders above the 1e-4 floor. ray_rotate
+            # runs AFTER this in policy.py and preserves per-row norms, so
+            # the normalized semantics survive the ray mode. Calibration
+            # note (review P2): injected magnitudes are batch-coupled
+            # through this statistic even though directions/RNG stay
+            # row-independent.
+            row_norms = g.detach().flatten(1).norm(dim=1)          # (B,)
+            row_norms = torch.nan_to_num(row_norms, nan=0.0,
+                                         posinf=0.0, neginf=0.0)
+            live = ((kl.detach() < float(self._att.cap) - self.orbit_delta)
+                    & (row_norms > 1e-4)).to(g.dtype)              # (B,)
+            g_med = (row_norms * live).sum() / live.sum().clamp(min=1.0)
+            cond_grad = cond_grad / g_med.clamp(min=1e-4)
+            self._last_g_med = g_med.clamp(min=1e-4).detach()
+            self._gmed_acc = (self._last_g_med
+                              if self._gmed_acc is None
+                              or self._gmed_acc.device != self._last_g_med.device
+                              else self._gmed_acc + self._last_g_med)
         disp, p2, (fb_n, noise_n) = orbit_displacement(
             kl, g, kappa=self._att.cap, lam=self.orbit_lam,
             delta=self.orbit_delta, sigma=self.orbit_sigma,
@@ -504,7 +521,9 @@ class OrbitCostPlanner(ScoutPlanner):
             print(f"[orbit-telemetry] calls={self._orb_calls} "
                   f"p2_rows={self._orb_p2_rows}/{self._orb_rows} "
                   f"mean|fb|/p2row={float(self._fb_acc) / n:.4g} "
-                  f"mean|noise|/p2row={float(self._noise_acc) / n:.4g}",
+                  f"mean|noise|/p2row={float(self._noise_acc) / n:.4g}"
+                  + ("" if self._gmed_acc is None
+                     else f" mean_g_med={float(self._gmed_acc) / self._orb_calls:.4g}"),
                   flush=True)
         row_losses = -torch.clamp(kl.detach(), max=float(self._att.cap))
         return cond_grad, disp, p2, row_losses

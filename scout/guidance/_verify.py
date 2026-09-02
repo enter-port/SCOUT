@@ -1140,15 +1140,20 @@ def check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data,
     """Check 17 (2026-09-02, orbit-hparam-dev): eta-dimless climb
     normalization.
 
-    (17a) OFF (default) is bit-identical to the pre-change orbit_step --
-          same fixture as check 16 (odd-row zero-KL / even-row far
-          baselines), two fresh planners, same RNG stream -> torch.equal;
-    (17b) ON divides cond_grad by exactly the batch-median per-row
-          ||grad|| (manual reference), and disp / p2 / row_losses are
-          UNTOUCHED (phase 2 has no eta dependence);
+    (17a) OFF (default) is deterministic on a fixture that mixes at-anchor,
+          mid-band and above-cap rows (16a already pins OFF to the legacy
+          two-backward reference);
+    (17b) ON divides cond_grad by the LIVE-CLIMB MEAN per-row ||grad||
+          (rows with kl < cap-delta and norm > 1e-4), recomputed
+          INDEPENDENTLY in this check via _enc_forward/_kl_rows (a
+          self-referential _last_g_med comparison would pass for ANY
+          statistic definition -- review round 2 demonstrated the all-rows
+          variant passing its own divisor); disp / p2 / row_losses are
+          UNTOUCHED (phase 2 has no eta dependence), and at-anchor roundoff
+          rows stay sub-dose after normalization (P0-1 regression);
     (17c) policy-level: normalization BITES at equal scale (trajectory
           differs, finite) -- full bit-identity is not assertable because
-          g_med is a per-step online median; the planner-level identity
+          g_med is a per-step online statistic; the planner-level identity
           (17b) + check 16b's RNG-path guarantee cover the wiring.
     """
     from scout.guidance.orbit_costs import OrbitCostPlanner
@@ -1182,6 +1187,7 @@ def check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data,
         traj = torch.randn(B, H, Ad).requires_grad_(True)
         outs[name] = p.orbit_step(traj, 2.0 * traj, current_obs,
                                   noise_scale=0.6)
+        outs[name + "_planner"] = p
     cg_off1, disp_off1, p2_off1, rl_off1 = outs["off1"]
     cg_off2, _, _, _ = outs["off2"]
     cg_on, disp_on, p2_on, rl_on = outs["on"]
@@ -1193,24 +1199,35 @@ def check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data,
     # division below is verified on numerical noise only.
     assert cg_off1[1].abs().max().item() > 1e-3, (
         "(17a) fixture row 1 must carry a real mid-band climb gradient")
-    # (17b) ON == OFF / median(||g_row||) over ALL rows. The production
-    # median runs over the uncapped gradient g; recover it with a cap=inf
-    # clone of the fixture (capped rows of cg_off1 are zeroed, so their
-    # norms cannot be read off cg_off1 directly). NOTE: with cap=inf the
-    # clone's disp is inf/NaN garbage (kl - inf) -- only cg_unc is read.
-    p_unc = armed(mk(False))
-    p_unc._att.cap = float("inf")
+    # (17b) ON == OFF / g_med where g_med is the LIVE-CLIMB MEAN row norm,
+    # recomputed INDEPENDENTLY here (self-referencing the planner's
+    # _last_g_med would pass for any statistic -- the review's WrongStat
+    # probe passed its own divisor). Rebuild (kl, g) on the identical
+    # fixture input through the same encoder path.
+    from scout.guidance.entropy_costs import _enc_forward, _kl_rows
+    p_on = outs["on_planner"]
     torch.manual_seed(seed + 12)
-    traj_u = torch.randn(B, H, Ad).requires_grad_(True)
-    cg_unc, _, _, _ = p_unc.orbit_step(traj_u, 2.0 * traj_u, current_obs,
-                                       noise_scale=0.6)
-    row_norms = cg_unc.detach().flatten(1).norm(dim=1)
-    g_med = row_norms.median().clamp(min=1e-4)
+    traj_r = torch.randn(B, H, Ad).requires_grad_(True)
+    s_bar = p_on._att._resolve_s_bar_t(current_obs)
+    a_r = _enc_forward(p_on, 2.0 * traj_r)
+    mu_r, lv_r = p_on.scout_vib.vib_enc(s_bar.detach(), a_r)
+    kl_r = _kl_rows(mu_r, lv_r, p_on._att._base_mu, p_on._att._base_lv,
+                    2.0 * traj_r)
+    g_r = torch.autograd.grad(kl_r.sum(), traj_r)[0]
+    norms_r = g_r.detach().flatten(1).norm(dim=1)
+    norms_r = torch.nan_to_num(norms_r, nan=0.0, posinf=0.0, neginf=0.0)
+    live_r = ((kl_r.detach() < float(p_on._att.cap) - p_on.orbit_delta)
+              & (norms_r > 1e-4)).to(norms_r.dtype)
+    g_med = ((norms_r * live_r).sum()
+             / live_r.sum().clamp(min=1.0)).clamp(min=1e-4)
+    assert torch.allclose(outs["on_planner"]._last_g_med, g_med, atol=1e-6), (
+        "(17b) planner's stored divisor must equal the independent "
+        "live-climb-mean recomputation")
     assert torch.allclose(cg_on, cg_off1 / g_med, atol=1e-6), (
-        "(17b) ON must divide cond_grad by the batch-median row ||grad||")
+        "(17b) ON must divide cond_grad by the live-climb mean row ||grad||")
     # roundoff amplification guard (review P0-1): a batch of PURE at-anchor
     # rows (KL==0 exactly, roundoff grads ~1e-8) must stay near-zero after
-    # normalization -- the 1e-4 floor prevents the median from amplifying
+    # normalization -- the 1e-4 floor prevents the divisor from amplifying
     # noise into a full-dose kick.
     p_anchor = mk(False)                          # NO arming: every row at-anchor
     p_dim = mk(True)
@@ -1234,9 +1251,9 @@ def check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data,
     # (17c) policy-level: normalization BITES (trajectory differs from the
     # OFF arm at equal scale) and the dose telemetry stays finite/positive.
     # Full-trajectory bit-identity at eta_tilde = eta*g_med is NOT asserted:
-    # g_med is a PER-STEP batch median (by design -- the online-adaptive
+    # g_med is a PER-STEP live-climb mean (by design -- the online-adaptive
     # semantics), so a fixed scale cannot reproduce the OFF arm step-by-step
-    # unless every step's median is identical; the planner-level identity
+    # unless every step's divisor is identical; the planner-level identity
     # (17b) plus check 16b's policy RNG-path guarantee cover the wiring.
     gst = policy.noise_scheduler.config.num_train_timesteps
     cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)

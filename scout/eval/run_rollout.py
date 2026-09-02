@@ -147,12 +147,14 @@ def main():
                         "--rescue-seed).")
     p.add_argument("--orbit-eta-dimless", action="store_true",
                    help="orbit: eta-dimless mode (2026-09-02 orbit-hparam-"
-                        "dev) -- normalize the climb gradient by the batch-"
-                        "median per-row ||grad||, so --guidance-scale carries "
-                        "eta_tilde (a fixed per-step ACTION-SPACE injection "
-                        "magnitude that transfers across tasks with "
-                        "different VIB gradient scales). OFF = bit-identical "
-                        "legacy injection (scale = eta in gradient units).")
+                        "dev) -- normalize the climb gradient by the live-"
+                        "climb MEAN per-row ||grad|| (rows with kl < "
+                        "cap-delta, norm > 1e-4), so --guidance-scale "
+                        "carries eta_tilde (a fixed per-step ACTION-SPACE "
+                        "injection magnitude that transfers across tasks "
+                        "with different VIB gradient scales). OFF = "
+                        "bit-identical legacy injection (scale = eta in "
+                        "gradient units).")
     p.add_argument("--guidance-scale", type=float, default=None,
                    help="override cfg.exploration.guidance_scale (the "
                         "multiplier on the injected gradient). With "
