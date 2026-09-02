@@ -1274,6 +1274,82 @@ def check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data,
           f"policy-level bite + finite telemetry OK")
 
 
+def check_orbit_sigma_schedule(scout_vib, current_obs, cond_data, seed=233):
+    """Check 18 (2026-09-02, orbit-hparam-dev): round-dependent sigma
+    ceiling  sigma_eff = sigma * decay**(round-1).
+
+    (18a) round=1 / decay=1.0 (defaults) is BIT-IDENTICAL to the legacy
+          planner on a mixed-phase fixture (same RNG stream);
+    (18b) round=2 / decay=0.5 halves ONLY the tangential-noise component
+          exactly: disp(r2) == 0.5*disp(legacy) + 0.5*fb, where fb is
+          isolated by a sigma=0 run (the check-14b algebra);
+    (18c) a large round drives sigma_eff to numerical zero -> NO randn is
+          drawn (disp equals the sigma=0 arm bit-for-bit) -- the sigma>0
+          guard in orbit_displacement holds;
+    (18d) invalid arguments raise at __init__ (round < 1, decay outside
+          (0,1]).
+    """
+    from scout.guidance.orbit_costs import OrbitCostPlanner
+
+    B = current_obs["proprio"].shape[0]
+    H, Ad = cond_data.shape[1], cond_data.shape[2]
+
+    torch.manual_seed(seed + 12)
+    traj0 = torch.randn(B, H, Ad)
+
+    def mk(sigma=0.25, **kw):
+        p = OrbitCostPlanner(scout_vib, bridge=IdentityBridge(), cap=2.5,
+                             orbit_lam=0.5, orbit_delta=0.25,
+                             orbit_sigma=sigma, **kw)
+        p.set_current_obs(current_obs)
+        p.select_z(2.0 * traj0, current_obs)
+        with torch.no_grad():
+            for i in range(0, B, 2):
+                p._att._base_mu[i] = p._att._base_mu[i] + 3.0
+            if B > 1:
+                p._att._base_mu[1] = p._att._base_mu[1] + 0.4
+        return p
+
+    def run(p, ns=0.6):
+        torch.manual_seed(seed + 18)
+        traj = torch.randn(B, H, Ad).requires_grad_(True)
+        return p.orbit_step(traj, 2.0 * traj, current_obs, noise_scale=ns)
+
+    # (18a) defaults bit-identical to a planner constructed without the new
+    # kwargs at all
+    a1 = run(mk())
+    a2 = run(mk(orbit_round=1, orbit_sigma_decay=1.0))
+    assert torch.equal(a1[0], a2[0]) and torch.equal(a1[1], a2[1]), (
+        "(18a) round=1/decay=1 must be bit-identical to the legacy planner")
+    # (18b) round=2/decay=0.5 -> noise halved exactly (check-14b algebra:
+    # fb isolated with sigma=0, which shares the RNG stream trivially).
+    r2 = run(mk(orbit_round=2, orbit_sigma_decay=0.5))
+    fb_only = run(mk(sigma=0.0))
+    assert torch.allclose(r2[1], 0.5 * a1[1] + 0.5 * fb_only[1], atol=1e-6), (
+        "(18b) round=2/decay=0.5 must scale ONLY the noise component by 0.5")
+    # (18c) round large -> sigma_eff ~ 0 -> no randn drawn
+    p_zero = mk(sigma=0.0)
+    p_big = mk(orbit_round=60, orbit_sigma_decay=0.5)   # 0.25*0.5**59 ~ 0
+    assert p_big.orbit_sigma_eff == 0.0, (
+        f"(18c) numerical-zero sigma_eff must snap to EXACT 0.0, got "
+        f"{p_big.orbit_sigma_eff!r} -- otherwise the randn draw still fires "
+        f"and shifts the trajectory RNG stream")
+    out_zero = run(p_zero)
+    out_big = run(p_big)
+    assert torch.equal(out_zero[1], out_big[1]), (
+        "(18c) numerical-zero sigma_eff must not consume randn (disp equal "
+        "to the sigma=0 arm)")
+    # (18d) guards
+    for bad in (dict(orbit_round=0), dict(orbit_sigma_decay=0.0),
+                dict(orbit_sigma_decay=1.5)):
+        try:
+            mk(**bad)
+            raise AssertionError(f"(18d) {bad} must raise at __init__")
+        except ValueError:
+            pass
+    print("[check 18] sigma round-schedule: defaults bit-identical; "
+          "round=2/decay=0.5 halves only the noise; numerical-zero draws no "
+          "randn; guards OK")
 def main():
     print("=" * 60)
     print("SCOUT guidance wiring -- hermetic dummy verify")
@@ -1309,6 +1385,8 @@ def main():
     check_orbit_merged(policy, scout_vib, current_obs, cond_data)
     # eta-dimless normalization (17) -- orbit-hparam-dev, 2026-09-02.
     check_orbit_eta_dimless(policy, scout_vib, current_obs, cond_data)
+    # round-dependent sigma ceiling (18) -- orbit-hparam-dev, 2026-09-02.
+    check_orbit_sigma_schedule(scout_vib, current_obs, cond_data)
 
     print("-" * 60)
     print("ALL CHECKS PASSED")

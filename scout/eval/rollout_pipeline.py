@@ -210,6 +210,8 @@ class RolloutPipeline:
                 orbit_climb=str(ek.get("orbit_climb", "grad")),
                 orbit_ray_seed=int(ek.get("orbit_ray_seed", 42)),
                 orbit_grad_norm=bool(ek.get("orbit_grad_norm", False)),
+                orbit_round=int(ek.get("orbit_round", 1)),
+                orbit_sigma_decay=float(ek.get("orbit_sigma_decay", 1.0)),
             )
             print(f"[rollout] orbit guidance: lam={planner.orbit_lam} "
                   f"delta={planner.orbit_delta} sigma={planner.orbit_sigma} "
@@ -217,7 +219,10 @@ class RolloutPipeline:
                   f"sector={planner.orbit_sector} "
                   f"anneal={planner.orbit_noise_anneal} "
                   f"climb={planner.orbit_climb} "
-                  f"eta_dimless={planner.orbit_grad_norm}")
+                  f"eta_dimless={planner.orbit_grad_norm} "
+                  f"round={planner.orbit_round} "
+                  f"sigma_eff={planner.orbit_sigma_eff:.4g} "
+                  f"(decay={planner.orbit_sigma_decay})")
         else:
             planner = ScoutPlanner(scout_vib, bridge=bridge,
                                    obs_adapter=obs_adapter, z=None)

@@ -161,6 +161,17 @@ def main():
                         "--orbit-eta-dimless this is eta_tilde in action-"
                         "space units per sqrt(1-abar_t); without it, eta in "
                         "gradient units (legacy semantics).")
+    p.add_argument("--orbit-round", type=int, default=1,
+                   help="orbit: chain round index for the sigma schedule "
+                        "(user 2026-09-02) -- sigma ceiling decays as "
+                        "orbit_sigma * orbit_sigma_decay**(round-1) because "
+                        "the retrained VIB stack settles onto the rescue "
+                        "ridge and late-round tangential noise only kicks "
+                        "retries off it. 1 = no decay (bit-identical).")
+    p.add_argument("--orbit-sigma-decay", type=float, default=1.0,
+                   help="orbit: per-round decay factor of the sigma ceiling, "
+                        "in (0,1]. 0.5 halves the noise every round. "
+                        "1.0 = round-independent (bit-identical legacy).")
     p.add_argument("--failed-set-json", default=None,
                    help="rescue mode: load the FROZEN failure set from this "
                         "json (explore-only -- the eval phase is skipped and "
@@ -597,7 +608,9 @@ def main():
                         "orbit_noise_anneal": args.orbit_noise_anneal,
                         "orbit_climb": args.orbit_climb,
                         "orbit_ray_seed": args.orbit_ray_seed,
-                        "orbit_grad_norm": bool(args.orbit_eta_dimless)},
+                        "orbit_grad_norm": bool(args.orbit_eta_dimless),
+                        "orbit_round": args.orbit_round,
+                        "orbit_sigma_decay": args.orbit_sigma_decay},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -704,6 +717,10 @@ def main():
                                        "explore_init_done": metrics["n_failed"]})
 
             # ---- JSON summary ------------------------------------------------- #
+            _sig_eff = (args.orbit_sigma
+                        * (args.orbit_sigma_decay ** (args.orbit_round - 1)))
+            if 0.0 < _sig_eff < 1e-12:      # same snap as the planner (18c)
+                _sig_eff = 0.0
             summary = {
                 "task": args.task,
                 "mode": args.guide + (":eval-only" if args.eval_only else ""),
@@ -731,6 +748,9 @@ def main():
                     **({"orbit_lam": args.orbit_lam,
                         "orbit_delta": args.orbit_delta,
                         "orbit_sigma": args.orbit_sigma,
+                        "orbit_sigma_eff": _sig_eff,
+                        "orbit_round": args.orbit_round,
+                        "orbit_sigma_decay": args.orbit_sigma_decay,
                         "orbit_sector": args.orbit_sector,
                         "orbit_noise_anneal": args.orbit_noise_anneal,
                         "orbit_climb": args.orbit_climb,

@@ -139,7 +139,9 @@ class OrbitCostPlanner(ScoutPlanner):
                  orbit_sector: str = "iid", orbit_sector_seed: int = 42,
                  orbit_noise_anneal: float = 1.0,
                  orbit_climb: str = "grad", orbit_ray_seed: int = 42,
-                 orbit_grad_norm: bool = False):
+                 orbit_grad_norm: bool = False,
+                 orbit_round: int = 1,
+                 orbit_sigma_decay: float = 1.0):
         super().__init__(scout_vib, bridge=bridge, z=None,
                          obs_adapter=obs_adapter)
         self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
@@ -174,6 +176,31 @@ class OrbitCostPlanner(ScoutPlanner):
         # own ||grad||^2 normalization and the tangent noise is sigma-scaled,
         # both already dimensionless w.r.t. the gradient scale.
         self.orbit_grad_norm = bool(orbit_grad_norm)
+        # Round-dependent sigma ceiling (user order 2026-09-02): the chain's
+        # retrained VIB co-adapts to the guidance's rescued trajectories, so
+        # the DP/VIB stack settles onto the rescue ridge -- late rounds the
+        # tangential noise only kicks retries OFF that ridge (orbit rescue
+        # 36 -> 17 -> 12 -> 14 -> 0 on square while atypical stays 22 at the
+        # same trio). Effective ceiling:
+        #     sigma_eff(round) = orbit_sigma * orbit_sigma_decay ** (round-1)
+        # decay=1.0 (default) = round-independent = bit-identical legacy.
+        # Compose with --orbit-noise-anneal p for the per-DENOISE-step
+        # exponent (noise carries (1-abar_t)^(p/2), already shipped as B3).
+        if int(orbit_round) < 1:
+            raise ValueError(f"orbit_round must be >= 1, got {orbit_round!r}")
+        if not (0.0 < float(orbit_sigma_decay) <= 1.0):
+            raise ValueError(f"orbit_sigma_decay must be in (0, 1], got "
+                             f"{orbit_sigma_decay!r}")
+        self.orbit_round = int(orbit_round)
+        self.orbit_sigma_decay = float(orbit_sigma_decay)
+        self.orbit_sigma_eff = float(orbit_sigma) * (
+            self.orbit_sigma_decay ** (self.orbit_round - 1))
+        if 0.0 < self.orbit_sigma_eff < 1e-12:
+            # the round schedule switched the noise OFF numerically -- snap
+            # to exact 0.0 so orbit_displacement draws NO randn (a residual
+            # 1e-19 magnitude would still shift the trajectory RNG stream;
+            # check 18c). Guard above requires orbit_sigma > 0 to reach here.
+            self.orbit_sigma_eff = 0.0
         # sector mode (B2, 2026-08-31 beat-SOE campaign): "iid" = per-step
         # i.i.d. tangent noise (original, bit-identical default); "det" =
         # per-(init, try) DETERMINISTIC direction vector, cached for the
@@ -509,9 +536,9 @@ class OrbitCostPlanner(ScoutPlanner):
                               else self._gmed_acc + self._last_g_med)
         disp, p2, (fb_n, noise_n) = orbit_displacement(
             kl, g, kappa=self._att.cap, lam=self.orbit_lam,
-            delta=self.orbit_delta, sigma=self.orbit_sigma,
+            delta=self.orbit_delta, sigma=self.orbit_sigma_eff,
             noise_scale=noise_scale,
-            xi_override=(self._sector_xi(g) if self.orbit_sigma > 0.0
+            xi_override=(self._sector_xi(g) if self.orbit_sigma_eff > 0.0
                          else None))
         # telemetry (norms masked to phase-2 rows -- the dose numbers must
         # describe what was actually injected, not the pre-mask values).
