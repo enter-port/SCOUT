@@ -1,0 +1,50 @@
+seed: 42
+# eval_tool_hang_entropy.yaml -- orbit-native chain config, TOOL_HANG (2026-09-01).
+# Copy of eval_square_entropy.yaml with tool_hang fields (horizon 700,
+# sideview + robot0_eye_in_hand cameras, base_dp_tool_hang_image).
+# guidance_scale 3.0 = PROVISIONAL (can/square calibrated value); the
+# tool_hang dose-response probe on the s233 round0 trio runs BEFORE round 1
+# and the final value is patched here (atomic write-new+mv). Stale ckpt paths
+# are ALWAYS overridden by run_rollout CLI (--base-dp-ckpt / --vib-ckpt /
+# --core-hdf5); dataset.path follows --core-hdf5.
+base_dp:
+  initial_ckpt_path: /root/workspace/baojiachun/scout-orbit/data/2026_9_1_toolhang/TOOLHANG-s233/tool_hang/train/DP/DP-base/checkpoints/599.ckpt
+  config_name: base_dp_tool_hang_image
+  config_dir: configs
+vib:
+  ckpt_path: /root/workspace/baojiachun/scout-orbit/data/2026_9_1_toolhang/TOOLHANG-s233/tool_hang/train/dyn/dyn-base/20260901-000000/scout_vib.ckpt
+  base_dp_ckpt: /root/workspace/baojiachun/scout-orbit/data/2026_9_1_toolhang/TOOLHANG-s233/tool_hang/train/DP/DP-base/checkpoints/599.ckpt
+  view_names: [sideview_image, robot0_eye_in_hand_image]
+  proprio_dim: 9
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+dataset:
+  path: /root/workspace/baojiachun/scout/data/robomimic/tool_hang/ph/image_v141_abs_core20.hdf5
+  core_filter_key: core_20
+action_dim: 10
+eval:
+  n_init_states: 100
+  try_times: 5
+  horizon: 700
+  n_envs: 25
+  log_every: 10
+  view_names: [sideview_image, robot0_eye_in_hand_image]
+  proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+exploration:
+  guidance_scale: 12.0             # PROVISIONAL -- patch from the s233 round0 dose probe (target: mean_inject ~ square band 1.05-1.20)
+  guidance_start_timestep: 100
+self_improvement:
+  num_rounds: 8
+  scout_aug_mask: scout_aug
+  num_epochs: 1500
+wandb:
+  use_wandb: true
+  project: TOOLHANG-9-1-orbit-s233
+  tags: [formal, orbit]
+device: auto
+log_dir: logs/scout_eval_tool_hang_image
+explore:
+  base_seed_round1: 1042
+  n_scenes: 100
+  try_times: 1

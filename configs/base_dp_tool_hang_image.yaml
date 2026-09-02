@@ -1,0 +1,192 @@
+# SCOUT E0: base Diffusion Policy on robomimic `tool_hang` image (LPB format).
+#
+# Clone of base_dp_square_image.yaml with tool_hang fields (2026-09-01):
+#   * cameras sideview + robot0_eye_in_hand (tool_hang has NO agentview;
+#     per LPB/DP tool_hang_image_abs.yaml);
+#   * single-arm 7-dim abs action -> 10-dim 6drot (same conversion as can/square);
+#   * horizon/max_steps 700 (tool_hang episodes are long; DP official config).
+# Everything else identical to the can/square E0 recipe (down_dims, DDPM 100,
+# crop 76, 600ep, batch 64, lr 1e-4).
+#
+# round-0 (BASE arm of round_orbit_th.sh) passes task.dataset_path=$CORE
+# (the TSEED-seeded 20-of-200 split) on the CLI; the dataset_path below is
+# the fixed-interval official core20 placeholder.
+
+name: base_dp_tool_hang_image
+_target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
+
+exp_name: "scout_e0"
+task_name: tool_hang
+dataset_type: ph
+abs_action: true
+train_filter_key: null     # SCOUT mask knob (SOE convention); ignored by LPB dataset
+
+shape_meta: &shape_meta
+  obs:
+    sideview_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eef_pos:     {shape: [3]}
+    robot0_eef_quat:    {shape: [4]}
+    robot0_gripper_qpos: {shape: [2]}
+  action:
+    shape: [10]            # abs_6drot: 3 trans + 6 rot + 1 gripper
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: false
+keypoint_visible_rate: 1.0
+obs_as_global_cond: true
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_global_cond: ${obs_as_global_cond}
+  crop_shape: [76, 76]
+  diffusion_step_embed_dim: 128
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: true
+  obs_encoder_group_norm: true
+  eval_fixed_crop: true
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+# robomimic `tool_hang` image dataset (SOE path layout; override per machine).
+task:
+  name: ${task_name}
+  dataset_path: /root/workspace/baojiachun/scout/data/robomimic/tool_hang/ph/image_v141_abs_core20.hdf5
+  train_filter_key: ${train_filter_key}
+  env_runner:
+    _target_: diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner
+    dataset_path: ${task.dataset_path}
+    shape_meta: *shape_meta
+    n_train: 6
+    n_train_vis: 2
+    train_start_idx: 0
+    n_test: 50
+    n_test_vis: 4
+    test_start_seed: 100000
+    max_steps: 700
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    render_obs_key: sideview_image
+    fps: 10
+    crf: 22
+    past_action: ${past_action_visible}
+    abs_action: ${abs_action}
+    tqdm_interval_sec: 1.0
+    n_envs: 28
+  dataset:
+    _target_: diffusion_policy.dataset.robomimic_replay_image_dataset.RobomimicReplayImageDataset
+    shape_meta: ${shape_meta}
+    dataset_path: ${task.dataset_path}
+    horizon: ${horizon}
+    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+    pad_after: ${eval:'${n_action_steps}-1'}
+    n_obs_steps: ${dataset_obs_steps}
+    abs_action: ${abs_action}
+    rotation_rep: rotation_6d
+    use_legacy_normalizer: false
+    use_cache: true
+    seed: 42
+    val_ratio: 0.02
+
+dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: true
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 600
+  gradient_accumulate_every: 1
+  use_ema: true
+  use_amp: false             # bench: no gain on H20 (kernel-launch-bound, not FLOP-bound)
+  compile_model: false       # torch.compile opt-in (inductor BROKEN on this server; use compile_backend: cudagraphs)
+  cudnn_benchmark: false     # cudnn autotuner (fixed shapes; bench +7%)
+  compile_backend: inductor   # inductor needs triton toolchain (broken here)/cudagraphs
+  rollout_every: 20
+  checkpoint_every: 100
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: true
+  mode: online
+  name: DP-${task_name}-base           # e.g. DP-tool_hang-base (SCOUT convention)
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
