@@ -262,6 +262,8 @@ source /root/workspace/baojiachun/.venv/bin/activate   # 或直接 .venv/bin/pyt
 
 > 📝 **2026-08 更新**：上述「deferred」为 stage-1 完成时点的快照。此后 base DP / VIB / multi-round 已在服务器实跑（e2–e5 系列实验，见 `experiments/experiment_log.md`）；**正式 entropy-cost 实验**（can，3 seed × DP/SCOUT 双臂，SOE rescue 口径 ×10 重试，`--guide atypical`）自 2026-08-24 起运行（服务器 `data/2026_8_21_entropy/`，驱动 `soe_scripts/round_entropy.sh`）。
 
+> 📝 **2026-08-31 更新（orbit 约束控制 campaign，branch `entropy-random-dev`）**：新增 `--guide orbit`（`scout/guidance/orbit_costs.py`，commits `f639e4b`+`c36e69f`）——κ−δ 以下逐字节沿用 atypical 爬坡，以上切「Newton 反馈扶 κ + 切向噪声 ξ⊥」在逃逸壳上巡行；λ 无量纲、no-op 哨兵位同 atypical，对其它 guide 模式零影响（`_verify.py` check 10-12）。SQUARE s233 base 定集上 σ0.25 为五臂最佳（救 36 vs atypical 30，pass@10 0.74，PR 1.38 + μ̄距 0.188 = 径向压缩+角向展开机制签名）；但随后 **3 seed × 链轮 r1-r3 网格（7/9 格）证明轮次反转**：r1 均值 +2.7、r2/r3 均值 −8（累计 −24），orbit 只在 round1 冷策略占优、进链中段系统性变差。归因（重叠分析实证）：r2/r3 的 DP/VIB/残余失败集都是 atypical 自蒸馏回路塑形的——orbit 守棱线能力 90%→41-53%、独破新场景红利 9-11→2-4，且亏损与剂量无关（带内格子同样输）、jerk 通胀 2-3×。结论：orbit 若要用须连数据回路一起换（原生链），不可链中段替换；数值存档与细节见本地 `experiments/orbit_grid_0831/`（服务器输出已清理）。
+
 ---
 
 ## 参考
