@@ -146,7 +146,11 @@ def project_to_pixels(points: np.ndarray, cam_pos: np.ndarray, fov_deg: float,
                       width: int, height: int) -> np.ndarray:
     """Exact pinhole projection for the straight-down camera (identity quat).
 
-    mujoco ``camera_fov`` is the vertical fov in degrees; square pixels.
+    Deprecated convenience wrapper: use :func:`project_to_pixels_frame` (works
+    for ANY camera pose via the sim-reported frame). This closed form is only
+    valid for the world-aligned identity-quat top-down camera; convention
+    verified to sub-pixel accuracy against segmentation masks (mujoco 2.3.7 +
+    robosuite EGL + robomimic's ``im[::-1]`` row flip).
     """
     f = 0.5 * height / np.tan(np.radians(fov_deg) / 2.0)
     d = points - cam_pos[None, :]
@@ -156,6 +160,139 @@ def project_to_pixels(points: np.ndarray, cam_pos: np.ndarray, fov_deg: float,
     return np.stack([u, v], axis=1)
 
 
+# --------------------------------------------------------------------------- #
+# multi-view cameras + general exact projection (any camera pose)
+# --------------------------------------------------------------------------- #
+def project_to_pixels_frame(points, cam_xpos, cam_xmat, fov_deg: float,
+                            width: int, height: int,
+                            min_depth: float = 0.01) -> np.ndarray:
+    """Exact pinhole projection for ANY mujoco camera, via its DATA-level
+    frame (``sim.data.cam_xpos`` / ``cam_xmat`` AFTER ``sim.forward()``).
+
+    ``cam_xmat`` rows are the camera axes in world coords; the camera looks
+    along its -z axis (so visible points have negative camera-z). With
+    identity frame this reduces exactly to the top-down closed form above
+    (verified sub-pixel vs segmentation). Vertical ``camera_fov`` in degrees.
+
+    Points closer than ``min_depth`` to the camera (e.g. the EE waypoint at
+    the eye-in-hand camera's own origin -- depth 0) project to garbage; they
+    are returned as NaN so downstream plotting silently skips them.
+    """
+    f = 0.5 * height / np.tan(np.radians(fov_deg) / 2.0)
+    d = np.asarray(points, dtype=np.float64) \
+        - np.asarray(cam_xpos, dtype=np.float64)[None, :]
+    # Camera axes are the COLUMNS of cam_xmat (verified 2026-08-28 against
+    # red-pixel-mask ground truth on the stock agentview: cols-rule err 18px
+    # = can-radius level, rows-rule err >=375px; rows only coincide with
+    # columns for symmetric frames, e.g. the identity-quat top-down camera).
+    R = np.asarray(cam_xmat, dtype=np.float64).reshape(3, 3)
+    x_c, y_c, z_c = d @ R[:, 0], d @ R[:, 1], d @ R[:, 2]
+    depth = -z_c
+    bad = depth < min_depth
+    depth_s = np.where(bad, 1.0, depth)      # avoid div-by-0, masked below
+    u = 0.5 * width + f * x_c / depth_s
+    v = 0.5 * height - f * y_c / depth_s
+    out = np.stack([u, v], axis=1)
+    out[bad] = np.nan
+    return out
+
+
+def lookat_camera_frame(pos, target, up=(0.0, 0.0, 1.0)):
+    """Camera (pos, quat) looking from ``pos`` at ``target``.
+
+    Returns the mujoco quat (w,x,y,z) orienting the camera frame with x
+    right, y up, looking along the pos->target direction (mujoco cameras
+    look along their -z, so the frame's z axis points back at the viewer).
+
+    NOTE the quat conversion MUST be mujoco's own ``mju_mat2Quat``:
+    robosuite's ``transform_utils.mat2quat`` returns (x,y,z,w) order while
+    mujoco ``cam_quat`` expects (w,x,y,z) -- writing robosuite's output
+    directly shuffles the components into a garbage rotation (camera looks
+    at the sky; verified 2026-08-28).
+    """
+    import mujoco
+
+    pos = np.asarray(pos, dtype=np.float64)
+    fwd = np.asarray(target, dtype=np.float64) - pos
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, np.asarray(up, dtype=np.float64))
+    if np.linalg.norm(right) < 1e-8:        # looking straight along `up`
+        right = np.array([1.0, 0.0, 0.0])
+    right /= np.linalg.norm(right)
+    up_v = np.cross(right, fwd)
+    R = np.stack([right, up_v, -fwd], axis=0)   # rows = camera axes (world)
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, np.ascontiguousarray(R).ravel())
+    return pos, quat
+
+
+WORKSPACE_CENTER = np.array([0.0, -0.15, 0.9])   # can task table workspace
+
+
+def build_views(sim, fit_points: Optional[np.ndarray] = None) -> dict:
+    """Every implemented camera view for the can workspace.
+
+    Re-posed views share the model's ``agentview`` camera (pos + quat set per
+    render, see :func:`render_view`); ``agentview`` restores the STOCK pose.
+    ``eye_in_hand`` renders the gripper-mounted camera natively (no re-pose;
+    its frame moves with the arm -- handled by projecting through the
+    data-level frame at render time).
+
+    ``fit_points`` (optional): trajectory points the top-down camera should
+    cover; None -> a generous fixed workspace box (stable scale across video
+    frames).
+    """
+    cid = sim.model.camera_name2id("agentview")
+    fov = float(sim.model.cam_fovy[cid])
+    # "agentview" = the STOCK robomimic camera pose (XML values, read from
+    # the fresh model before any re-pose). The projection now handles its
+    # frame exactly (column-axes rule; red-mask verified err 18px @512).
+    views = {
+        "agentview": {"camera": "agentview",
+                      "pos": np.array(sim.model.cam_pos[cid], dtype=np.float64),
+                      "quat": np.array(sim.model.cam_quat[cid],
+                                       dtype=np.float64)},
+    }
+    if fit_points is None:
+        fit_points = np.array(
+            [[dx, dy, dz]
+             for dx in (-0.35, 0.35) for dy in (-0.6, 0.3)
+             for dz in (0.85, 1.3)], dtype=np.float64)
+    views["topdown"] = {"camera": "agentview",
+                        "pos": topdown_camera_pose(fit_points, fov),
+                        "quat": np.array([1.0, 0.0, 0.0, 0.0])}
+    for name, pos in (("front", np.array([0.0, 1.35, 1.45])),
+                      ("side_left", np.array([-1.35, -0.15, 1.35])),
+                      ("side_right", np.array([1.35, -0.15, 1.35])),
+                      ("corner45", np.array([0.95, 1.0, 1.75]))):
+        p, q = lookat_camera_frame(pos, WORKSPACE_CENTER)
+        views[name] = {"camera": "agentview", "pos": p, "quat": q}
+    views["eye_in_hand"] = {"camera": "robot0_eye_in_hand"}
+    return views
+
+
+def render_view(renv, view: dict, res: int):
+    """Render one view on a robomimic ``EnvRobosuite`` (``renv``).
+
+    Re-poses the shared camera (model + ``sim.forward()`` -- see
+    ``render_initial_views`` for why forward is mandatory) unless the view is
+    native (e.g. eye_in_hand). Returns ``(img, cam_xpos, cam_xmat, fovy)`` --
+    feed the frame straight into :func:`project_to_pixels_frame`.
+    """
+    sim = renv.env.sim
+    if "pos" in view:
+        cid = sim.model.camera_name2id(view["camera"])
+        sim.model.cam_pos[cid] = view["pos"]
+        sim.model.cam_quat[cid] = view["quat"]
+        sim.forward()
+    img = renv.render(mode="rgb_array", height=res, width=res,
+                      camera_name=view["camera"])
+    cid = sim.model.camera_name2id(view["camera"])
+    return (img, np.array(sim.data.cam_xpos[cid], dtype=np.float64),
+            np.array(sim.data.cam_xmat[cid], dtype=np.float64),
+            float(sim.model.cam_fovy[cid]))
+
+
 def render_initial_views(env, state0: np.ndarray, fit_points: np.ndarray,
                          res: int):
     """Two renders of the initial state: agentview (original pose) + top-down.
@@ -163,6 +300,16 @@ def render_initial_views(env, state0: np.ndarray, fit_points: np.ndarray,
     The top-down view re-poses the ``agentview`` camera in the mujoco model
     (position + identity quat) -- a model-level render setting, no env reset
     involved, so the restored simulator state is untouched.
+
+    NOTE the mandatory ``sim.forward()`` after the re-pose: mujoco renders
+    fixed cameras from the DATA-level frame (``data.cam_xpos`` /
+    ``data.cam_xmat``), which ``mj_forward`` recomputes from
+    ``model.cam_pos`` / ``model.cam_quat``; the render path
+    (``mjv_updateScene``) never reads the model arrays directly.  Without
+    the forward call the renderer keeps the PREVIOUS camera frame and the
+    re-pose silently does nothing (the "top-down" render stays the stock
+    angled agentview, while ``project_to_pixels`` keeps projecting with the
+    new pose -> misaligned overlay).
     """
     env.reset_to({"states": np.asarray(state0, dtype=np.float64)})
     img_agent = env.render(mode="rgb_array", height=res, width=res,
@@ -173,6 +320,15 @@ def render_initial_views(env, state0: np.ndarray, fit_points: np.ndarray,
     cam_pos = topdown_camera_pose(fit_points, fov_deg)
     sim.model.cam_pos[cam_id] = cam_pos
     sim.model.cam_quat[cam_id] = np.array([1.0, 0.0, 0.0, 0.0])
+    sim.forward()
+    # post-forward sanity: project_to_pixels' closed form is exact only for
+    # a world-aligned camera frame (identity quat on a fixed worldbody cam).
+    xmat = np.asarray(sim.data.cam_xmat[cam_id], dtype=np.float64).reshape(3, 3)
+    if not np.allclose(xmat, np.eye(3), atol=1e-6):
+        raise RuntimeError(
+            f"topdown camera frame is not world-aligned (cam_xmat="
+            f"{xmat.tolist()}); project_to_pixels' identity-quat closed form "
+            f"would misalign")
     img_top = env.render(mode="rgb_array", height=res, width=res,
                          camera_name="agentview")
     return img_agent, img_top, cam_pos, fov_deg

@@ -157,6 +157,8 @@ z (B,16) ⊕ s̄_t (B,1088)
   4. 用原 $\varepsilon_\theta$ 沿调整后的 $a_t$ 走一步 DDPM 反步 → $a_{t-1}$
   5. 走完得：既在 DP 支集上、又把行为编码推离策略习惯后验的动作块
 
+- **控制律扩展（2026-08-31 起）**：上式注入是 argmax 控制（爬单峰）；orbit 在同一注入点改为壳上两阶段控制律（phase 2 = Newton 反馈 + 切向噪声），见 §7。
+
 > **v0 旧版 cost（历史，2026-08-14 定稿、08-24 弃用）**：高斯 NLL
 > $-\log q_\theta(z\mid\bar s_t,a)$（z 从先验采样、每条 rollout 定住；expert 模式
 > 从 bank 选 z*）——「把动作推向能命中给定 skill 的方向」。因需要外部 z 目标
@@ -175,11 +177,46 @@ z (B,16) ⊕ s̄_t (B,1088)
 - 重试语境下这正合需求：失败场景的失败模式就是 DP 的习惯行为，重试要的
   就是「策略不会做的动作」。
 
-## 7. 代码位置与训练超参
+## 7. 测试阶段扩展：orbit 约束控制（2026-08-31 定稿；两阶段控制律）
+
+- **定位**：§5 的注入 $a_t\leftarrow a_t-\eta\sqrt{1-\bar\alpha_t}\,\nabla_{a_t}\text{Cost}$ 是 **argmax 控制**——峰形奖励，每条重试沿同一 cost 景观爬同一个主峰（窄锥的根源）。orbit 把奖励换成**平台形**（到达逃逸集 $\{f\ge\kappa\}$ 即满分）→ 最优控制从「爬峰」变成**壳上约束动力学**：到壳即留、沿等值面巡行。单轨迹层面换控制律，不依赖粒子间耦合；推导链见 [`escape_coverage_research.md`](escape_coverage_research.md) §6（#math 会话 msg 42）。
+- **记号**：$f$ = **未封顶** $\mathrm{KL}(q_\phi(z\mid\bar s_t,a)\,\|\,q_\phi(z\mid\bar s_t,a^0))$（§5 cost 去掉 min 的那部分），$\kappa$ = 同一个 cap（2.5）；「壳」= $f=\kappa$ 的等值面（行为编码离 DP 意图恰好 κ nats 的动作曲面）。**每个引导去噪步对 replan 批内每一行（并发 env）独立判相**：
+  - **phase 1｜爬坡**：$f<\kappa-\delta$ → 注入照旧 $\eta\sqrt{1-\bar\alpha_t}\,\nabla f$，逐字节 = atypical；
+  - **phase 2｜壳上约束动力学**：$f\ge\kappa-\delta$ → 爬坡被**替换**（非叠加；缓冲带 $[\kappa-\delta,\kappa)$ 内的爬坡由 `_keep` 掩码清零，防双份剂量）：
+    $$\Delta x_t=\underbrace{-\lambda\,(f-\kappa)\,\frac{g}{\lVert g\rVert^2}}_{\text{Newton 反馈（法向，扶 }f\text{ 回 }\kappa\text{）}}\;+\;\underbrace{\sigma_{orb}\sqrt{1-\bar\alpha_t}\,\xi_\perp}_{\text{切向噪声（方向覆盖的唯一来源）}},\qquad g=\frac{\partial f}{\partial x_t},\quad \xi_\perp=\xi-(\xi\cdot\hat g)\hat g$$
+- **设计性质**（逐条有 `_verify.py` check 10–12 背书）：
+  - **Newton 步一阶精确投回壳**：步后 $f'\approx f-\lambda(f-\kappa)$（$\lambda=1$ 一步到壳，$\lambda<1$ 阻尼）；**λ 无量纲**、$(0,1]$ 松弛因子，不继承 η 的 VIB 梯度尺度 → 跨任务免 η 型剂量换算（σ_orb 仍须标定）；
+  - **重参数不变**（frozen-ε 仿射近似）：$\hat a_0=(x_t-\sqrt{1-\bar\alpha}\,\hat\varepsilon)/\sqrt{\bar\alpha}$ ⇒ $x_t$ 空间算出的 Newton 步 = $\hat a_0$ 空间的 Newton 步（$1/\sqrt{\bar\alpha}$ 在分子与 $\lVert g\rVert^2$ 分母间消去）；近似阶与爬坡注入相同（UNet 雅可比同在图中）；
+  - **交接无缺口**：壳下方 $-\lambda(f-\kappa)>0$，feedback 自带沿 $+g$ 的爬坡，交接带内不减速；但交接是**方向连续、非力度连续**——幅度从 $\eta\sqrt{1-\bar\alpha_t}\lVert g\rVert$ 跳到 $\lambda\lvert f-\kappa\rvert/\lVert g\rVert$，且 Newton 项故意**不带** $\sqrt{1-\bar\alpha_t}$ 退火（scale-free 步，后期去噪反馈相对更强）→ 剂量读数拆 mean|fb| 与 mean|noise| 两条遥测分别看；
+  - **过剂量悬崖结构性消失**：feedback 永不把 $f$ 推过 $\kappa$（超壳自动回拉），「越推越远」的正反馈按构造不存在——这是与粒子斥力的本质分界；
+  - 切向噪声乘 $\sqrt{1-\bar\alpha_t}$ = 与注入约定一致、随 DDPM 过程噪声退火；$\sigma_{orb}$ 是**独立**剂量旋钮（与 η 解耦）；
+  - **逐行独立**（无组锁、无粒子耦合），重试仍 i.i.d.、与 atypical 同分布；
+  - 守卫：平坦梯度行（$\lVert g\rVert^2<10^{-16}$）fb=0、噪声不投影（防除零）；$\delta\ge\kappa$ 时 δ 钳到 κ 下（$\kappa-\delta\le0$ 会把 KL≈0 的行也判入 phase 2 → 全批纯噪声）；no-op 哨兵 $(\lambda,\sigma,\delta)=(0,0,0)$ ≡ atypical **位同**（连 RNG 流都不动）。
+- **实现链**（`scout/guidance/orbit_costs.py`；2026-09-01 起合并单反传）：
+  ```
+  每引导去噪步（orbit_step，替代原 compute_loss backward）：
+    (μ,logvar)=VIB_enc(s̄, bridge(x̂₀))；f = KL 行向量（未封顶）
+    g = ∂(Σ_i f_i)/∂x_t                     # 一次 backward 供两个消费方
+    cond_grad = where(f ≤ κ, g, 0)          # capped 爬坡（块对角 ⇒ 与旧两路逐位等价）
+    (disp, p2) = orbit_displacement(f, g; λ, δ, σ_eff, √(1−ᾱ_t), fb_clamp)  # 纯函数，单测直测
+  注入（policy.py）：x_t ← x_t + η√(1−ᾱ_t)·cond_grad·(1−p2) + disp
+  ```
+  - 合并动机：此前每引导步 2 次 VIB 前向 + 2 次穿 UNet 反向（guided 路径占墙钟 ~55%，kernel-launch bound）；合并后 capped 梯度与 phase-2 位移共享一次前向/反向，`_verify.py` check 16 断言与旧两路位同；
+  - ξ 抽取是该步唯一全局 RNG 事件、位置在 backward 之后（RNG 流不移动，各模式位可比）；遥测 `[orbit-telemetry]` = calls / p2_rows / mean|fb| / mean|noise|（device 侧累积，print tick 才同步 host）；η̃ 模式加 mean_g_med，soft 模式加 sat_rows / g_shell（壳饱和度读数）。
+- **phase-2 后继旋钮**（均已合入本分支；前两个 = 2026-08-31 beat-SOE 批 B2/B3，后两个 = 2026-09-02 链上取证后的修复）：
+  - `--orbit-sector det`（B2）：切向 ξ 从每步 i.i.d. 换成按（场景，重试）缓存的确定性方向 → 每条重试沿壳上一个**大圆**巡行（分层角度覆盖，仍投影到当前行法向）；
+  - `--orbit-noise-anneal p`（B3）：切向噪声带 $(1-\bar\alpha_t)^{p/2}$，$p>1$ 更狠压后期（精细动作段）噪声 = jerk 旋钮；
+  - `--orbit-fb-clamp soft`（option C）：Newton 残差 $(f-\kappa)\to\delta\cdot\tanh((f-\kappa)/\delta)$，远壳拉力饱和到 $\lambda\delta/\lVert g\rVert$。动因：链上 retrain 的 VIB 与引导共适应、KL 分布右移，后期行远离壳，无界残差把 feedback 变成大步长 jerk（sq r5 fb=0.55、can r2 fb=0.61 vs 健康 0.24–0.33，救回归零）；带内 tanh 线性到 $O(x^3/\delta^2)$，冷启动段解析不变。切向噪声同时限带 $[\kappa-\delta,\ \kappa+\delta]$（带外行不在壳上，巡之无意义；randn 照抽、事后置零 → RNG 流跨臂位同）；
+  - `--orbit-round N --orbit-sigma-decay ρ`：σ 上限随轮衰减 $\sigma_{eff}=\sigma\cdot\rho^{\,r-1}$。动因：square 链救回 36→17→12→14→0 而 atypical 同位置守 22——retrain 后的 VIB 已共适应到 rescue 棱线，后期切向噪声只会把重试踢下棱线；与 noise-anneal p 相乘复合；数值零 snap 到精确 0.0（不抽 randn，RNG 流不动）。
+  - phase-1 爬坡的 ray 改造（climb=ray）不触及 phase-2 行（`_keep` 照旧清零其爬坡）。
+- **剂量标定**：$\kappa/\delta/\lambda=2.5/0.25/0.5$ 跨任务共用不动。η 内嵌 VIB 梯度尺度的问题由 **η̃ 无量纲化**根治（`--orbit-eta-dimless`：climb 梯度除以 **live-climb 行均值范数**——仅 $f<\kappa-\delta$ 且 $\lVert g\rVert>10^{-4}$ 的行参与，NaN→0，取均值不取中位数，逐行 3× cap）→ guidance_scale 从此携带 η̃ = 动作空间每步位移，tool_hang η=12 vs square/can η=3.0 的逐任务手标差距被自动吸收（phase-2 不受影响：Newton 自带 $1/\lVert g\rVert^2$、噪声走 σ）。**最终跨任务固定参数组 = η̃0.33 / σ0.16×0.5^(r−1) / fb_clamp=soft / noise_anneal p=2 / κ2.5 / δ0.25 / λ0.5**，一组参数免标定直用双任务（20 场景×10：square 0.80→0.96、can 0.97→0.98，jerk 双降）；有量纲标定史与无量纲化推导见 [`orbit_calibration_values.md`](orbit_calibration_values.md)、[`orbit_calibration_protocol.md`](orbit_calibration_protocol.md)。
+
+## 8. 代码位置与训练超参
 
 - E_s：`scout/model/encoder.py`；VIB：`scout/model/vib.py` + `scout/model/scout_vib.py`
 - 训练：`scout/train_vib.py`（config `configs/vib_{task}_image.yaml`）
 - Cost：**entropy cost** `scout/guidance/entropy_costs.py`（AtypicalCostPlanner，CLI `--guide atypical --atypical-cap 2.5`；同文件另有方案二 Novelty 与 Combo 组合）；v0 NLL `scout/guidance/cost.py`（`--guide dyn`/`expert`）；planner：`scout/guidance/planner.py`
+- orbit：`scout/guidance/orbit_costs.py`（OrbitCostPlanner，CLI `--guide orbit --orbit-lam 0.5 --orbit-delta 0.25 --orbit-sigma 0.25`；sector/anneal/fb-clamp/round/decay/eta-dimless 旋钮见 §7）；验证 = `scout/guidance/_verify.py` check 10–19
 - 去噪循环：`scout/guidance/policy.py`（`guided_conditional_sample`）
 - base DP：`diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py`（config `configs/base_dp_{task}_image.yaml`）
 
