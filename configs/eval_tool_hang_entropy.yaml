@@ -32,8 +32,8 @@ eval:
   view_names: [sideview_image, robot0_eye_in_hand_image]
   proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
 exploration:
-  guidance_scale: 12.0             # PROVISIONAL -- patch from the s233 round0 dose probe (target: mean_inject ~ square band 1.05-1.20)
-  guidance_start_timestep: 100
+  guidance_scale: 1.0             # FINAL 2026-09-04 toolhang calibration (p10-probe R11-R18 gst=50 era; user-settled): s1.0 / cap 2.5 (CLI --atypical-cap) / raw dose (no --aty-eta-dimless). Supersedes the 12.0 provisional.
+  guidance_start_timestep: 50     # delayed guidance: a0 captured at t49 from the settled x0_hat (clipped-x0 KL-floor fix, R11+ era)
 self_improvement:
   num_rounds: 8
   scout_aug_mask: scout_aug
