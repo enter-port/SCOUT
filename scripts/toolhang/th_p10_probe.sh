@@ -37,6 +37,7 @@ ATY_CAP=${ATY_CAP:-2.5}
 ORB_CAP=${ORB_CAP:-2.5}
 ORB_DIMLESS=${ORB_DIMLESS:-0}
 TRIES=${TRIES:-10}
+GST=${GST:-100}
 GPU_DP=${GPU_DP:-3}; GPU_ATY=${GPU_ATY:-2}; GPU_ORB=${GPU_ORB:-1}
 WPROJ=${WPROJ:-TOOLHANG-9-4-p10probe}
 BACKSTOP=${BACKSTOP:-1500}
@@ -70,17 +71,18 @@ PYEOF
 # ---- per-arm config copies (dose has NO CLI flag: config-only entry) -------
 for spec in "dp:0.0" "aty:${ATY_SCALE}" "orb:${ORB_ETA}"; do
   arm=${spec%%:*}; sc=${spec#*:}
-  $PY - "configs/eval_tool_hang_entropy.yaml" "$T/cfg_${arm}.yaml" "$sc" "$WPROJ" <<'PYEOF'
+  $PY - "configs/eval_tool_hang_entropy.yaml" "$T/cfg_${arm}.yaml" "$sc" "$WPROJ" "$GST" <<'PYEOF'
 import sys, yaml
-src, out, sc, proj = sys.argv[1:5]
+src, out, sc, proj, gst = sys.argv[1:6]
 with open(src) as f:
     cfg = yaml.safe_load(f)
 cfg["exploration"]["guidance_scale"] = float(sc)
+cfg["exploration"]["guidance_start_timestep"] = int(gst)
 cfg["wandb"]["project"] = proj
 cfg["wandb"]["tags"] = ["p10probe"]
 with open(out, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f"[p10-cfg] {out}: exploration.guidance_scale={sc} wandb.project={proj}")
+print(f"[p10-cfg] {out}: guidance_scale={sc} guidance_start_timestep={gst} wandb.project={proj}")
 PYEOF
 done
 
