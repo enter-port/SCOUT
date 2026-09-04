@@ -202,8 +202,8 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
                     next_grp.create_dataset(
                         k, data=_stack_obs(next_obs_list, k, ep_len))
             # actions: rot_6d -> axis-angle (matches core storage).
-            grp.create_dataset("actions",
-                               data=_acts_to_storage(rollout["actions"], rot))
+            acts = _acts_to_storage(rollout["actions"], rot)
+            grp.create_dataset("actions", data=acts)
             # abs_actions: same 7-dim absolute aa (the policy emits absolute
             # actions; the loader reads THIS key for training when abs_action=
             # true, and reads demo['actions'] only for episode length).
