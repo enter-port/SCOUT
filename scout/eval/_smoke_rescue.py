@@ -38,7 +38,13 @@ class MockEnv:
         }
 
     def reset_to(self, state):
-        self._need = state["need"]
+        # accepts the legacy dict form (init_states) or the numeric-array form
+        # the engine stores per step (get_state) -- the array form is what the
+        # hdf5 writers require for the optional `states` dataset.
+        if isinstance(state, dict):
+            self._need = state["need"]
+        else:
+            self._need = int(float(np.asarray(state).reshape(-1)[0]))
         self._attempt = ATTEMPTS[self._need] = ATTEMPTS[self._need] + 1
         return self._obs(self._attempt)
 
@@ -49,7 +55,7 @@ class MockEnv:
         return {"task": self._attempt >= self._need}
 
     def get_state(self):
-        return {"need": self._need}
+        return np.array([self._need], dtype=np.float32)
 
     def rollout_exceptions(self):
         return ()
@@ -214,6 +220,8 @@ def _smoke_rescue_spool(cfg, result_ref):
         with h5py.File(got, "r") as fg, h5py.File(ref, "r") as fr:
             assert sorted(fg["data"].keys()) == sorted(fr["data"].keys()), tag
             for demo in sorted(fr["data"].keys()):
+                if int(demo.split("_")[-1]) < 1:
+                    continue     # core demo_0: copied source, no rollout datasets
                 assert set(fg["data"][demo].keys()) == \
                     set(fr["data"][demo].keys()), (
                     f"{tag}:{demo} keys {set(fg['data'][demo].keys())} vs "
