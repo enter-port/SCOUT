@@ -95,7 +95,10 @@ def main():
         scout_vib_factory=None, env_factory=lambda: MockEnv(),
         device=torch.device("cpu"), guided=False,
     )
-    init_states = [{"need": n} for n in NEEDS]
+    # numeric-array states throughout: the engine records the init state +
+    # per-step get_state() into traj["states"], and the hdf5 writers require
+    # flat numeric arrays there (dicts crash at write time)
+    init_states = [np.array([n], dtype=np.float32) for n in NEEDS]
     # pre-register the baseline attempts exactly as collect_initial_states
     # would (it resets each scene once); we call the internal pieces directly
     # via run(), so instead feed the states by monkey-patching the collector.
@@ -198,7 +201,10 @@ def _smoke_rescue_spool(cfg, result_ref):
         device=torch.device("cpu"), guided=False,
     )
     import scout.eval.rollout_pipeline as rp
-    init_states = [{"need": n} for n in NEEDS]
+    # numeric-array states throughout: the engine records the init state +
+    # per-step get_state() into traj["states"], and the hdf5 writers require
+    # flat numeric arrays there (dicts crash at write time)
+    init_states = [np.array([n], dtype=np.float32) for n in NEEDS]
     orig_collect = rp.collect_initial_states
     rp.collect_initial_states = lambda ef, n_init_states, base_seed=None: \
         init_states[:int(n_init_states)]
