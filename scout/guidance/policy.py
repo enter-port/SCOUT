@@ -205,6 +205,11 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # for every guide mode (bit-identical).
         _ray_fn = (getattr(self.scout_planner, "ray_rotate", None)
                    if classifier_guidance else None)
+        # phase-2 displacement marker for the loop below: stays None on the
+        # generic compute_loss path (plain injection line); a planner-level
+        # merged step (orbit) rebinds it every guided step. Initialized here
+        # so the generic branch never reads an unbound local (review P0).
+        _disp = None
         if classifier_guidance:
             # fix z for the whole loop (design §1: "z 整段定住"). Sampled WITHOUT
             # the `generator` so the trajectory / DDPM RNG stream is unchanged

@@ -1565,12 +1565,18 @@ def check_kl_guided_step(policy, scout_vib, current_obs, cond_data, seed=233):
     traj0 = torch.randn(B, H, Ad)
 
     # ---- (20a) generic-path equivalence, dimless OFF (default) ----------- #
+    # fixture: even rows far above kappa (capped + phase 2), row 1 nudged
+    # +0.4 into the MID-BAND (a live climb row with a real O(1) gradient --
+    # review P2: without it the live-climb set is empty and the eta check
+    # below would divide/multiply by the 1e-4 floor), odd rows at anchor.
     att = KLCostPlanner(scout_vib, bridge=IdentityBridge(), cap=2.5)
     att.set_current_obs(current_obs)
     att.select_z(2.0 * traj0, current_obs)
     with torch.no_grad():
         for i in range(0, B, 2):                 # even rows far above kappa
             att._base_mu[i] = att._base_mu[i] + 3.0
+        if B > 1:                                # row 1: mid-band (0<KL<cap)
+            att._base_mu[1] = att._base_mu[1] + 0.4
     torch.manual_seed(seed + 21)
     traj = torch.randn(B, H, Ad).requires_grad_(True)
     cg, disp, p2, rl = att.guided_step(traj, 2.0 * traj, current_obs,
@@ -1600,6 +1606,8 @@ def check_kl_guided_step(policy, scout_vib, current_obs, cond_data, seed=233):
     with torch.no_grad():
         for i in range(0, B, 2):
             orb0._base_mu[i] = orb0._base_mu[i] + 3.0
+        if B > 1:
+            orb0._base_mu[1] = orb0._base_mu[1] + 0.4
     torch.manual_seed(seed + 21)
     traj3 = torch.randn(B, H, Ad).requires_grad_(True)
     cg3, disp3, p23, rl3 = orb0.guided_step(traj3, 2.0 * traj3, current_obs,
@@ -1617,12 +1625,24 @@ def check_kl_guided_step(policy, scout_vib, current_obs, cond_data, seed=233):
     with torch.no_grad():
         for i in range(0, B, 2):
             att_dim._base_mu[i] = att_dim._base_mu[i] + 3.0
+        if B > 1:
+            att_dim._base_mu[1] = att_dim._base_mu[1] + 0.4
     torch.manual_seed(seed + 21)
     traj4 = torch.randn(B, H, Ad).requires_grad_(True)
     cg4, _, _, _ = att_dim.guided_step(traj4, 2.0 * traj4, current_obs,
                                        noise_scale=0.6)
     g_med = float(att_dim._last_g_med)
-    assert g_med > 0.0, "(20c) fixture must have live climb rows"
+    # fixture sanity (review P2): row 1 is the ONLY live climb row (odd
+    # at-anchor rows are roundoff-excluded, even rows sit above cap), so
+    # the divisor is not the 1e-4 floor but exactly that row's ||grad|| --
+    # recomputed INDEPENDENTLY from the generic-path gradient.
+    n1 = float(cg_ref[1].detach().flatten().norm())
+    assert cg_ref[1].abs().max().item() > 1e-3, (
+        "(20c) fixture row 1 must carry a real mid-band climb gradient")
+    assert g_med > 1e-3, (
+        f"(20c) live-climb mean must be real, not the floor ({g_med:.3e})")
+    assert abs(g_med - n1) < 1e-6 * max(n1, 1.0), (
+        f"(20c) g_med {g_med:.6g} != the single live row's norm {n1:.6g}")
     s = 0.7
     assert torch.allclose(s * g_med * cg4, s * cg_ref, rtol=1e-4, atol=1e-7), (
         "(20c) eta_tilde = s*g_med must reproduce the raw-s injection "
