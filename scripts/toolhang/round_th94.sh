@@ -1,8 +1,9 @@
 #!/bin/bash
 # round_th94.sh (2026-09-04) -- TOOLHANG-9-4-orbit-s233 round driver, running in
-# the scout-th94 worktree (orbit-dev: KLCostPlanner refactor 4e0877e+76e2adc +
-# TrajSpool OOM fix 6f3d844; scripts/ layout). COPY of scout-orbit's
-# soe_scripts/round_orbit_th.sh with these deltas:
+# the scout-th94 worktree (plain extract of origin/orbit-dev@796bf8c: KLCost-
+# Planner refactor 4e0877e+76e2adc + TrajSpool OOM fix 6f3d844..796bf8c;
+# scripts/ layout). COPY of scout-orbit's soe_scripts/round_orbit_th.sh with
+# these deltas:
 #   * REPO = scout-th94; soe_scripts/{shard_rollout.sh,shard_heartbeat.py} ->
 #     scripts/infra/, split_core.py -> scripts/analysis/;
 #   * SCOUT arm = ATYPICAL raw dose (user order 2026-09-04: s1.0 / cap 2.5 /
