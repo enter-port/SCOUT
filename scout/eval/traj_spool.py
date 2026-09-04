@@ -469,7 +469,7 @@ def _smoke():
                 all_trajs.extend(tries)
         return trajs, all_trajs
 
-    def assert_files_equal(p1, p2, ctx):
+    def assert_files_equal(p1, p2, ctx, n_core=3):
         with h5py.File(p1, "r") as f1, h5py.File(p2, "r") as f2:
             d1 = sorted(f1["data"].keys())
             d2 = sorted(f2["data"].keys())
@@ -481,7 +481,12 @@ def _smoke():
                     f1[k + "/mask"][()], f2[k + "/mask"][()],
                     err_msg=f"{ctx}: mask {k}")
                 assert int(f1[k].attrs["num"]) == int(f2[k].attrs["num"])
+            # per-demo compare: APPENDED demos only (id >= n_core) -- the core
+            # demos are byte-copies of the same source and lack the rollout
+            # datasets (abs_actions/done/success) by construction.
             for demo in d1:
+                if int(demo.split("_")[-1]) < n_core:
+                    continue
                 g1, g2 = f1["data"][demo], f2["data"][demo]
                 # dataset-name-set parity FIRST (review P1-1: comparing only a
                 # fixed tuple is blind to missing keys -- e.g. the abs_actions

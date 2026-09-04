@@ -629,15 +629,19 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
         init_done = 0
         init_done_failed = 0          # failed inits whose try_times tries all ran
         solved_failed = 0             # failed inits solved by exploration
+        solved_fini = 0               # solved AND drained: live pass@10 numerator
         for i in range(n):
             if results[i]["baseline_solved"]:
                 init_done += 1
                 continue
-            if len(results[i]["all_trajs"]) >= tries_per_init:
+            fini_i = len(results[i]["all_trajs"]) >= tries_per_init
+            if fini_i:
                 init_done += 1
                 init_done_failed += 1
             if results[i]["solved"]:
                 solved_failed += 1
+                if fini_i:
+                    solved_fini += 1
         _wandb_log(wandb_run, {
             "explore/init_done": init_done,
             "explore/tries_done": done,
@@ -652,8 +656,13 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
             })
         _hb_n += 1
         if _hb_n % 10 == 0:   # every 10th cb (log_every ticks each) -> ~100 ticks
+            # solved=<rescued-and-drained>/<failed inits all-tries-done>:
+            # per-shard live pass@10 numerator/denominator (reporter sums).
+            # Numerator needs the init DRAINED so the ratio can never exceed
+            # 1 mid-run (a try-1 success still has try_times-1 tries queued).
             _hb_line("explore", done, _hb_total,
-                     f"collected={collected}", _hb_t0)
+                     f"collected={collected} "
+                     f"solved={solved_fini}/{init_done_failed}", _hb_t0)
 
     runner = _VecRunner(
         dp, env_factory, n_envs, n_action_steps, horizon, device,

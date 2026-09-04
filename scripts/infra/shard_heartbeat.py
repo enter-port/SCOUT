@@ -32,13 +32,17 @@ import sys
 import time
 
 HB_RE = re.compile(
-    rb"\[(\w+)-hb\] (\d+)/(\d+)(?: collected=(\d+))?(?: succ=(\d+))?")
+    rb"\[(\w+)-hb\] (\d+)/(\d+)(?: collected=(\d+))?(?: solved=(\d+)/(\d+))?")
 TAIL_BYTES = 8192
 
 
 def tail_last_hb(path):
-    """(done, total, collected) from the last explore-hb line in `path`,
-    or None if the worker has not printed one yet."""
+    """(done, total, collected, solved, fini) from the last explore-hb line
+    in `path`, or None if the worker has not printed one yet.
+
+    solved/fini = this shard's failed inits rescued so far / failed inits
+    with all their tries completed (2026-09-04 rollout_vec extension); both
+    are None on pre-2026-09-04 worker lines."""
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -55,7 +59,9 @@ def tail_last_hb(path):
         return None
     done, total = int(best.group(2)), int(best.group(3))
     coll = int(best.group(4)) if best.group(4) is not None else None
-    return done, total, coll
+    solved = int(best.group(5)) if best.group(5) is not None else None
+    fini = int(best.group(6)) if best.group(6) is not None else None
+    return done, total, coll, solved, fini
 
 
 def find_workers(match):
@@ -173,6 +179,11 @@ def main():
 
         done_sum = sum(h[0] for h in shard_hb.values())
         total_sum = sum(h[1] for h in shard_hb.values())
+        # live pass@10: rescued inits summed over shards / failed inits whose
+        # try_times tries are ALL completed so far (running window estimate;
+        # converges to the final rescued/n_failed as phase B drains).
+        solved_sum = sum(h[3] for h in shard_hb.values() if h[3] is not None)
+        fini_sum = sum(h[4] for h in shard_hb.values() if h[4] is not None)
         stamp = time.strftime("%F %T")
         rss_txt = ",".join(
             "{}:{}/{}".format(
@@ -183,8 +194,10 @@ def main():
         sys_txt = ((f"{avail:.1f}/{total:.0f}G"
                     f"({100 * (1 - avail / total):.0f}% used)")
                    if avail is not None and total else "?")
+        p10_txt = (f" pass10={solved_sum / fini_sum:.3f}" if fini_sum else "")
         line = (f"{stamp} poll={poll} alive={len(workers)} "
                 f"done={done_sum}/{total_sum if total_sum else '?'} "
+                f"rescued={solved_sum}/{fini_sum if fini_sum else '?'}{p10_txt} "
                 f"shards={len(shard_hb)} rss[{rss_txt}] sys={sys_txt}")
         try:
             with open(args.log_file, "a") as f:
@@ -206,10 +219,17 @@ def main():
                 if avail is not None:
                     payload["explore_hb/sys_used_pct"] = round(
                         100 * (1 - avail / total), 1)
-            for slot, (d, t, c) in shard_hb.items():
+            if fini_sum:
+                payload["explore_hb/rescued"] = solved_sum
+                payload["explore_hb/init_fini"] = fini_sum
+                payload["explore_hb/pass10_live"] = round(
+                    solved_sum / fini_sum, 4)
+            for slot, (d, t, c, sv, fi) in shard_hb.items():
                 payload[f"explore_hb/shard{slot}_done"] = d
                 if c is not None:
                     payload[f"explore_hb/shard{slot}_collected"] = c
+                if sv is not None:
+                    payload[f"explore_hb/shard{slot}_solved"] = sv
             for w in workers:
                 if w["slot"] is not None and w["rss"] is not None:
                     payload[f"explore_hb/shard{w['slot']}_rss_gb"] = \
