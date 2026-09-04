@@ -33,7 +33,9 @@ ORB_SIGMA=${ORB_SIGMA:-0.025}
 ORB_LAM=${ORB_LAM:-0.15}
 ORB_DELTA=${ORB_DELTA:-0.25}
 ORB_FBCLAMP=${ORB_FBCLAMP:-none}
-ATT_CAP=${ATT_CAP:-2.5}
+ATY_CAP=${ATY_CAP:-2.5}
+ORB_CAP=${ORB_CAP:-2.5}
+ORB_DIMLESS=${ORB_DIMLESS:-0}
 TRIES=${TRIES:-10}
 GPU_DP=${GPU_DP:-3}; GPU_ATY=${GPU_ATY:-2}; GPU_ORB=${GPU_ORB:-1}
 WPROJ=${WPROJ:-TOOLHANG-9-4-p10probe}
@@ -125,13 +127,14 @@ run_arm() { # name gpu guide vib extra...
   echo "[p10] arm=$name rc=$rc wall=$(( (t1-t0)/60 ))m$(( (t1-t0)%60 ))s"
 }
 
-echo "[p10] ROUND=$ROUND OFF=$OFF N=$N P=$P aty(scale)=$ATY_SCALE orb(eta/sigma/lam/delta/fbclamp)=$ORB_ETA/$ORB_SIGMA/$ORB_LAM/$ORB_DELTA/$ORB_FBCLAMP cap=$ATT_CAP gpus dp/aty/orb=$GPU_DP/$GPU_ATY/$GPU_ORB"
-run_arm orb  "$GPU_ORB" orbit     vib --atypical-cap "$ATT_CAP" \
-                                     --orbit-lam "$ORB_LAM" --orbit-delta "$ORB_DELTA" \
-                                     --orbit-sigma "$ORB_SIGMA" \
-                                     --orbit-fb-clamp "$ORB_FBCLAMP" &
+echo "[p10] ROUND=$ROUND OFF=$OFF N=$N P=$P aty(scale/cap)=$ATY_SCALE/$ATY_CAP orb(eta/sigma/lam/delta/fbclamp/cap/dimless)=$ORB_ETA/$ORB_SIGMA/$ORB_LAM/$ORB_DELTA/$ORB_FBCLAMP/$ORB_CAP/$ORB_DIMLESS gpus dp/aty/orb=$GPU_DP/$GPU_ATY/$GPU_ORB"
+ORB_ARGS=(--atypical-cap "$ORB_CAP" --orbit-lam "$ORB_LAM" \
+           --orbit-delta "$ORB_DELTA" --orbit-sigma "$ORB_SIGMA" \
+           --orbit-fb-clamp "$ORB_FBCLAMP")
+[ "$ORB_DIMLESS" = "1" ] && ORB_ARGS+=(--orbit-eta-dimless)
+run_arm orb  "$GPU_ORB" orbit     vib ${ORB_ARGS[@]+"${ORB_ARGS[@]}"} &
 P1=$!
-run_arm aty  "$GPU_ATY" atypical  vib --atypical-cap "$ATT_CAP" &
+run_arm aty  "$GPU_ATY" atypical  vib --atypical-cap "$ATY_CAP" &
 P2=$!
 run_arm dp   "$GPU_DP"  off       novib &
 P3=$!
@@ -140,9 +143,10 @@ wait $P1 $P2 $P3
 
 # ---- summary: approx pass@10 per arm + r1 DP reference on this window ------
 sleep 2
-$PY - "$T" "$ROUND" "$N" "$ATY_SCALE" "$ORB_ETA" "$ORB_SIGMA" "$ROOT/ledger.csv" "$TH" <<'PYEOF'
+$PY - "$T" "$ROUND" "$N" "$ATY_SCALE" "$ORB_ETA" "$ORB_SIGMA" "$ROOT/ledger.csv" "$TH" "$ATY_CAP" "$ORB_CAP" "$ORB_DIMLESS" <<'PYEOF'
 import csv, glob, json, os, re, sys
 T, rnd, N, aty_s, orb_e, orb_sig, ledger, TH = sys.argv[1:9]
+aty_cap, orb_cap, orb_dimless = sys.argv[9:12]
 r1 = json.load(open(f"{TH}/rollout/DP-exp1/log/tool_hang_DP_explore_exp1.json"))
 win = json.load(open(f"{T}/win.json"))["failed_init_indices"]
 r1_detail = {d["init"]: d for d in r1["explore_detail"]}
@@ -151,8 +155,9 @@ print(f"[p10] r1 DP reference on window: {r1_solved}/{N}")
 rows = []
 for arm in ("dp", "aty", "orb"):
     row = {"round": rnd, "arm": arm,
-           "params": (aty_s if arm == "aty" else
-                      f"eta{orb_e},sig{orb_sig}" if arm == "orb" else "none"),
+           "params": (f"s{aty_s},cap{aty_cap}" if arm == "aty" else
+                      f"eta{orb_e},sig{orb_sig},cap{orb_cap},dimless{orb_dimless}"
+                      if arm == "orb" else "none"),
            "window": " ".join(map(str, win))}
     rc_f = f"{T}/{arm}.rc"
     row["rc"] = open(rc_f).read().strip() if os.path.exists(rc_f) else "?"
