@@ -50,6 +50,58 @@ def h5py_group_class():
     return h5py.Group
 
 
+def _last_frame(o_k) -> np.ndarray:
+    """Last frame of an n_obs_steps windowed obs value -> current frame."""
+    return np.asarray(o_k, dtype=np.float32)[-1]
+
+
+def _to_storage(k: str, frame) -> np.ndarray:
+    """rollout frame -> core hdf5 storage layout.
+
+    rollout image obs is (C,H,W) float (robomimic CHW); core stores
+    (H,W,C) uint8. low_dim obs is (D,) float either way.
+    """
+    if k.endswith("image"):
+        img = np.asarray(frame, dtype=np.float32)
+        if img.ndim == 3 and img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))     # CHW -> HWC
+        return (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return np.asarray(frame, dtype=np.float32)
+
+
+def get_aa_transformer():
+    """Lazy RotationTransformer (axis_angle <- rotation_6d inverse)."""
+    from diffusion_policy.model.common.rotation_transformer import (
+        RotationTransformer,)
+    return RotationTransformer("axis_angle", "rotation_6d")  # .inverse = 6d->aa
+
+
+def _acts_to_storage(acts: np.ndarray, rot) -> np.ndarray:
+    """policy 10|20-dim rot_6d actions -> 7|14-dim axis-angle (core storage).
+
+    Single arm: 10 -> 7; dual arm (transport): 20 -> 14 via per-arm chunks,
+    same layout as the training loader. Actions already in aa form pass
+    through unchanged.
+    """
+    acts = np.asarray(acts, dtype=np.float32)   # (T,10|20)
+    if acts.shape[-1] in (10, 20):
+        n_arms = acts.shape[-1] // 10
+        per_arm = acts.reshape(-1, n_arms, 10)
+        pos = per_arm[..., :3]
+        rot_aa = np.asarray(rot.inverse(per_arm[..., 3:9]))
+        grip = per_arm[..., 9:10]
+        acts = np.concatenate([pos, rot_aa, grip],
+                              axis=-1).reshape(acts.shape[:-1] +
+                                               (n_arms * 7,))
+    return acts
+
+
+def _stack_obs(obs_list, k: str, ep_len: int) -> np.ndarray:
+    """obs_list[:ep_len] per-frame last-frame conversion -> (T, ...) stacked."""
+    return np.stack([_to_storage(k, _last_frame(o[k]))
+                     for o in obs_list[:ep_len]], axis=0)
+
+
 def write_rollouts_to_hdf5(core_path: str, out_path: str,
                            rollouts: List[dict],
                            core_filter_key: str = "train",
@@ -125,26 +177,7 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
         # abs_action: rollout actions are the policy's 10-dim rot_6d output; the
         # core hdf5 stores 7-dim axis-angle (the loader re-converts to 6d via
         # abs_action=true). Transform back so the augmented hdf5 is consistent.
-        from diffusion_policy.model.common.rotation_transformer import (
-            RotationTransformer,)
-        rot = RotationTransformer("axis_angle", "rotation_6d")  # .inverse = 6d->aa
-
-        def _last_frame(o_k) -> np.ndarray:
-            """Last frame of an n_obs_steps windowed obs value -> current frame."""
-            return np.asarray(o_k, dtype=np.float32)[-1]
-
-        def _to_storage(k: str, frame) -> np.ndarray:
-            """rollout frame -> core hdf5 storage layout.
-
-            rollout image obs is (C,H,W) float (robomimic CHW); core stores
-            (H,W,C) uint8. low_dim obs is (D,) float either way.
-            """
-            if k.endswith("image"):
-                img = np.asarray(frame, dtype=np.float32)
-                if img.ndim == 3 and img.shape[0] == 3:
-                    img = np.transpose(img, (1, 2, 0))     # CHW -> HWC
-                return (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-            return np.asarray(frame, dtype=np.float32)
+        rot = get_aa_transformer()
 
         new_demo_names: List[str] = []
         for rollout in rollouts:
@@ -162,29 +195,15 @@ def write_rollouts_to_hdf5(core_path: str, out_path: str,
                     f"got {len(obs_list)} frames, need {ep_len}")
             obs_grp = grp.create_group("obs")
             for k in obs_keys:
-                obs_grp.create_dataset(
-                    k, data=np.stack([_to_storage(k, _last_frame(o[k]))
-                                      for o in obs_list[:ep_len]], axis=0))
+                obs_grp.create_dataset(k, data=_stack_obs(obs_list, k, ep_len))
             if next_obs_list:
                 next_grp = grp.create_group("next_obs")
                 for k in obs_keys:
                     next_grp.create_dataset(
-                        k, data=np.stack([_to_storage(k, _last_frame(o[k]))
-                                          for o in next_obs_list[:ep_len]], axis=0))
+                        k, data=_stack_obs(next_obs_list, k, ep_len))
             # actions: rot_6d -> axis-angle (matches core storage).
-            # single arm: 10 -> 7; dual arm (transport): 20 -> 14 via
-            # per-arm chunks, same layout as the training loader.
-            acts = np.asarray(rollout["actions"], dtype=np.float32)   # (T,10|20)
-            if acts.shape[-1] in (10, 20):
-                n_arms = acts.shape[-1] // 10
-                per_arm = acts.reshape(-1, n_arms, 10)
-                pos = per_arm[..., :3]
-                rot_aa = np.asarray(rot.inverse(per_arm[..., 3:9]))
-                grip = per_arm[..., 9:10]
-                acts = np.concatenate([pos, rot_aa, grip],
-                                      axis=-1).reshape(acts.shape[:-1] +
-                                                       (n_arms * 7,))
-            grp.create_dataset("actions", data=acts)
+            grp.create_dataset("actions",
+                               data=_acts_to_storage(rollout["actions"], rot))
             # abs_actions: same 7-dim absolute aa (the policy emits absolute
             # actions; the loader reads THIS key for training when abs_action=
             # true, and reads demo['actions'] only for episode length).

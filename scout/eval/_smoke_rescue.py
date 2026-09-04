@@ -138,6 +138,98 @@ def main():
                              "exploration_rescued", "pass_at_5",
                              "collected_trajs", "n_all_trajs")})
 
+    _smoke_rescue_spool(cfg, result)
+
+
+def _smoke_rescue_spool(cfg, result_ref):
+    """End-to-end TrajSpool parity (2026-09-04 OOM fix): rerun the SAME
+    deterministic mock protocol with ``traj_sink=TrajSpool.on_traj`` and
+    assert (a) metrics/counts identical to the sink-less run, (b) the
+    spool-assembled success/all hdf5 are value-identical to a one-shot
+    ``write_rollouts_to_hdf5`` on the reference lists. Needs pytorch3d
+    (RotationTransformer) -- skipped where unavailable (local dev boxes).
+    """
+    try:
+        import pytorch3d  # noqa: F401
+    except ImportError:
+        print("[smoke_rescue] spool scenario SKIPPED (pytorch3d unavailable)")
+        return
+    import os
+    import tempfile
+    import h5py
+    from scout.eval.hdf5_writer import write_rollouts_to_hdf5
+    from scout.eval.traj_spool import TrajSpool
+
+    tmp = tempfile.mkdtemp(prefix="smoke_rescue_spool_")
+    core = os.path.join(tmp, "core.hdf5")
+    with h5py.File(core, "w") as f:
+        d = f.create_group("data")
+        g = d.create_group("demo_0")
+        for k, shape in (("obs/agentview_image", (2, 4, 4, 3)),
+                         ("obs/robot0_eye_in_hand_image", (2, 4, 4, 3))):
+            g.create_dataset(k, data=np.zeros(shape, dtype=np.uint8))
+        for k, shape in (("obs/robot0_eef_pos", (2, 3)),
+                         ("obs/robot0_eef_quat", (2, 4)),
+                         ("obs/robot0_gripper_qpos", (2, 2))):
+            g.create_dataset(k, data=np.zeros(shape, dtype=np.float32))
+        g.attrs["num_samples"] = 2
+
+    ref_s = os.path.join(tmp, "ref_success.hdf5")
+    ref_a = os.path.join(tmp, "ref_all.hdf5")
+    write_rollouts_to_hdf5(core, ref_s, result_ref["trajs"],
+                           core_filter_key="train")
+    write_rollouts_to_hdf5(core, ref_a, result_ref["all_trajs"],
+                           core_filter_key="train")
+
+    s_path = os.path.join(tmp, "sp_success.hdf5")
+    a_path = os.path.join(tmp, "sp_all.hdf5")
+    spool = TrajSpool(core, s_path, a_path, core_filter_key="train",
+                      rule="rescue", try_times=5, flush_every=3, verbose=False)
+    ATTEMPTS.clear()          # replay the identical deterministic attempt stream
+    pipe2 = RolloutPipeline(
+        cfg=cfg, dp_factory=lambda ckpt: MockDP().eval(),
+        scout_vib_factory=None, env_factory=lambda: MockEnv(),
+        device=torch.device("cpu"), guided=False,
+    )
+    import scout.eval.rollout_pipeline as rp
+    init_states = [{"need": n} for n in NEEDS]
+    orig_collect = rp.collect_initial_states
+    rp.collect_initial_states = lambda ef, n_init_states, base_seed=None: \
+        init_states[:int(n_init_states)]
+    try:
+        result2 = pipe2.run("mock-ckpt", explore_mode="rescue",
+                            explore_try_times=5, traj_sink=spool.on_traj)
+    finally:
+        rp.collect_initial_states = orig_collect
+    res = spool.finalize()
+
+    assert result2["metrics"] == result_ref["metrics"], (
+        "sink-mode metrics diverged from the sink-less run")
+    assert res["success_demos"] == len(result_ref["trajs"]), res
+    assert res["all_demos"] == len(result_ref["all_trajs"]), res
+    assert spool.n_success == len(result_ref["trajs"])
+    assert spool.n_all == len(result_ref["all_trajs"])
+
+    for got, ref, tag in ((s_path, ref_s, "success"), (a_path, ref_a, "all")):
+        with h5py.File(got, "r") as fg, h5py.File(ref, "r") as fr:
+            assert sorted(fg["data"].keys()) == sorted(fr["data"].keys()), tag
+            for demo in sorted(fr["data"].keys()):
+                for sub in ("obs", "next_obs"):
+                    for k in fr["data"][demo].get(sub, {}):
+                        np.testing.assert_array_equal(
+                            fg[f"data/{demo}/{sub}/{k}"][()],
+                            fr[f"data/{demo}/{sub}/{k}"][()],
+                            err_msg=f"{tag}:{demo}/{sub}/{k}")
+                for ds in ("actions", "done", "success"):
+                    np.testing.assert_array_equal(
+                        fg[f"data/{demo}/{ds}"][()],
+                        fr[f"data/{demo}/{ds}"][()],
+                        err_msg=f"{tag}:{demo}/{ds}")
+            np.testing.assert_array_equal(
+                fg["mask/scout_aug/mask"][()], fr["mask/scout_aug/mask"][()])
+    print(f"[smoke_rescue] spool parity OK: success={res['success_demos']} "
+          f"all={res['all_demos']} value-identical to one-shot (flush_every=3)")
+
 
 if __name__ == "__main__":
     main()

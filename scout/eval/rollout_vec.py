@@ -517,6 +517,21 @@ def evaluate_baseline_vec(dp, env_factory: Callable[[], Any],
     return first_results, any_succ_flags, success_trajs  # type: ignore[return-value]
 
 
+def _lightweight_traj(traj: dict) -> dict:
+    """Obs/states-stripped traj for sink-mode entries (2026-09-04 OOM fix).
+
+    When a ``traj_sink`` receives the raw trajectories (TrajSpool converts
+    them immediately), the per-init result entries only need the metrics
+    fields (actions feed jerk; lengths feed progress/init-done counting) --
+    the ~200MB-per-traj per-frame obs lists are dropped here so the engine
+    no longer holds the whole round in memory.
+    """
+    return {"actions": traj["actions"], "rewards": traj["rewards"],
+            "dones": traj["dones"], "horizon": traj["horizon"],
+            "success": traj["success"], "initial_state_dict": None,
+            "obs": None, "next_obs": None, "states": None}
+
+
 def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                              init_states: Sequence[dict], horizon: int,
                              try_times: int, n_envs: int, n_action_steps: int,
@@ -524,7 +539,8 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                              only_failed_of: Optional[Sequence[Tuple[bool, dict]]] = None,
                              guided: bool = True,
                              on_progress: Optional[Callable[[dict], None]] = None,
-                             wandb_run=None, log_every: int = 10
+                             wandb_run=None, log_every: int = 10,
+                             traj_sink: Optional[Callable[[dict, int, int], None]] = None
                              ) -> List[dict]:
     """Vectorized exploration: up to ``try_times`` tries per FAILED init state.
 
@@ -534,6 +550,15 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
     unless ``only_failed_of`` is None. ALL ``try_times`` retries run (no early
     stop) and EVERY successful rollout is kept (SOE pattern). ``record_obs=True``
     so successful trajs feed the augmented-hdf5 write-back.
+
+    ``traj_sink(traj, init_idx, try_idx)`` (2026-09-04 OOM fix, TrajSpool):
+    when set, every FINALIZED trajectory is handed to the sink (in the raw,
+    obs-carrying form) at its ``on_done`` moment and the per-init entries keep
+    only :func:`_lightweight_traj` copies -- the caller (CLI) assembles the
+    success/all hdf5 incrementally from the sink instead of from the returned
+    lists. Selection rules live in the sink; this function's counting/schema
+    are unchanged (``successful_trajs``/``all_trajs``/``first_traj`` hold the
+    lightweight copies, so lengths and ordering are identical).
     """
     n = len(init_states)
     # pre-build per-init-state result entries
@@ -571,14 +596,19 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
     def on_done(slot: _VecSlot):
         nonlocal jerk_sum, jerk_n
         _init_state, init_idx, try_idx = slot.job
+        if traj_sink is not None:
+            traj_sink(slot.traj, init_idx, try_idx)   # spool converts NOW
+            stored = _lightweight_traj(slot.traj)
+        else:
+            stored = slot.traj
         done_tries[init_idx] = max(done_tries.get(init_idx, -1), try_idx)
         entry = results[init_idx]
-        entry["all_trajs"].append(slot.traj)
+        entry["all_trajs"].append(stored)
         if try_idx == 0:
             # rescue-protocol dyn rule (user 2026-08-23): an all-failed init
             # contributes its FIRST retry to the dyn data -- completion order
             # is NOT try order under parallel envs, so tag try 0 explicitly.
-            entry["first_traj"] = slot.traj
+            entry["first_traj"] = stored
         j = _traj_jerk(slot.traj["actions"])
         if j > 0.0:                              # T<4 -> 0.0, skipped
             jerk_sum += j
@@ -587,7 +617,7 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
             if init_idx not in first_success:
                 first_success[init_idx] = try_idx + 1     # 1-based first-success try
             entry["solved"] = True
-            entry["successful_trajs"].append(slot.traj)   # keep ALL (SOE-style)
+            entry["successful_trajs"].append(stored)     # keep ALL (SOE-style)
 
     def progress_cb(tick: int):
         nonlocal _hb_n
@@ -889,6 +919,39 @@ def _smoke_vec():
         "rate>1 regression: numerators must only count fully-done envs")
     assert succ / max(env_done, 1) <= 1.0 and pass5 / max(env_done, 1) <= 1.0
     print("[4] rate>1 regression guard OK")
+
+    # ---- check 5: traj_sink mode = raw sink stream + lightweight entries --- #
+    guided_dp3 = MockGuidedDP()
+    received = []
+
+    def _sink(traj, init_idx, try_idx):
+        received.append((traj, init_idx, try_idx))
+
+    expl_sink = evaluate_exploration_vec(
+        guided_dp3, lambda: MockEnv(seed=0), init_states, horizon=HORIZON,
+        try_times=3, n_envs=N_ENVS, n_action_steps=N_ACTION_STEPS, device=device,
+        only_failed_of=base_vec, traj_sink=_sink,
+    )
+    n_raw = sum(len(r["all_trajs"]) for r in expl_sink)
+    assert len(received) == n_raw, (
+        f"sink saw {len(received)} trajs, entries hold {n_raw}")
+    for r in expl_sink:
+        assert r["first_traj"] is not None or r["baseline_solved"], "first_traj kept"
+        for t in r["all_trajs"] + r["successful_trajs"]:
+            assert t["obs"] is None and t["states"] is None, (
+                "sink-mode entries must be lightweight")
+    for traj, _i, _j in received:
+        assert isinstance(traj["obs"], list) and len(traj["obs"]) == traj["horizon"], (
+            "sink must receive the RAW obs-carrying traj")
+    for a, b in zip(expl_vec, expl_sink):          # schema/count parity
+        assert a["solved"] == b["solved"] and a["n_tries"] == b["n_tries"]
+        assert len(a["successful_trajs"]) == len(b["successful_trajs"])
+        assert len(a["all_trajs"]) == len(b["all_trajs"])
+    # metrics helpers still work on lightweight entries (actions kept)
+    assert sum(_traj_jerk(t["actions"])
+               for r in expl_sink for t in r["all_trajs"]) >= 0.0
+    print(f"[5] traj_sink mode: {n_raw} raw trajs to sink, entries "
+          f"lightweight, counts identical OK")
 
     print("[smoke] rollout_vec.py OK")
 

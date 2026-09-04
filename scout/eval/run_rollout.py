@@ -325,6 +325,15 @@ def main():
                         "statistically equivalent to (not bit-identical "
                         "with) the monolithic run -- same protocol, same "
                         "scenes, deterministic per (seed, SHARDS, SLOT).")
+    p.add_argument("--flush-every", type=int, default=0, metavar="N",
+                   help="OOM fix (2026-09-04): spool explore trajectories to "
+                        "staging hdf5 every N kept trajs, then assemble the "
+                        "final success/all hdf5 in the exact one-shot demo "
+                        "order (value-identical outputs; memory bounded by "
+                        "O(N) converted trajs instead of the whole round -- "
+                        "a rescue round holds ~200GB of float obs per worker "
+                        "otherwise). 0 (default) = legacy one-shot write. "
+                        "rescue/split explore only.")
     args = p.parse_args()
 
     scene_slice = None
@@ -599,6 +608,30 @@ def main():
     scout_vib_factory = make_scout_vib_factory(cfg, device) if guided else None
     env_factory = make_default_env_factory(cfg)
 
+    # ---- trajectory spool (OOM fix, --flush-every N) ----------------------- #
+    spool = None
+    if args.flush_every > 0:
+        if args.success_only or args.eval_only:
+            print("[run_rollout] --flush-every ignored (no explore data "
+                  "in success-only/eval-only rounds)")
+        elif not (rescue_mode or split_mode):
+            p.error("--flush-every requires --explore-mode rescue or the "
+                    "split protocol (legacy retry-failed mode is unsupported)")
+        else:
+            from scout.eval.traj_spool import TrajSpool
+            spool = TrajSpool(
+                cfg.dataset.path, success_path, all_path,
+                core_filter_key=cfg.dataset.core_filter_key,
+                aug_mask_key=(args.aug_mask_key
+                              or cfg.get("self_improvement", {}).get(
+                                  "scout_aug_mask", "scout_aug")),
+                rule=("rescue" if rescue_mode else "split"),
+                try_times=int(args.explore_try_times),
+                flush_every=int(args.flush_every))
+            print(f"[run_rollout] traj spool ON: rule={spool.rule} "
+                  f"try_times={spool.try_times} flush_every={spool.flush_every} "
+                  f"staging={success_path}.spool,{all_path}.spool")
+
     print(f"[run_rollout] task={args.task} guide={args.guide} wandb={wandb_name} "
           f"n_init={cfg.eval.n_init_states} try_times={cfg.eval.try_times} "
           f"n_envs={cfg.eval.n_envs} device={device}")
@@ -650,6 +683,7 @@ def main():
             explore_mode=args.explore_mode,
             rescue_seed=args.rescue_seed,
             scene_slice=scene_slice,
+            traj_sink=None if spool is None else spool.on_traj,
         )
         metrics = result["metrics"]
 
@@ -687,7 +721,26 @@ def main():
             aug_mask_key = (args.aug_mask_key
                             or cfg.get("self_improvement", {}).get("scout_aug_mask",
                                                                    "scout_aug"))
-            if trajs:
+            if spool is not None:
+                # engine-vs-spool parity invariant: the pipeline's lists and
+                # the spool implement the SAME selection rules -- divergence
+                # is a bug (finalize would write different data than the
+                # one-shot path), so refuse to write anything.
+                if spool.n_success != len(trajs) or spool.n_all != len(all_trajs):
+                    raise RuntimeError(
+                        f"spool/engine selection divergence: spool "
+                        f"succ={spool.n_success} all={spool.n_all} vs "
+                        f"engine succ={len(trajs)} all={len(all_trajs)} "
+                        f"-- refusing to finalize")
+                # staged writes already happened during explore; assemble the
+                # final files now (canonical one-shot order, value-identical)
+                _sp = spool.finalize()
+                if not _sp["success_written"]:
+                    print("[run_rollout] 0 successful exploration trajs "
+                          "-- skipping success hdf5")
+                if not _sp["all_written"]:
+                    print("[run_rollout] 0 all-trajs -- skipping all hdf5")
+            elif trajs:
                 write_rollouts_to_hdf5(
                     cfg.dataset.path, success_path, trajs,
                     core_filter_key=cfg.dataset.core_filter_key,
@@ -696,13 +749,13 @@ def main():
             else:
                 print("[run_rollout] 0 successful exploration trajs "
                       "-- skipping success hdf5")
-            if all_trajs:
+            if spool is None and all_trajs:
                 write_rollouts_to_hdf5(
                     cfg.dataset.path, all_path, all_trajs,
                     core_filter_key=cfg.dataset.core_filter_key,
                     aug_mask_key=aug_mask_key, include_core=True,
                 )
-            else:
+            elif spool is None:
                 print("[run_rollout] 0 all-trajs -- skipping all hdf5")
 
             # ---- final wandb points (converged values at full scene counts) -- #
@@ -848,6 +901,8 @@ def main():
             print(f"[run_rollout] all     -> {all_path} ({len(all_trajs)} trajs)")
             print(f"[run_rollout] json    -> {json_path}")
     finally:
+        if spool is not None:
+            spool.close()       # staging handles only; finalize already ran
         if wandb_run is not None:
             wandb_run.finish()
 
