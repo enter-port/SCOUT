@@ -214,13 +214,17 @@ def _smoke_rescue_spool(cfg, result_ref):
         with h5py.File(got, "r") as fg, h5py.File(ref, "r") as fr:
             assert sorted(fg["data"].keys()) == sorted(fr["data"].keys()), tag
             for demo in sorted(fr["data"].keys()):
+                assert set(fg["data"][demo].keys()) == \
+                    set(fr["data"][demo].keys()), (
+                    f"{tag}:{demo} keys {set(fg['data'][demo].keys())} vs "
+                    f"{set(fr['data'][demo].keys())}")
                 for sub in ("obs", "next_obs"):
                     for k in fr["data"][demo].get(sub, {}):
                         np.testing.assert_array_equal(
                             fg[f"data/{demo}/{sub}/{k}"][()],
                             fr[f"data/{demo}/{sub}/{k}"][()],
                             err_msg=f"{tag}:{demo}/{sub}/{k}")
-                for ds in ("actions", "done", "success"):
+                for ds in ("actions", "abs_actions", "done", "success"):
                     np.testing.assert_array_equal(
                         fg[f"data/{demo}/{ds}"][()],
                         fr[f"data/{demo}/{ds}"][()],

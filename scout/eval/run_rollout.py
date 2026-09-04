@@ -406,6 +406,15 @@ def main():
                                         or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
+    # --flush-every mode validation BEFORE wandb.init (review P1-2: a p.error
+    # after init leaks the run); 0 = legacy one-shot (default), <0 = refuse.
+    if args.flush_every != 0:
+        if args.flush_every < 0:
+            p.error("--flush-every must be >= 0 (0 = legacy one-shot write)")
+        if not (rescue_mode or split_mode or args.success_only or args.eval_only):
+            p.error("--flush-every requires --explore-mode rescue or the "
+                    "split protocol (legacy retry-failed mode is unsupported)")
+
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
                             "shell", "orbit")) and not args.success_only
     if guided and (args.vib_ckpt is None
@@ -614,9 +623,6 @@ def main():
         if args.success_only or args.eval_only:
             print("[run_rollout] --flush-every ignored (no explore data "
                   "in success-only/eval-only rounds)")
-        elif not (rescue_mode or split_mode):
-            p.error("--flush-every requires --explore-mode rescue or the "
-                    "split protocol (legacy retry-failed mode is unsupported)")
         else:
             from scout.eval.traj_spool import TrajSpool
             spool = TrajSpool(

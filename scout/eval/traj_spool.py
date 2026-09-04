@@ -103,7 +103,7 @@ class TrajSpool:
         self._stage_a_n = 0
         # conversion state
         self._obs_keys: Optional[List[str]] = None   # core ∩ first-traj keys
-        self._rot = get_aa_transformer()
+        self._rot = None             # lazy RotationTransformer (pytorch3d)
         # buffers / bookkeeping
         self._seq = 0                 # global arrival counter (within-init order)
         self._buf_s: List[dict] = []  # records -> success staging (successes)
@@ -196,7 +196,12 @@ class TrajSpool:
         next_obs_list = traj.get("next_obs") or []
         rec["next_obs"] = ({k: _stack_obs(next_obs_list, k, ep_len)
                             for k in self._obs_keys} if next_obs_list else None)
-        rec["actions"] = _acts_to_storage(traj["actions"], self._rot)
+        acts = np.asarray(traj["actions"], dtype=np.float32)
+        if acts.shape[-1] in (10, 20):
+            if self._rot is None:
+                self._rot = get_aa_transformer()
+            acts = _acts_to_storage(acts, self._rot)
+        rec["actions"] = acts
         rec["dones"] = np.asarray(traj["dones"], dtype=bool)
         states = traj.get("states")
         rec["states"] = (np.asarray(states[:ep_len], dtype=np.float32)
@@ -205,9 +210,12 @@ class TrajSpool:
         return rec
 
     def _set_obs_keys(self, keys: set) -> None:
-        """core ∩ rollout keys, decided from the FIRST kept traj (the one-shot
-        writer intersects with the union over all rollouts -- identical for
-        the consistent key sets the engine always produces)."""
+        """core ∩ rollout keys, decided from the FIRST kept traj. The one-shot
+        writer intersects core with the union over ALL rollouts -- identical
+        for the consistent key sets the engine always produces; on an
+        inconsistent batch the one-shot writer instead fails later at the
+        per-rollout stack (KeyError on the missing key) -- same failure class,
+        just earlier here."""
         import h5py
         with h5py.File(self.core_path, "r") as f:
             core_demos = _demo_list(f, self.core_filter_key)
@@ -246,6 +254,10 @@ class TrajSpool:
             for k, arr in rec["next_obs"].items():
                 next_grp.create_dataset(k, data=arr)
         grp.create_dataset("actions", data=rec["actions"])
+        # abs_actions: identical 7-dim aa (the one-shot writer stores BOTH; the
+        # LPB loader reads THIS key when abs_action=true -- omitting it would
+        # KeyError every downstream retrain; review P0-2)
+        grp.create_dataset("abs_actions", data=rec["actions"])
         grp.create_dataset("done", data=rec["dones"])
         grp.create_dataset("success",
                            data=np.full(int(rec["ep_len"]), rec["success"],
@@ -288,6 +300,11 @@ class TrajSpool:
         import h5py
         import shutil
         self._flush()
+        # close the staging WRITE handles BEFORE reopening the files for
+        # reading below -- a second (read) h5py handle on a file that is still
+        # open for writing can observe a stale/partial image (no SWMR); the
+        # server smoke caught a half-written demo group this way.
+        self.close()
         res = {"success_written": False, "success_demos": 0,
                "all_written": False, "all_demos": 0, "flushes": self._flushes}
         for which, out_path, n_records in (
@@ -466,11 +483,16 @@ def _smoke():
                 assert int(f1[k].attrs["num"]) == int(f2[k].attrs["num"])
             for demo in d1:
                 g1, g2 = f1["data"][demo], f2["data"][demo]
+                # dataset-name-set parity FIRST (review P1-1: comparing only a
+                # fixed tuple is blind to missing keys -- e.g. the abs_actions
+                # omission this assert now exists to catch)
+                assert set(g1.keys()) == set(g2.keys()), \
+                    f"{ctx}:{demo} keys {set(g1.keys())} vs {set(g2.keys())}"
                 assert int(g1.attrs["num_samples"]) == \
                     int(g2.attrs["num_samples"]), f"{ctx}:{demo} num_samples"
                 assert set(g1.attrs.keys()) == set(g2.attrs.keys()), \
                     f"{ctx}:{demo} attrs {set(g1.attrs)} vs {set(g2.attrs)}"
-                for ds in ("actions", "done", "success"):
+                for ds in ("actions", "abs_actions", "done", "success"):
                     np.testing.assert_array_equal(
                         g1[ds][()], g2[ds][()], err_msg=f"{ctx}:{demo}/{ds}")
                 if "states" in g2:
