@@ -28,9 +28,13 @@ only ``compute_loss`` changes.
   * Rows with an empty buffer contribute a graph-connected ZERO (no pull --
     retry 0 of a scene is the natural unguided retry).
 
-方案三 AtypicalCostPlanner (unchanged from v1): cost =
+方案三 KLCostPlanner (renamed from AtypicalCostPlanner 2026-09-04, user
+order -- same mechanism, new name): cost =
 -min(KL(q(z|s̄,a) ‖ q(z|s̄,a^DP)), κ) with the per-chunk unguided-intent
-baseline (μ⁰, σ⁰²) captured by the select_z hook.
+baseline (μ⁰, σ⁰²) captured by the select_z hook. The class owns the WHOLE
+phase-1 machinery (capped climb, merged single-backward guided_step,
+eta_tilde normalization) that the orbit subclass (orbit_costs.py) inherits
+verbatim -- the subclass adds ONLY phase 2.
 
 方案A ShellTargetCostPlanner (user 2026-08-27): 方案二 abandoned (its diversity
 came only from the evolving per-scene cache -- with a fixed cache the guided
@@ -212,17 +216,58 @@ class NoveltyCostPlanner(ScoutPlanner):
         raise ValueError(reduction)
 
 
-class AtypicalCostPlanner(ScoutPlanner):
+class KLCostPlanner(ScoutPlanner):
     """方案三: maximize KL(q(z|s̄,a) ‖ q(z|s̄,a^DP)) (capped at κ) -- move the
     code distribution of the chosen action away from the policy's own
-    unguarded intent for this chunk, in the encoder's own units."""
+    unguided intent for this chunk, in the encoder's own units.
+
+    Renamed from AtypicalCostPlanner (2026-09-04, user order): this is the
+    base of the KL-cost family. It owns ALL of phase 1 -- the per-chunk
+    intent anchor (select_z), the merged single-backward :meth:`guided_step`
+    consumed by policy.py's injection line, and the eta_tilde climb
+    normalization (:attr:`eta_dimless`). OrbitCostPlanner subclasses it and
+    adds ONLY the phase-2 constrained update, so "atypical vs orbit"
+    decomposes exactly into "phase 1 only" vs "phase 1 + phase 2" with
+    identical parameters and structure on the shared part.
+    """
 
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
-                 cap: float = 10.0):
+                 cap: float = 10.0, eta_dimless: bool = False):
         super().__init__(scout_vib, bridge=bridge, z=None, obs_adapter=obs_adapter)
         self.cap = float(cap)
+        # eta-dimless mode (2026-09-02 orbit-hparam-dev; moved into the base
+        # 2026-09-04 so atypical and orbit share it): normalize the climb
+        # gradient by the LIVE-CLIMB MEAN per-row gradient norm before the
+        # policy's guidance_scale multiplies it. The injected climb becomes
+        #   eta_tilde * sqrt(1-abar_t) * (g / g_med)
+        # i.e. a fixed ACTION-SPACE displacement per step, so one eta_tilde
+        # transfers across tasks whose VIB gradient scales differ (tool_hang
+        # needed eta=12 vs 3.0 on square/can -- a per-task hand calibration
+        # the live-climb mean absorbs automatically). Scale conversion on a
+        # given task/ckpt: eta_tilde = eta_legacy * <g_med> measured on data
+        # (per-step exact: eta_tilde = eta * g_med(step) reproduces the raw
+        # injection exactly; a FIXED eta_tilde matches it to the extent g_med
+        # is stable across steps -- the [kl-telemetry] mean_g_med print is
+        # the probe surface). Telemetry: the policy's mean_inject lands at
+        # the legacy value when eta_tilde = eta_legacy * g_med. OFF
+        # (default) = bit-identical legacy injection. Phase 2 (orbit
+        # subclass) is untouched: the Newton term carries its own
+        # ||grad||^2 normalization and the tangent noise is sigma-scaled,
+        # both already dimensionless w.r.t. the gradient scale.
+        self.eta_dimless = bool(eta_dimless)
+        # rows within [cap - _norm_band, cap) are excluded from the g_med
+        # divisor -- the orbit subclass sets its phase-2 handover delta
+        # (those rows swap the climb for the constrained update); the base
+        # keeps 0.0 so EVERY injecting row counts.
+        self._norm_band = 0.0
         self._base_mu: List[Optional[torch.Tensor]] = []
         self._base_lv: List[Optional[torch.Tensor]] = []
+        # eta-dimless: last divisor + running mean (debug/probe surface).
+        # _kl_calls drives the [kl-telemetry] print tick (base class only --
+        # the orbit subclass prints its own merged telemetry line).
+        self._last_g_med: Optional[torch.Tensor] = None
+        self._gmed_acc: Optional[torch.Tensor] = None
+        self._kl_calls = 0
 
     def set_row_context(self, init_ids: Sequence):
         pass    # rows identified positionally per chunk; nothing to persist
@@ -263,6 +308,121 @@ class AtypicalCostPlanner(ScoutPlanner):
         if reduction == "sum":
             return nll.sum()
         raise ValueError(reduction)
+
+    # -- phase-1 core (shared verbatim with the orbit subclass) ------------ #
+    def _kl_backward(self, trajectory: torch.Tensor, x0_hat: torch.Tensor,
+                     current_obs=None):
+        """ONE encoder forward + ONE summed backward -> per-row UNCAPPED
+        ``(kl, g)`` -- the shared graph that every guidance consumer (capped
+        climb, orbit phase 2) differentiates through. ``g`` is the gradient
+        of ``kl.sum()`` w.r.t. the trajectory; rows are block-diagonal, so
+        row slices of ``g`` are the per-row gradients of the summed
+        backward."""
+        s_bar_t = self._resolve_s_bar_t(current_obs)
+        a = _enc_forward(self, x0_hat)
+        mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
+        kl = _kl_rows(mu, logvar, self._base_mu, self._base_lv, x0_hat)
+        g = torch.autograd.grad(kl.sum(), trajectory)[0]
+        return kl, g
+
+    def _climb_gradient(self, kl: torch.Tensor, g: torch.Tensor):
+        """The capped climb gradient (phase 1), optionally eta_tilde-
+        normalized. Equivalence with ``-autograd.grad(compute_loss(...,
+        reduction="sum"))``: the cap's gradient mask is ``1[KL <= kappa]``
+        (torch clamp(max) backward PASSES gradient at input == max --
+        empirically confirmed, review P1-1), and applying it AFTER the
+        uncapped backward is exact because rows are block-diagonal -- a
+        row's vjp never mixes with other rows, so a row at/below kappa
+        keeps its full uncapped gradient (bitwise: ``where`` returns ``g``
+        verbatim on the selected branch), and a row above kappa gets exact
+        zeros (the old zero-upstream backward; ``where`` additionally
+        avoids the ``0 * inf = NaN`` pathology of a post-multiply)."""
+        cap_mask = (kl.detach() <= float(self.cap)).view(
+            -1, *([1] * (g.dim() - 1)))
+        cond_grad = torch.where(cap_mask, g, torch.zeros_like(g))
+        if self.eta_dimless:
+            # eta-dimless: divide by the MEAN per-row gradient norm over the
+            # LIVE CLIMB rows (detached scalar; consumes no RNG, so streams
+            # stay aligned with the legacy path). Guards (review 2026-09-02 +
+            # 20k-call can telemetry: an all-batch median let the shell rows
+            # -- orbit phase 2, LARGE norms -- inflate the divisor and starve
+            # the climb 3x on can where p2=58%):
+            #   * live-only: the divisor must describe the rows that
+            #     actually inject the climb. The base counts every uncapped
+            #     row (kl < cap); the orbit subclass additionally excludes
+            #     its phase-2 handover band via _norm_band = orbit_delta
+            #     (rows in [cap-delta, cap) swap the climb for the
+            #     constrained update -- policy's _keep zeroes them).
+            #   * roundoff exclusion: rows with norm <= 1e-4 (at-anchor
+            #     first-step rows: KL==0 exactly, gradients ~1e-8 roundoff)
+            #     are dropped from the MEAN as well as floored in the
+            #     division -- otherwise they drag the divisor down and
+            #     re-amplify noise.
+            #   * NaN containment: map NaN row-norms to 0 so they drop out
+            #     of the weighted mean; if EVERY live row is NaN the count
+            #     clamps to 1 and g_med -> 0 -> floor -> zero climb (safe
+            #     no-injection direction), never batch-wide NaN.
+            #   * MEAN, not median: after normalization the per-row norm
+            #     ||g_i||/mean is bounded by B (mean >= ||g_i||/B), so a
+            #     single finite outlier row can only cause batch-wide
+            #     UNDER-injection (safe: the DP prior dominates, and the
+            #     mean_g_med telemetry makes it visible). A median divisor
+            #     would allow unbounded over-injection of rows below it.
+            # Real working-point row norms are O(0.1) (square/can chain
+            # telemetry), three orders above the 1e-4 floor. ray_rotate
+            # (orbit subclass) runs AFTER this in policy.py and preserves
+            # per-row norms, so the normalized semantics survive the ray
+            # mode. Calibration note (review P2): injected magnitudes are
+            # batch-coupled through this statistic even though
+            # directions/RNG stay row-independent.
+            row_norms = g.detach().flatten(1).norm(dim=1)          # (B,)
+            row_norms = torch.nan_to_num(row_norms, nan=0.0,
+                                         posinf=0.0, neginf=0.0)
+            live = ((kl.detach() < float(self.cap) - self._norm_band)
+                    & (row_norms > 1e-4)).to(g.dtype)              # (B,)
+            g_med = (row_norms * live).sum() / live.sum().clamp(min=1.0)
+            cond_grad = cond_grad / g_med.clamp(min=1e-4)
+            # Per-row cap at 3x nominal dose (2026-09-02, telemetry round):
+            # the divisor describes LIVE CLIMB rows (small norms); the
+            # orbit subclass's handover-band rows [cap-delta, cap) keep
+            # nonzero cond_grad with LARGER norms and would normalize to
+            # 10-50x nominal -- they do not inject (policy's _keep zeroes
+            # them) but they dominate the injection telemetry and any
+            # future consumer (ray_rotate). Clamp every normalized row to
+            # <= 3x so the statistic, the telemetry and the (possible)
+            # injection all stay in the eta_tilde band; normal rows (ratio
+            # ~1) are untouched. Bit-identity of the OFF path is
+            # unaffected.
+            row_ratio = cond_grad.detach().flatten(1).norm(dim=1)
+            row_scale = (3.0 / row_ratio.clamp(min=1e-12)).clamp(max=1.0)
+            cond_grad = cond_grad * row_scale.view(-1, *([1] * (g.dim() - 1)))
+            self._last_g_med = g_med.clamp(min=1e-4).detach()
+            self._gmed_acc = (self._last_g_med
+                              if self._gmed_acc is None
+                              or self._gmed_acc.device != self._last_g_med.device
+                              else self._gmed_acc + self._last_g_med)
+        return cond_grad
+
+    def guided_step(self, trajectory: torch.Tensor, x0_hat: torch.Tensor,
+                    current_obs=None, noise_scale: float = 1.0):
+        """The planner-level merged guided step consumed by policy.py's
+        injection line (duck-typed hook). Phase-1 only: ONE encoder forward
+        + ONE backward supply the capped climb gradient and the detached
+        per-row cost. Returns ``(cond_grad, None, None, row_losses)`` --
+        the ``None``s mark "no phase-2 displacement", and policy.py uses
+        the plain injection line for this planner.
+        ``noise_scale`` is accepted for interface parity with the orbit
+        subclass's override (the pure climb carries no sigma)."""
+        kl, g = self._kl_backward(trajectory, x0_hat, current_obs)
+        cond_grad = self._climb_gradient(kl, g)
+        row_losses = -torch.clamp(kl.detach(), max=float(self.cap))
+        if self.eta_dimless:
+            self._kl_calls += 1
+            if self._kl_calls % 2500 == 0 and self._gmed_acc is not None:
+                print(f"[kl-telemetry] calls={self._kl_calls} "
+                      f"mean_g_med={float(self._gmed_acc) / self._kl_calls:.4g}",
+                      flush=True)
+        return cond_grad, None, None, row_losses
 
 
 class ShellTargetCostPlanner(ScoutPlanner):
@@ -319,7 +479,7 @@ class ShellTargetCostPlanner(ScoutPlanner):
 
     def select_z(self, x0_hat: torch.Tensor, current_obs=None):
         """Per-chunk intent baseline (mu^0, sigma^0^2) from the unguided x̂₀
-        (same hook and semantics as AtypicalCostPlanner)."""
+        (same hook and semantics as KLCostPlanner)."""
         with torch.no_grad():
             s_bar_t = self._resolve_s_bar_t(current_obs)
             a = _enc_forward(self, x0_hat)
@@ -376,7 +536,7 @@ class ComboCostPlanner(ScoutPlanner):
         self._nov = NoveltyCostPlanner(
             scout_vib, bridge=bridge, obs_adapter=obs_adapter,
             h_scale=h_scale, spread_c=spread_c, sample_z=sample_z)
-        self._att = AtypicalCostPlanner(
+        self._att = KLCostPlanner(
             scout_vib, bridge=bridge, obs_adapter=obs_adapter, cap=cap)
         self.nov_weight = float(nov_weight)
         self.att_weight = float(att_weight)
@@ -406,3 +566,8 @@ class ComboCostPlanner(ScoutPlanner):
                 * self._nov.compute_loss(x0_hat, current_obs, reduction)
                 + self.att_weight
                 * self._att.compute_loss(x0_hat, current_obs, reduction))
+
+
+# Backward-compat alias (renamed 2026-09-04, user order): historical
+# probes/notebooks/older branches import the old name.
+AtypicalCostPlanner = KLCostPlanner

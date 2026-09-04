@@ -201,6 +201,16 @@ def main():
                         "per-chunk fixed eps (1, default) or at mu (0)")
     p.add_argument("--atypical-cap", type=float, default=10.0,
                    help="atypical: cap on the KL bonus in nats (default 10)")
+    p.add_argument("--aty-eta-dimless", action="store_true",
+                   help="atypical: eta-dimless mode (2026-09-04 refactor -- "
+                        "same mechanism as --orbit-eta-dimless, now shared "
+                        "in KLCostPlanner): normalize the climb by the "
+                        "live-climb mean per-row ||grad|| so "
+                        "exploration.guidance_scale is eta_tilde in action-"
+                        "space units. Scale->eta conversion on a task: "
+                        "eta_tilde = scale_raw * <g_med> measured on data "
+                        "(per-step exact). OFF (default) = raw-scale legacy, "
+                        "bit-identical.")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -457,7 +467,8 @@ def main():
         cfg.exploration.guidance_scale = float(args.guidance_scale)
         print(f"[run_rollout] guidance_scale override: "
               f"{cfg.exploration.guidance_scale}"
-              f"{' (eta_tilde, --orbit-eta-dimless)' if args.orbit_eta_dimless else ''}")
+              f"{' (eta_tilde, --orbit-eta-dimless)' if args.orbit_eta_dimless else ''}"
+              f"{' (eta_tilde, --aty-eta-dimless)' if args.aty_eta_dimless else ''}")
     wcfg = cfg.get("wandb", {}) or {}
     use_wandb = bool(wcfg.get("use_wandb", True)) and not args.no_wandb
     wandb_run = None
@@ -618,7 +629,8 @@ def main():
                         "orbit_noise_anneal": args.orbit_noise_anneal,
                         "orbit_climb": args.orbit_climb,
                         "orbit_ray_seed": args.orbit_ray_seed,
-                        "orbit_grad_norm": bool(args.orbit_eta_dimless),
+                        "eta_dimless": bool(args.orbit_eta_dimless
+                                            or args.aty_eta_dimless),
                         "orbit_round": args.orbit_round,
                         "orbit_sigma_decay": args.orbit_sigma_decay,
                         "orbit_fb_clamp": args.orbit_fb_clamp},
@@ -755,7 +767,8 @@ def main():
                 "guidance": {
                     "guide": args.guide,
                     "guidance_scale": float(cfg.exploration.guidance_scale),
-                    "eta_dimless": int(bool(args.orbit_eta_dimless)),
+                    "eta_dimless": int(bool(args.orbit_eta_dimless
+                                           or args.aty_eta_dimless)),
                     **({"orbit_lam": args.orbit_lam,
                         "orbit_delta": args.orbit_delta,
                         "orbit_sigma": args.orbit_sigma,

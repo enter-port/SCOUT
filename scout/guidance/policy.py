@@ -187,20 +187,21 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
         # generator preserves LPB's call syntax and value exactly while keeping
         # the main ``generator`` + global RNG streams clean.
         _gate_gen = torch.Generator(device=condition_data.device)
-        # orbit guidance (2026-08-31; merged single-backward step 2026-09-01):
-        # planner-provided combined guided step -- capped climb gradient +
-        # phase-2 constrained update (Newton feedback + tangential noise on
-        # the kappa shell) computed from ONE encoder forward and ONE backward
-        # through the shared graph (scout/guidance/orbit_costs.py
-        # ``orbit_step``; pre-merge this line consumed two separate
-        # UNet-traversing backwards per guided denoise step). Duck-typed
-        # like set_denoise_step; absent -> the injection below is exactly the
-        # pre-orbit line for every other guide mode.
-        _orbit_fn = (getattr(self.scout_planner, "orbit_step", None)
-                     if classifier_guidance else None)
+        # planner-level merged guided step (2026-08-31 orbit; generalized
+        # 2026-09-04 user order to the whole KL cost family): the
+        # planner-provided combined step -- capped climb gradient + eta_tilde
+        # normalization + phase-2 constrained update (orbit only: Newton
+        # feedback + tangential noise on the kappa shell) computed from ONE
+        # encoder forward and ONE backward through the shared graph
+        # (scout/guidance/entropy_costs.py KLCostPlanner.guided_step,
+        # overridden by orbit_costs.py OrbitCostPlanner). Duck-typed like
+        # set_denoise_step; absent -> the generic compute_loss injection
+        # below is exactly the pre-refactor line for every other guide mode.
+        _guided_fn = (getattr(self.scout_planner, "guided_step", None)
+                      if classifier_guidance else None)
         # ray climb (2026-09-01, B4): planner-provided climb-direction rotation
         # for retries k>=1 (fixed design directions, magnitude preserved).
-        # Duck-typed like orbit_step; absent -> cond_grad is used verbatim
+        # Duck-typed like guided_step; absent -> cond_grad is used verbatim
         # for every guide mode (bit-identical).
         _ray_fn = (getattr(self.scout_planner, "ray_rotate", None)
                    if classifier_guidance else None)
@@ -266,7 +267,7 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                         _select_fn(x0_hat, current_obs))
                     _z_selected = True
                 _noise_scale = (1.0 - scheduler.alphas_cumprod[t]).sqrt()
-                if _orbit_fn is None:
+                if _guided_fn is None:
                     # reduction="sum": rows are block-diagonal independent, so the
                     # gradient of the SUMMED cost gives each row its full unscaled
                     # gradient -- the injected force no longer depends on how many
@@ -279,15 +280,15 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                     )
                     cond_grad = -torch.autograd.grad(loss, trajectory)[0]
                 else:
-                    # orbit: ONE forward + ONE backward supply both the capped
-                    # climb gradient and the phase-2 constrained update
-                    # (orbit_costs.orbit_step; equivalence with the old two-
-                    # backward path is asserted by verify check 16). Phase-2
-                    # rows (KL >= kappa - delta) swap the climb for the
-                    # constrained update -- the Newton feedback keeps
+                    # KL-cost family merged step (KLCostPlanner.guided_step;
+                    # the orbit subclass adds the phase-2 constrained update --
+                    # equivalence of the merged climb with the generic
+                    # compute_loss path is asserted by verify checks 16/20).
+                    # Phase-2 rows (KL >= kappa - delta) swap the climb for
+                    # the constrained update -- the Newton feedback keeps
                     # climbing below kappa, so the hand-over has no gap and no
                     # double dose; phase-1 rows keep the climb verbatim.
-                    cond_grad, _disp, _p2, _row_losses = _orbit_fn(
+                    cond_grad, _disp, _p2, _row_losses = _guided_fn(
                         trajectory, x0_hat, current_obs,
                         noise_scale=float(_noise_scale))
                 if _ray_fn is not None:
@@ -296,7 +297,7 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                     # _keep below, so the rotation is a no-op for them).
                     cond_grad = _ray_fn(cond_grad)
                 grad_scale = self.guidance_scale * _noise_scale
-                if _orbit_fn is None:
+                if _disp is None:
                     trajectory = trajectory.detach() + grad_scale * cond_grad
                 else:
                     _keep = (1.0 - _p2).view(
@@ -321,11 +322,12 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                           f"max_inject={float(self._g_acc[1]):.4g}", flush=True)
                 if return_cost_curve:
                     # log per-row mean (historical scale of the E2 metric),
-                    # not the B-aggregated sum. Orbit arm: the merged step
-                    # already returned the equivalent capped rows (detached)
-                    # -- same value as the old compute_loss scalar / B.
+                    # not the B-aggregated sum. Merged-step arms (KL cost
+                    # family): the step already returned the equivalent
+                    # capped rows (detached) -- same value as the generic
+                    # compute_loss scalar / B.
                     denom = x0_hat.shape[0]
-                    if _orbit_fn is None:
+                    if _guided_fn is None:
                         cost_curve.append(float(loss.item()) / denom)
                     else:
                         cost_curve.append(float(_row_losses.sum()) / denom)

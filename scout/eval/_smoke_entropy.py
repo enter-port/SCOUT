@@ -7,8 +7,8 @@ import numpy as np
 import torch
 
 from scout.guidance.entropy_costs import (
-    AtypicalCostPlanner,
     ComboCostPlanner,
+    KLCostPlanner,
     NoveltyCostPlanner,
 )
 
@@ -95,8 +95,8 @@ def main():
     c_batch = pl.compute_loss(_x(a_near), s_bar, reduction="sum")
     assert torch.allclose(c_alone, c_batch, atol=1e-5)
 
-    # ---------------- atypical --------------------------------------------- #
-    pa = AtypicalCostPlanner(vib, cap=2.0)
+    # ---------------- atypical (KLCostPlanner) ----------------------------- #
+    pa = KLCostPlanner(vib, cap=2.0)
     pa.set_current_obs(s_bar)
     x0 = torch.randn(2, Da)
     pa.select_z(x0.unsqueeze(1), s_bar)

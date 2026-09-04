@@ -215,8 +215,8 @@ z (B,16) ⊕ s̄_t (B,1088)
 
 - E_s：`scout/model/encoder.py`；VIB：`scout/model/vib.py` + `scout/model/scout_vib.py`
 - 训练：`scout/train_vib.py`（config `configs/vib_{task}_image.yaml`）
-- Cost：**entropy cost** `scout/guidance/entropy_costs.py`（AtypicalCostPlanner，CLI `--guide atypical --atypical-cap 2.5`；同文件另有方案二 Novelty 与 Combo 组合）；v0 NLL `scout/guidance/cost.py`（`--guide dyn`/`expert`）；planner：`scout/guidance/planner.py`
-- orbit：`scout/guidance/orbit_costs.py`（OrbitCostPlanner，CLI `--guide orbit --orbit-lam 0.5 --orbit-delta 0.25 --orbit-sigma 0.25`；sector/anneal/fb-clamp/round/decay/eta-dimless 旋钮见 §7）；验证 = `scout/guidance/_verify.py` check 10–19
+- Cost：**entropy cost** `scout/guidance/entropy_costs.py`（KLCostPlanner，2026-09-04 由 AtypicalCostPlanner 更名；CLI `--guide atypical --atypical-cap 2.5`，η̃ 模式 `--aty-eta-dimless`；同文件另有方案二 Novelty 与 Combo 组合）；v0 NLL `scout/guidance/cost.py`（`--guide dyn`/`expert`）；planner：`scout/guidance/planner.py`
+- orbit：`scout/guidance/orbit_costs.py`（OrbitCostPlanner = **KLCostPlanner 的子类**，2026-09-04 重构：phase-1 爬升+η̃ 归一化全部继承基类，唯一新增 = phase-2；CLI `--guide orbit --orbit-lam 0.5 --orbit-delta 0.25 --orbit-sigma 0.25`；sector/anneal/fb-clamp/round/decay/eta-dimless 旋钮见 §7）；验证 = `scout/guidance/_verify.py` check 10–20
 - 去噪循环：`scout/guidance/policy.py`（`guided_conditional_sample`）
 - base DP：`diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py`（config `configs/base_dp_{task}_image.yaml`）
 

@@ -157,8 +157,8 @@ class RolloutPipeline:
             # only the cost changes; same injection path, same frozen dyn/VIB
             # encoder.
             from scout.guidance.entropy_costs import (
-                AtypicalCostPlanner,
                 ComboCostPlanner,
+                KLCostPlanner,
                 NoveltyCostPlanner,
                 ShellTargetCostPlanner,
             )
@@ -170,9 +170,10 @@ class RolloutPipeline:
                     sample_z=bool(ek.get("novelty_sample_z", False)),
                 )
             elif self.guide_mode == "atypical":
-                planner = AtypicalCostPlanner(
+                planner = KLCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                     cap=float(ek.get("atypical_cap", 10.0)),
+                    eta_dimless=bool(ek.get("eta_dimless", False)),
                 )
             elif self.guide_mode == "shell":
                 planner = ShellTargetCostPlanner(
@@ -209,7 +210,7 @@ class RolloutPipeline:
                 orbit_noise_anneal=float(ek.get("orbit_noise_anneal", 1.0)),
                 orbit_climb=str(ek.get("orbit_climb", "grad")),
                 orbit_ray_seed=int(ek.get("orbit_ray_seed", 42)),
-                orbit_grad_norm=bool(ek.get("orbit_grad_norm", False)),
+                eta_dimless=bool(ek.get("eta_dimless", False)),
                 orbit_round=int(ek.get("orbit_round", 1)),
                 orbit_sigma_decay=float(ek.get("orbit_sigma_decay", 1.0)),
                 orbit_fb_clamp=str(ek.get("orbit_fb_clamp", "none")),
@@ -220,7 +221,7 @@ class RolloutPipeline:
                   f"sector={planner.orbit_sector} "
                   f"anneal={planner.orbit_noise_anneal} "
                   f"climb={planner.orbit_climb} "
-                  f"eta_dimless={planner.orbit_grad_norm} "
+                  f"eta_dimless={planner.eta_dimless} "
                   f"round={planner.orbit_round} "
                   f"sigma_eff={planner.orbit_sigma_eff:.4g} "
                   f"(decay={planner.orbit_sigma_decay}) "
