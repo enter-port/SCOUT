@@ -18,10 +18,13 @@
 #
 # Read-only reuse of the r1 frozen trio + SCOUT-exp1/failed.json; outputs only
 # under data/2026_9_4_p10probe/. Never touches campaign data or chains.
-# usage: ROUND=4 [OFFSET=9] [N=9] [P=3] [ATY_SCALE=12] [ORB_ETA=1.2]
+# usage: ROUND=4 [OFF=9] [N=9] [P=3] [ATY_SCALE=12] [ORB_ETA=1.2]
 #        [ORB_SIGMA=0.025] [ORB_LAM=0.15] [ORB_DELTA=0.25] [ORB_FBCLAMP=none]
 #        [TRIES=10] [DRY_RUN=1] GPU_DP=3 GPU_ATY=2 GPU_ORB=1
 #        bash soe_scripts/th_p10_probe.sh
+# GPU_ORB=none -> two-arm mode (dp + aty only; aty-scale sweep, user order
+# 2026-09-04): the orb arm is skipped entirely (cfg_orb.yaml is still written
+# but unused) and the summary table only lists arms with an output dir.
 set -uo pipefail
 ROUND=${ROUND:?set ROUND=<iteration round >=1>}
 N=${N:-9}
@@ -134,13 +137,18 @@ ORB_ARGS=(--atypical-cap "$ORB_CAP" --orbit-lam "$ORB_LAM" \
            --orbit-delta "$ORB_DELTA" --orbit-sigma "$ORB_SIGMA" \
            --orbit-fb-clamp "$ORB_FBCLAMP")
 [ "$ORB_DIMLESS" = "1" ] && ORB_ARGS+=(--orbit-eta-dimless)
-run_arm orb  "$GPU_ORB" orbit     vib ${ORB_ARGS[@]+"${ORB_ARGS[@]}"} &
-P1=$!
+# GPU_ORB=none skips the orbit arm (aty-scale sweep mode; the pid-0 trap is
+# why WAIT_PIDS is built instead of waiting on a literal 0)
+WAIT_PIDS=()
+if [ "${GPU_ORB:-x}" != "none" ]; then
+  run_arm orb  "$GPU_ORB" orbit     vib ${ORB_ARGS[@]+"${ORB_ARGS[@]}"} &
+  WAIT_PIDS+=($!)
+fi
 run_arm aty  "$GPU_ATY" atypical  vib --atypical-cap "$ATY_CAP" &
-P2=$!
+WAIT_PIDS+=($!)
 run_arm dp   "$GPU_DP"  off       novib &
-P3=$!
-wait $P1 $P2 $P3
+WAIT_PIDS+=($!)
+wait "${WAIT_PIDS[@]}"
 [ "${DRY_RUN:-0}" = "1" ] && { echo "[p10] DRY_RUN done"; exit 0; }
 
 # ---- summary: approx pass@10 per arm + r1 DP reference on this window ------
@@ -155,7 +163,8 @@ r1_detail = {d["init"]: d for d in r1["explore_detail"]}
 r1_solved = sum(1 for i in win if r1_detail.get(i, {}).get("solved"))
 print(f"[p10] r1 DP reference on window: {r1_solved}/{N}")
 rows = []
-for arm in ("dp", "aty", "orb"):
+arms = ("dp", "aty") + (("orb",) if os.path.isdir(f"{T}/orb") else ())
+for arm in arms:
     row = {"round": rnd, "arm": arm,
            "params": (f"s{aty_s},cap{aty_cap}" if arm == "aty" else
                       f"eta{orb_e},sig{orb_sig},cap{orb_cap},dimless{orb_dimless}"
