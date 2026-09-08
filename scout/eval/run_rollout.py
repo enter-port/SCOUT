@@ -134,6 +134,17 @@ def main():
                         "alone (row dies exactly when atypical's would; "
                         "gae-norm ignored). lambda=0 or gamma=0 = bitwise "
                         "atypical.")
+    p.add_argument("--gae-weighting", choices=["anchor", "recent"],
+                   default="anchor",
+                   help="gaelike: decay direction of the gamma^k weights "
+                        "(reflection round 2, P3). 'anchor' (default) = "
+                        "original: anchor weight 1, NEWEST history least "
+                        "(g^k, k = steps since anchor). 'recent' = "
+                        "recency-first: newest history g^1, oldest g^(H-1), "
+                        "anchor still 1 -- turns early-history repulsion "
+                        "(momentum continuation) into a brake on recent "
+                        "iterates (anti-oscillation). g=0 identical in "
+                        "both.")
     p.add_argument("--gae-hist-weight", type=float, default=0.15,
                    help="gaelike add mode: lambda, the weight of the "
                         "gamma-decayed history sum around the full-weight "
@@ -725,7 +736,8 @@ def main():
                         "gae_gamma": args.gae_gamma,
                         "gae_norm": int(args.gae_norm),
                         "gae_agg": args.gae_agg,
-                        "gae_hist_weight": args.gae_hist_weight},
+                        "gae_hist_weight": args.gae_hist_weight,
+                        "gae_weighting": args.gae_weighting},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -896,7 +908,8 @@ def main():
                     **({"gae_gamma": args.gae_gamma,
                         "gae_norm": int(args.gae_norm),
                         "gae_agg": args.gae_agg,
-                        "gae_hist_weight": args.gae_hist_weight}
+                        "gae_hist_weight": args.gae_hist_weight,
+                        "gae_weighting": args.gae_weighting}
                        if args.guide == "gaelike" else {}),
                 },
                 "outputs": {"success": success_path, "all": all_path},

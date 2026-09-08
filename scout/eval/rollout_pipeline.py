@@ -196,6 +196,7 @@ class RolloutPipeline:
                     gae_normalize=bool(ek.get("gae_norm", 1)),
                     gae_agg=str(ek.get("gae_agg", "avg")),
                     gae_hist_weight=float(ek.get("gae_hist_weight", 0.15)),
+                    gae_weighting=str(ek.get("gae_weighting", "anchor")),
                 )
                 print(f"[rollout] GAElike guidance: gamma={planner.gae_gamma} "
                       f"normalize={planner.gae_normalize} "

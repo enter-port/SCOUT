@@ -76,7 +76,8 @@ class GAELikeCostPlanner(KLCostPlanner):
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
                  cap: float = 10.0, eta_dimless: bool = False,
                  gae_gamma: float = 0.9, gae_normalize: bool = True,
-                 gae_agg: str = "avg", gae_hist_weight: float = 0.15):
+                 gae_agg: str = "avg", gae_hist_weight: float = 0.15,
+                 gae_weighting: str = "anchor"):
         super().__init__(scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                          cap=cap, eta_dimless=eta_dimless)
         self.gae_gamma = float(gae_gamma)
@@ -87,6 +88,11 @@ class GAELikeCostPlanner(KLCostPlanner):
             raise ValueError(
                 f"gae_gamma must be in [0, 1] (0 = vanilla atypical); got "
                 f"{self.gae_gamma}")
+        self.gae_weighting = str(gae_weighting)
+        if self.gae_weighting not in ("anchor", "recent"):
+            raise ValueError(
+                f"gae_weighting must be 'anchor' or 'recent'; got "
+                f"{self.gae_weighting!r}")
         if self.gae_agg not in ("avg", "add"):
             raise ValueError(
                 f"gae_agg must be 'avg' or 'add'; got {self.gae_agg!r}")
@@ -171,9 +177,19 @@ class GAELikeCostPlanner(KLCostPlanner):
                     - (logvar.unsqueeze(1) - self._hist_lv)).sum(dim=-1)  # (B,H)
         kl = torch.clamp(kl, max=float(self.cap))               # per-term κ
         anchor = kl[:, 0]                                       # (B,)
-        w = torch.as_tensor(
-            [self.gae_gamma ** k for k in range(H)],
-            device=mu.device, dtype=mu.dtype)                    # (H,)
+        if self.gae_weighting == "recent":
+            # P3 (reflection round 2, 2026-09-09): recency-first decay --
+            # the anchor keeps weight 1, the NEWEST history entry gets g^1
+            # and the OLDEST gets g^(H-1) (the original form weights the
+            # anchor most and the newest LEAST; the anti-return intent is
+            # arguably inverted). g=0 still leaves only the anchor term.
+            w = torch.as_tensor(
+                [1.0] + [self.gae_gamma ** (H - k) for k in range(1, H)],
+                device=mu.device, dtype=mu.dtype)                # (H,)
+        else:
+            w = torch.as_tensor(
+                [self.gae_gamma ** k for k in range(H)],
+                device=mu.device, dtype=mu.dtype)                # (H,)
         if self.gae_agg == "add":
             hist = (kl[:, 1:] * w[1:]).sum(dim=1)               # (B,)
             return anchor, anchor + self.gae_hist_weight * hist

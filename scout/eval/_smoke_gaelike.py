@@ -308,6 +308,51 @@ def main():
     print(f"[11] add-mode autograd == finite differences ({ana:.6f} vs "
           f"{num:.6f}) OK")
 
+    # ---------------- 12. recent weighting: form + g=0 parity -------------- #
+    # g=0 with recent weights: w = [1, g^(H-1), ..., g^1] -> [1, 0, ..., 0]
+    # -> bitwise atypical (cond_grad AND row_losses).
+    van4 = KLCostPlanner(vib, cap=2.5)
+    gr0 = GAELikeCostPlanner(vib, cap=2.5, gae_gamma=0.0,
+                             gae_weighting="recent")
+    for pl in (van4, gr0):
+        pl.set_current_obs(s_bar)
+        pl.select_z(anchor_x.unsqueeze(1) * 1.0)
+    for step in range(4):
+        x = anchor_x + 0.3 * (step + 1) * torch.randn(B, Da)
+        t_v, x_v = _traj(x)
+        t_g, x_g = _traj(x)
+        cg_v, _, _, rl_v = van4.guided_step(t_v, x_v, None)
+        cg_g, _, _, rl_g = gr0.guided_step(t_g, x_g, None)
+        assert torch.equal(cg_v, cg_g), f"recent g0 step {step}: grad"
+        assert torch.equal(rl_v, rl_g), f"recent g0 step {step}: rl"
+    # value form: recent weights [1, g^(H-1), ..., g^1] (normalized avg)
+    gr5 = GAELikeCostPlanner(vib, cap=2.5, gae_gamma=0.5,
+                             gae_weighting="recent")
+    gr5.set_current_obs(s_bar)
+    gr5.select_z(anchor_x.unsqueeze(1) * 1.0)
+    hm = [gr5._hist_mu[:, 0].clone()]
+    hlv = [gr5._hist_lv[:, 0].clone()]
+    for step in range(3):
+        x = anchor_x + 0.4 * (step + 1) * torch.ones(B, Da)
+        mu, logvar = _enc(gr5, x, s_bar)
+        anchor, agg = gr5._gae_rows(mu, logvar, x.unsqueeze(1) * 1.0)
+        H = len(hm)
+        with torch.no_grad():
+            ref = torch.zeros(B)
+            wsum = 0.0
+            for k, (m0, lv0) in enumerate(zip(hm, hlv)):
+                w = 1.0 if k == 0 else 0.5 ** (H - k)
+                ref += w * torch.clamp(_kl_diag(mu, logvar, m0, lv0),
+                                       max=2.5)
+                wsum += w
+            ref /= wsum
+        assert torch.allclose(agg, ref, atol=1e-6), f"recent form {step}"
+        hm.append(mu.clone())
+        hlv.append(logvar.clone())
+        gr5._push_history(mu, logvar)
+        gr5._gae_fresh = False
+    print("[12] recent weighting: value form + g=0 bitwise parity OK")
+
     print("\n[gae-smoke] ALL CHECKS GREEN")
 
 
