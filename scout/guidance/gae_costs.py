@@ -21,18 +21,22 @@ GAE-weighted:
     intent; k>=1 are the post-injection iterates). History is per-chunk:
     every new anchor (select_z) resets it, mirroring the vanilla baseline.
   * g^k (``gae_gamma``) is the GAE discount: the anchor term keeps weight
-    1 and older-to-newer history decays geometrically, so the sum stays
-    bounded (<= kappa / (1-g) uncapped-normalized) no matter how many
-    guided steps the chunk runs. g -> 0 keeps ONLY the k=0 term = the
-    vanilla entropy cost exactly (value AND gradient; the normalize
-    divisor is then 1), so the new mechanism is a strict superset of
+    1 and older-to-newer history decays geometrically, so the history sum
+    stays bounded no matter how many guided steps the chunk runs. g -> 0
+    keeps ONLY the k=0 term = the vanilla entropy cost exactly on CPU
+    (value AND gradient; the normalize divisor is then 1; GPU accumulation
+    may differ at ulp level -- same caveat as the 2026-09-01 _kl_rows
+    vectorization), so the new mechanism is a strict superset of
     ``--guide atypical`` and inherits its calibrated dose.
   * each pairwise KL is capped at κ exactly as the vanilla anchor term
     (double trust region per comparison); ``gae_normalize`` (default ON)
     divides by the weight sum so the ROW cost envelope stays [0, κ] and
-    the existing η/guidance_scale semantics carry over unchanged. OFF =
-    the raw GAE sum (envelope κ/(1-g), i.e. a ~(1/(1-g))x dose uplift --
-    re-calibrate eta before using).
+    the existing η/guidance_scale semantics carry over unchanged. OFF
+    (review P1-1, semantics pending user decision) = raw unnormalized
+    weights with the anchor still dominant, BUT the inherited climb's
+    AGGREGATE kappa budget then kills the whole row (injection gradient)
+    as soon as the weighted SUM reaches κ -- rows die EARLIER than
+    atypical, it is NOT a ~(1/(1-g))x dose uplift. Calibrate with ON.
   * mechanism reading: keep "escape the anchor" as the dominant push, add
     a decaying "do not fall back onto any intent already visited"
     pressure (anti-return / momentum across the denoise walk).
@@ -105,6 +109,15 @@ class GAELikeCostPlanner(KLCostPlanner):
         self._hist_lv = torch.stack(self._base_lv).detach().unsqueeze(1)
         self._gae_fresh = True
         return None
+
+    def reset(self):
+        """Base reset (clear s̄_t / z caches) + drop the GAE history -- a
+        reused planner instance must not see a stale, same-B history (which
+        would slip past the row-alignment guard; review P2-5)."""
+        super().reset()
+        self._hist_mu = None
+        self._hist_lv = None
+        self._gae_fresh = False
 
     # ------------------------------------------------------------------ #
     # the GAE-weighted per-row cost (B,)

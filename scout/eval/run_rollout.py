@@ -111,13 +111,17 @@ def main():
                         "sum (<= kappa/(1-gamma) raw). gamma=0 = ONLY the "
                         "anchor term = --guide atypical exactly (value and "
                         "gradient; dose-compatible).")
-    p.add_argument("--gae-norm", type=int, default=1,
+    p.add_argument("--gae-norm", type=int, choices=[0, 1], default=1,
                    help="gaelike: 1 (default) = divide the weighted sum by "
                         "sum_k gamma^k so the row cost envelope stays [0, "
                         "kappa] and the atypical-calibrated guidance_scale "
-                        "carries over; 0 = raw GAE sum (envelope "
-                        "kappa/(1-gamma) -- a ~(1/(1-gamma))x dose uplift, "
-                        "re-calibrate eta first).")
+                        "carries over; 0 = raw (unnormalized) weights: the "
+                        "anchor still dominates but the AGGREGATE kappa "
+                        "budget of the inherited climb kills the whole row "
+                        "as soon as the weighted sum reaches kappa -- rows "
+                        "die EARLIER than atypical (NOT a dose uplift; "
+                        "review P1-1, semantics pending user decision -- "
+                        "calibrate with 1).")
     p.add_argument("--orbit-lam", type=float, default=0.5,
                    help="orbit: feedback gain lambda of the Newton term "
                         "-lam*(KL-kappa)*grad KL/||grad KL||^2 (dimensionless "
@@ -433,6 +437,13 @@ def main():
         if not (rescue_mode or split_mode or args.success_only or args.eval_only):
             p.error("--flush-every requires --explore-mode rescue or the "
                     "split protocol (legacy retry-failed mode is unsupported)")
+
+    # gaelike range check BEFORE wandb.init / the eval phase (review P1-3:
+    # the planner-side check fires only in _attach_planner, i.e. AFTER the
+    # step-2 baseline eval has already burned hours on a bad --gae-gamma).
+    if args.guide == "gaelike" and not (0.0 <= float(args.gae_gamma) <= 1.0):
+        p.error(f"--gae-gamma must be in [0, 1] (0 = vanilla atypical); "
+                f"got {args.gae_gamma}")
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
                             "shell", "orbit", "gaelike")) and not args.success_only
@@ -861,6 +872,9 @@ def main():
                         "orbit_climb": args.orbit_climb,
                         "atypical_cap": args.atypical_cap}
                        if args.guide == "orbit" else {}),
+                    **({"gae_gamma": args.gae_gamma,
+                        "gae_norm": int(args.gae_norm)}
+                       if args.guide == "gaelike" else {}),
                 },
                 "outputs": {"success": success_path, "all": all_path},
             }

@@ -141,7 +141,7 @@ def main():
     for step in range(6):
         t, x0 = _traj(torch.full((B, Da), 3.0 * (step + 1)))  # large KLs
         kl, g = gae._kl_backward(t, x0, None)
-        assert float(kl.max()) <= 2.5 + 1e-5, f"envelope broken: {kl}"
+        assert float(kl.detach().max()) <= 2.5 + 1e-5, f"envelope broken: {kl}"
         assert torch.isfinite(g).all()
     print("[4] per-term kappa cap + normalized envelope <= kappa OK")
 
@@ -160,7 +160,7 @@ def main():
     snap_mu, snap_lv = g1._hist_mu.clone(), g1._hist_lv.clone()
     t, x0 = _traj(x)
     kl, g = g1._kl_backward(t, x0, None)
-    assert float(kl.max()) < 2.5, "FD row saturated -- shrink the neighborhood"
+    assert float(kl.detach().max()) < 2.5, "FD row saturated -- shrink the neighborhood"
     ana = float(g[0, 0, 0])                          # d kl_row0 / d traj0
     g1._hist_mu, g1._hist_lv = snap_mu, snap_lv      # undo the push for FD
     eps = 1e-4
@@ -198,14 +198,23 @@ def main():
     assert torch.equal(st, torch.get_rng_state()), "RNG was consumed"
     print("[7] guided_step walk consumes no RNG OK")
 
-    # ---------------- 8. pre-select_z / B-mismatch guard ------------------ #
+    # ---------------- 8. pre-select_z / B-mismatch guards ------------------ #
     g3 = GAELikeCostPlanner(vib, cap=2.5, gae_gamma=0.9)
     g3.set_current_obs(s_bar)
-    t, x0 = _traj(torch.randn(B + 1, Da))            # B mismatch -> zeros
+    t, x0 = _traj(torch.randn(B + 1, Da))            # NO history -> zeros
     kl, g = g3._kl_backward(t, x0, None)
     assert torch.equal(kl, torch.zeros(B + 1)) and torch.equal(
         g, torch.zeros_like(g))
-    print("[8] B-mismatch guard: graph-connected zeros OK")
+    assert g3._hist_mu is None, "push must no-op without history"
+    # history EXISTS but the batch row count changed mid-flight -> zeros,
+    # no buffer corruption (review P2-4)
+    g3.select_z(torch.randn(B, Da).unsqueeze(1) * 1.0)
+    t, x0 = _traj(torch.randn(B + 1, Da))
+    kl, g = g3._kl_backward(t, x0, None)
+    assert torch.equal(kl, torch.zeros(B + 1)) and torch.equal(
+        g, torch.zeros_like(g))
+    assert g3._hist_mu.shape[:2] == (B, 1), "buffer corrupted by B mismatch"
+    print("[8] pre-select_z / B-mismatch guards OK (zeros, no corruption)")
 
     print("\n[gae-smoke] ALL CHECKS GREEN")
 
