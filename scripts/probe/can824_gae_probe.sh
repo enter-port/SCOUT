@@ -17,13 +17,22 @@
 #   * read-only reuse of the campaign's train/ ckpts; outputs ONLY under
 #     data/gae_probe_can824/. Never touches campaign data or running chains.
 #
-# usage: ROUND=1 [GAE_GAMMA=0.9] [GAE_NORM=1] [P=4] [TRIES=10] [ATY_SCALE=3.0]
-#        [CAP=2.5] [GST=100] [GPU_ATY=3] [GPU_GAE=1] [BACKSTOP=2700] [DRY_RUN=1]
-#        bash scripts/probe/can824_gae_probe.sh
-# step 0 (failed-set derivation) runs automatically when failed_dp.json is
-# missing (~10 min, unguided eval); force with PREP_ONLY=1.
+# usage: ROUND=1 [OFF=0] [N=22] [GAE_GAMMA=0.9] [GAE_NORM=1] [P=4] [TRIES=10]
+#        [ATY_SCALE=3.0] [CAP=2.5] [GST=100] [GPU_ATY=3] [GPU_GAE=1]
+#        [BACKSTOP=2700] [DRY_RUN=1] bash scripts/probe/can824_gae_probe.sh
+# Windowed rounds (th_p10_probe pattern, 2026-09-04 user precedent): the
+# stride sharding (index %% P) is lumpy on this failed set ({9,10,10,14}
+# scenes/stride at P=4), so the FULL 43-scene set needs ~55 min on the
+# slowest shard -- over the 45-min budget. Each ROUND therefore runs a
+# [OFF:OFF+N] window of the failed list (N=0 = full set); the ledger
+# CUMULATES rescued/n across rounds, so OFF=0 N=22 + OFF=22 N=21 covers
+# the whole set in two budget-respecting rounds. Step 0 (failed-set
+# derivation) runs automatically when failed_dp.json is missing (~10 min,
+# unguided eval); force with PREP_ONLY=1.
 set -uo pipefail
 ROUND=${ROUND:?set ROUND=<iteration round >=1>}
+OFF=${OFF:-0}
+N=${N:-22}
 GAE_GAMMA=${GAE_GAMMA:-0.9}
 GAE_NORM=${GAE_NORM:-1}
 P=${P:-4}
@@ -88,6 +97,21 @@ print(f"[gae-probe] failed set: {n} inits, recorded SR "
 PYEOF
 [ "${PREP_ONLY:-0}" = "1" ] && { echo "[gae-probe] PREP_ONLY done"; exit 0; }
 
+# ---- window cut: failed[OFF:OFF+N], original indices kept (th pattern) --- #
+$PY - "$FAILED" "$T/win.json" "$OFF" "$N" <<'PYEOF'
+import json, sys
+spec = json.load(open(sys.argv[1]))
+off, n = int(sys.argv[3]), int(sys.argv[4])
+allf = spec["failed_init_indices"]
+idx = allf if n <= 0 else allf[off:off + n]
+if n > 0:
+    assert len(idx) == n, f"window underflow: wants [{off}:{off+n}] of {len(allf)}"
+spec["failed_init_indices"] = idx
+json.dump(spec, open(sys.argv[2], "w"), indent=1)
+print(f"[gae-probe] window [{'0' if n <= 0 else str(off)}:{'all' if n <= 0 else str(off+n)}] = {idx}")
+PYEOF
+WIN=$T/win.json
+
 # ---- per-arm config copies (dose is config-only, th_p10_probe pattern) --- #
 for spec in "aty:${ATY_SCALE}" "gae:${ATY_SCALE}"; do
   arm=${spec%%:*}; sc=${spec#*:}
@@ -114,7 +138,7 @@ run_arm() { # name gpu guide extra...
   echo "[gae-probe] arm=$name gpu=$gpu guide=$guide P=$P extra=${extra[*]:-} (backstop ${BACKSTOP}s)"
   local t0=$(date +%s)
   if [ "${DRY_RUN:-0}" = "1" ]; then
-    echo "DRY: timeout -k 60 $BACKSTOP env CUDA_VISIBLE_DEVICES=$gpu SCOUT_RENDER_GPU=$gpu PYTHON=$PY CLEANUP_SHARDS=0 bash scripts/infra/shard_rollout.sh $P $T/$name/log/explore.json $T/$name/success.hdf5 $T/$name/all.hdf5 $CORE -- --config $T/cfg_${name}.yaml --task can --exp-num $ROUND --base-dp-ckpt $DP --core-hdf5 $CORE --vib-ckpt $VIB --guide $guide ${extra[@]+"${extra[@]}"} --explore-mode rescue --explore-try-times $TRIES --failed-set-json $FAILED --n-envs 25 --seed 42 --eval-seed 42 --no-wandb --output-dir $T/$name --output-success $T/$name/success.hdf5 --output-all $T/$name/all.hdf5 > $T/$name.stdout 2>&1"
+    echo "DRY: timeout -k 60 $BACKSTOP env CUDA_VISIBLE_DEVICES=$gpu SCOUT_RENDER_GPU=$gpu PYTHON=$PY CLEANUP_SHARDS=0 bash scripts/infra/shard_rollout.sh $P $T/$name/log/explore.json $T/$name/success.hdf5 $T/$name/all.hdf5 $CORE -- --config $T/cfg_${name}.yaml --task can --exp-num $ROUND --base-dp-ckpt $DP --core-hdf5 $CORE --vib-ckpt $VIB --guide $guide ${extra[@]+"${extra[@]}"} --explore-mode rescue --explore-try-times $TRIES --failed-set-json $WIN --n-envs 25 --seed 42 --eval-seed 42 --no-wandb --output-dir $T/$name --output-success $T/$name/success.hdf5 --output-all $T/$name/all.hdf5 > $T/$name.stdout 2>&1"
     return 0
   fi
   mkdir -p "$T/$name/log"
@@ -127,7 +151,7 @@ run_arm() { # name gpu guide extra...
       --base-dp-ckpt "$DP" --core-hdf5 "$CORE" --vib-ckpt "$VIB" \
       --guide "$guide" ${extra[@]+"${extra[@]}"} \
       --explore-mode rescue --explore-try-times "$TRIES" \
-      --failed-set-json "$FAILED" \
+      --failed-set-json "$WIN" \
       --n-envs 25 --seed 42 --eval-seed 42 \
       --no-wandb \
       --output-dir "$T/$name" --output-success "$T/$name/success.hdf5" \
@@ -143,7 +167,7 @@ run_arm() { # name gpu guide extra...
   echo "[gae-probe] arm=$name rc=$rc wall=$(( (t1-t0)/60 ))m$(( (t1-t0)%60 ))s"
 }
 
-echo "[gae-probe] ROUND=$ROUND P=$P TRIES=$TRIES aty(scale/cap/gst)=$ATY_SCALE/$CAP/$GST gae(gamma/norm)=$GAE_GAMMA/$GAE_NORM gpus aty/gae=$GPU_ATY/$GPU_GAE"
+echo "[gae-probe] ROUND=$ROUND OFF=$OFF N=$N P=$P TRIES=$TRIES aty(scale/cap/gst)=$ATY_SCALE/$CAP/$GST gae(gamma/norm)=$GAE_GAMMA/$GAE_NORM gpus aty/gae=$GPU_ATY/$GPU_GAE"
 GAE_ARGS=(--atypical-cap "$CAP" --gae-gamma "$GAE_GAMMA" --gae-norm "$GAE_NORM")
 run_arm gae "$GPU_GAE" gaelike ${GAE_ARGS[@]+"${GAE_ARGS[@]}"} &
 GAE_PID=$!
@@ -204,6 +228,19 @@ with open(ledger, "a", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
     if new: w.writeheader()
     w.writerows(rows)
+from collections import defaultdict
+if not new:
+    acc = defaultdict(lambda: [0, 0])
+    with open(ledger) as f:
+        for r in csv.DictReader(f):
+            try:
+                acc[r["arm"]][0] += int(r["rescued"])
+                acc[r["arm"]][1] += int(r["n"])
+            except (TypeError, ValueError, KeyError):
+                pass
+    print("[gae-probe] CUMULATIVE (all rounds so far): " + " ".join(
+        f"{a}={s}/{n} rescue_rate={s/max(n,1):.3f}"
+        for a, (s, n) in sorted(acc.items())))
 PYEOF
 
 # ---- post-hoc render-integrity check (report-only) ----------------------- #
