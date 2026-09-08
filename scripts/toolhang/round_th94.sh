@@ -1,40 +1,32 @@
 #!/bin/bash
-# round_orbit_th.sh (2026-09-01) -- orbit-native chain driver for TOOL_HANG,
-# running in the scout-orbit worktree (orbit-dev branch: orbit cost code +
-# shard_rollout.sh/merge_sharded.py live here). COPY of scout-rand's
-# round_orbit.sh (the live square-chain driver) with these deltas:
-#   * task whitelist += tool_hang;
-#   * [1/3] rollout is TWO-PHASE SHARDED (user 2026-09-01: cpu workers=4,
-#     25 envs each):
-#       phase A (monolithic, n_envs=$EVALNENV): --eval-only
-#         --save-failed-set  -> eval metrics + wandb run (id RID) + failed.json;
-#       phase B (sharded): shard_rollout.sh $SHARD_P workers x n_envs=$SHARD_ENVS
-#         on the SAME GPU, --failed-set-json failed.json --no-wandb, then the
-#         driver merges success.hdf5/all.hdf5/json (CLEANUP_SHARDS=1 leaves
-#         only the merged three-piece set);
-#       after merge, explore/pass@10 (+ rescued) is backfilled into the
-#       phase-A wandb run so the 7-key minimal contract stays intact;
-#   * DYN_FREEZE_AFTER default 8 (chain runs 8 rounds; dyn retrained every
-#     full round 1..7, consistent with the 2026-08-24 "dyn EVERY round" order);
-#   * MODE=eval-only (round 8) = phase A only: no failed-set file, no explore,
-#     no retrains.
-# Everything else inherited verbatim: TSEED controls split/init/shuffle/crop +
-# DP training.seed + dyn cfg.seed; CUDA determinism; idempotent round 0
-# (seeded 20-of-200 split + base DP 600ep + dyn-base) SHARED by the seed's
-# two arms; orbit explore params (ATT_CAP 2.5, lam 0.5, delta 0.25, sigma 0.25;
-# dose scale from configs/eval_${TASK}_entropy.yaml); XMODE=soe ETRIES=10;
-# DP retrain 300ep / dyn 100ep (SOE budget); wandb one project PER SEED.
+# round_th94.sh (2026-09-04) -- TOOLHANG-9-4-orbit-s233 round driver, running in
+# the scout-th94 worktree (plain extract of origin/orbit-dev@796bf8c: KLCost-
+# Planner refactor 4e0877e+76e2adc + TrajSpool OOM fix 6f3d844..796bf8c;
+# scripts/ layout). COPY of scout-orbit's soe_scripts/round_orbit_th.sh with
+# these deltas:
+#   * REPO = scout-th94; soe_scripts/{shard_rollout.sh,shard_heartbeat.py} ->
+#     scripts/infra/, split_core.py -> scripts/analysis/;
+#   * SCOUT arm = ATYPICAL raw dose (user order 2026-09-04: s1.0 / cap 2.5 /
+#     gst 50, config configs/eval_tool_hang_entropy.yaml FINAL 1.0/50): GEXTRA
+#     = --atypical-cap $ATT_CAP --guidance-scale $ATY_SCALE (raw, NO dimless);
+#   * wandb run names = $WNAME_BASE-round$NUM (user order: DP-round{i} /
+#     SCOUT-round{i}); WNAME_BASE defaults to $A (no -s$TSEED);
+#   * phase-B shard workers run with --flush-every $FLUSH_EVERY (TrajSpool
+#     incremental hdf5, memory bounded; final files value-identical).
+# Everything else inherited verbatim from round_orbit_th.sh (two-phase sharded
+# rescue, TSEED determinism, DP 300ep / dyn 100ep SOE budget, walk-back,
+# anti-deadlock retrain, heartbeat reporter, wandb backfill).
 #
-# Usage:  round_orbit_th.sh <tool_hang> <BASE|SCOUT|DP> <num> [full|eval-only]
+# Usage:  round_th94.sh <tool_hang> <BASE|SCOUT|DP> <num> [full|eval-only]
 # Env:    GPU=<id> TSEED=<int> DATA_ROOT=<abs dir> (required)
-#         WPROJ=<wandb project> ATT_CAP=2.5 DYN_FREEZE_AFTER=8
-#         SHARD_P=4 SHARD_ENVS=25 EVALNENV=25
+#         WPROJ=<wandb project> ATT_CAP=2.5 ATY_SCALE=1.0 DYN_FREEZE_AFTER=6
+#         SHARD_P=4 SHARD_ENVS=25 EVALNENV=25 ETRIES=10 FLUSH_EVERY=100
 # Layout: $DATA_ROOT/tool_hang/{rollout/,train/DP/,train/dyn/}.
 set -u
 
-TASK=${1:?usage: round_orbit_th.sh <task> <BASE|SCOUT|DP> <num> [mode]}
-A=${2:?usage: round_orbit_th.sh <task> <BASE|SCOUT|DP> <num> [mode]}
-NUM=${3:?usage: round_orbit_th.sh <task> <BASE|SCOUT|DP> <num> [mode]}
+TASK=${1:?usage: round_th94.sh <task> <BASE|SCOUT|DP> <num> [mode]}
+A=${2:?usage: round_th94.sh <task> <BASE|SCOUT|DP> <num> [mode]}
+NUM=${3:?usage: round_th94.sh <task> <BASE|SCOUT|DP> <num> [mode]}
 case "$TASK" in
   can)      TASKUP=CAN ;;
   square)   TASKUP=SQUARE ;;
@@ -56,46 +48,39 @@ esac
 GPU=${GPU:?set GPU=<cuda id>}
 TSEED=${TSEED:?set TSEED=<training seed -- controls split/init/shuffle/crop>}
 DATA_ROOT=${DATA_ROOT:?set DATA_ROOT=<experiment dir>}
-DYN_FREEZE_AFTER=${DYN_FREEZE_AFTER:-8}   # 8-round chain: dyn EVERY full round (user 2026-08-24)
+DYN_FREEZE_AFTER=${DYN_FREEZE_AFTER:-6}   # 6-round chain: dyn EVERY full round
 ATT_CAP=${ATT_CAP:-2.5}         # entropy cost: KL-bonus cap kappa (calibrated)
-SHARD_P=${SHARD_P:-2}           # explore shard workers (user 2026-09-02: 4x25 OOM-killed at ~870G RAM with 16 workers; 2x25 per chain)
-SHARD_ENVS=${SHARD_ENVS:-25}    # envs per shard worker (user 2026-09-01)
+ATY_SCALE=${ATY_SCALE:-1.0}     # atypical RAW dose (FINAL 2026-09-04, no dimless)
+SHARD_P=${SHARD_P:-4}           # explore shard workers (user 2026-09-04: 4/arm)
+SHARD_ENVS=${SHARD_ENVS:-25}    # envs per shard worker
 EVALNENV=${EVALNENV:-25}        # eval-phase (monolithic) n_envs
+FLUSH_EVERY=${FLUSH_EVERY:-100} # TrajSpool staging flush (OOM fix 6f3d844)
 SEED=42                       # eval phase: FIXED scene set every round (42..141)
-# XMODE=soe (2026-08-23): explore = retry ONLY the failed eval inits (the SAME
-# scenes/initial states as eval) x ETRIES each; DP data = successful retries;
-# dyn data = per failed init {successful retries if any, else FIRST retry}.
-# Fixed budgets: DP_EPOCHS_SOE=300, DYN_EPOCHS_SOE=100.
 XMODE=${XMODE:-soe}
-# soe-only: the two-phase sharded [1/3] implements the rescue protocol; the
-# fresh-scene explore path of the old round.sh generation is NOT ported here.
 case "$XMODE" in soe) ;; *) echo "XMODE must be soe (got: $XMODE)"; exit 1 ;; esac
 ETRIES=${ETRIES:-10}
 
 export MUJOCO_GL=egl
 export TMPDIR=/tmp            # MUST be local (CPFS TMPDIR kills torch_shm_manager)
 export CUBLAS_WORKSPACE_CONFIG=:4096:8   # T2: deterministic cuBLAS GEMM
-# spread offscreen rendering one GPU per chain (rollout.py env factory)
 export SCOUT_RENDER_GPU=$GPU
 export PYTHONUNBUFFERED=1
 set -a; . /root/workspace/baojiachun/.secrets/wandb.env; set +a
 export WANDB_DIR=/root/workspace/baojiachun/wandb_runs
 export WANDB_CACHE_DIR=/root/workspace/baojiachun/.cache/wandb
 
-REPO=/root/workspace/baojiachun/scout-orbit
+REPO=/root/workspace/baojiachun/scout-th94
 PY=/root/workspace/baojiachun/.venv/bin/python
 DATA=$DATA_ROOT
 TDP=$DATA/$TASK/train/DP
 TDYN=$DATA/$TASK/train/dyn
 CORE=$DATA/$TASK/rollout/${TASK}_core.hdf5
 LOG=$DATA/$TASK/round.log
-WPROJ=${WPROJ:-TOOLHANG-9-1-orbit-s${TSEED}}
+WPROJ=${WPROJ:-TOOLHANG-9-4-orbit-s${TSEED}}
 mkdir -p "$TDP" "$TDYN" "$(dirname "$CORE")"
 cd "$REPO" || exit 1
 exec 3>&1
 
-# DRY_RUN must not append to round.log (a fake TOTAL line would trip
-# wait_launch_dp.sh into launching the DP arm prematurely).
 log(){
   echo "[$(date '+%F %T')] $*"
   [ "${DRY_RUN:-0}" = 1 ] || echo "[$(date '+%F %T')] $*" >> "$LOG"
@@ -110,7 +95,6 @@ RUN(){
 newest_ckpt(){ ls -t "$1"/checkpoints/*.ckpt 2>/dev/null | head -1; }
 newest_vib(){  ls -t "$1"/*/scout_vib.ckpt  2>/dev/null | head -1; }
 
-# DP/dyn hydra/yaml overrides shared by EVERY training stage (T1+T2).
 DPOPTS=(training.seed="$TSEED" training.resume=False training.rollout_every=0
         training.sample_every=100 training.cudnn_benchmark=false
         +training.cudnn_deterministic=true training.device=cuda:0)
@@ -127,16 +111,14 @@ if [ "$A" = BASE ]; then
   T0=$(date +%s)
   log "=== ROUND0 $TASK seed=$TSEED START (GPU$GPU; official=$OFFICIAL) ==="
 
-  # [0/3] seeded 20-of-200 core split
   if [ -f "$CORE" ]; then
     log "[0/3] core exists -- skip split ($CORE)"
   else
-    log "[0/3] split: 20 of 200 demos, rng seed $TSEED -> $CORE"
-    RUN "$PY" soe_scripts/split_core.py "$OFFICIAL" "$CORE" 20 "$TSEED" \
+    log "[0/3] split: 40 of 200 demos, rng seed $TSEED -> $CORE"
+    RUN "$PY" scripts/analysis/split_core.py "$OFFICIAL" "$CORE" 40 "$TSEED" \
       || { log "SPLIT FAILED"; exit 1; }
   fi
 
-  # [1/3] base DP: 600ep on the core (seeded + deterministic)
   if [ -n "$(newest_ckpt "$TDP/DP-base")" ]; then
     log "[1/3] DP-base ckpt exists -- skip"
   else
@@ -174,7 +156,6 @@ if [ "$A" = BASE ]; then
     [ $RC -ne 0 ] && { log "BASE DP FAILED - see $TDP/DP-base/train.log"; exit 1; }
   fi
 
-  # [2/3] dyn-base on the core (E_s from the fresh DP-base)
   if [ -n "$(newest_vib "$TDYN/dyn-base")" ]; then
     log "[2/3] dyn-base ckpt exists -- skip"
   else
@@ -224,15 +205,16 @@ OUTDP=$TDP/DP-$A-exp$NUM
 OUTDYN=$TDYN/dyn-$A-exp$NUM
 mkdir -p "$RDIR" "$OUTDP" "$OUTDYN"
 RLOG=$RDIR/rollout.stdout; DPLOG=$OUTDP/train.log; DYNLOG=$OUTDYN/train.log
-WNAME=${A}-s${TSEED}-round${NUM}
+WNAME_BASE=${WNAME_BASE:-$A}
+WNAME=${WNAME_BASE}-round${NUM}
 
 for f in configs/eval_${TASK}_entropy.yaml configs/vib_${TASK}_exp1.yaml \
-         configs/base_dp_${TASK}_image.yaml soe_scripts/shard_rollout.sh; do
+         configs/base_dp_${TASK}_image.yaml scripts/infra/shard_rollout.sh; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
-[ -n "$(newest_ckpt "$TDP/DP-base")" ] || { echo "no DP-base ckpt (run: round_orbit_th.sh $TASK BASE 0)"; exit 1; }
+[ -n "$(newest_ckpt "$TDP/DP-base")" ] || { echo "no DP-base ckpt (run: round_th94.sh $TASK BASE 0)"; exit 1; }
 [ -n "$(newest_vib "$TDYN/dyn-base")" ] || [ "$A" = DP ] \
-  || { echo "no dyn-base ckpt (run: round_orbit_th.sh $TASK BASE 0)"; exit 1; }
+  || { echo "no dyn-base ckpt (run: round_th94.sh $TASK BASE 0)"; exit 1; }
 
 # ---- resolve this round's rollout inputs (walk-back, fallback to base) ---- #
 PREV=$((NUM - 1))
@@ -246,7 +228,6 @@ DPCKPT=$(newest_ckpt "$DPROLL")
 VIBARGS=()
 VIBDIR=""
 if [ "$A" = SCOUT ]; then
-  # walk-back to the nearest TRAINED dyn (freeze-aware)
   VIBDIR=$TDYN/dyn-base
   for e in $(seq "$PREV" -1 1); do
     if [ -n "$(newest_vib "$TDYN/dyn-$A-exp$e")" ]; then VIBDIR=$TDYN/dyn-$A-exp$e; break; fi
@@ -261,7 +242,7 @@ log "=== ROUND $TASK a=$A seed=$TSEED round=$NUM mode=$MODE START (GPU$GPU; roll
 
 # ---- [1/3] rollout: TWO-PHASE SHARDED rescue (eval monolithic + explore P workers)
 GUIDE=off; GEXTRA=()
-[ "$A" = SCOUT ] && { GUIDE=orbit; GEXTRA=(--atypical-cap "$ATT_CAP" --orbit-lam 0.5 --orbit-delta 0.25 --orbit-sigma 0.25); }
+[ "$A" = SCOUT ] && { GUIDE=atypical; GEXTRA=(--atypical-cap "$ATT_CAP" --guidance-scale "$ATY_SCALE"); }
 EXPLORE_JSON=$RDIR/log/${TASK}_${A}_explore_exp${NUM}.json
 
 if [ "${SKIP_ROLLOUT:-0}" = 1 ] && [ -f "$RDIR/all.hdf5" ]; then
@@ -289,14 +270,12 @@ elif [ "$MODE" = "eval-only" ]; then
   [ $RC -ne 0 ] && { log "[1/3] eval-only rollout rc=$RC -- see $RLOG"; exit 1; }
 else
   # -- phase A: eval + freeze the failed set (monolithic, carries the wandb run)
-  # resume path (2026-09-02 OOM incident): a crashed phase B leaves failed.json
-  # + the phase-A eval json behind -- reuse them instead of re-rolling eval.
   if [ -f "$RDIR/failed.json" ] \
      && [ -f "$RDIR/log/${TASK}_${A}_rollout_exp${NUM}.json" ] \
      && [ ! -f "$RDIR/all.hdf5" ]; then
     log "[1/3a] resume: failed.json + eval json intact from a crashed phase B -- skip eval, reuse frozen failed set"
   else
-  rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5" "$RDIR/failed.json"; rm -rf "$RDIR/log"
+  rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5" "$RDIR/failed.json" "$RDIR"/success.hdf5.spool "$RDIR"/all.hdf5.spool; rm -rf "$RDIR/log"
   log "[1/3a] eval phase guide=$GUIDE n_envs=$EVALNENV eval=$SEED(100) dp=$DPCKPT -> failed.json"
   RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU $PY -m scout.eval.run_rollout \
     --config configs/eval_${TASK}_entropy.yaml --task "$TASK" --exp-num "$NUM" \
@@ -321,14 +300,7 @@ else
   fi
 
   # -- phase B: sharded rescue explore (P workers x SHARD_ENVS envs, one GPU)
-  # (2026-09-02 user order: the global phase-B flock + the MemAvailable gate
-  # were REMOVED -- phase B now starts unconditionally, right after phase A.)
-  log "[1/3b] explore phase: $SHARD_P workers x n_envs=$SHARD_ENVS guide=$GUIDE failed-of-eval(x$ETRIES) -> merged $EXPLORE_JSON"
-  # -- heartbeat reporter (2026-09-02 user order): during sharded phase B the
-  # workers are --no-wandb, so progress/CPU-memory were invisible for hours
-  # (OOM discovered late). The reporter polls shard stdouts (workers now print
-  # unconditional [explore-hb] lines) + per-worker VmRSS + system memory, and
-  # wandb-logs explore_hb/* into the phase-A run; killed when phase B returns.
+  log "[1/3b] explore phase: $SHARD_P workers x n_envs=$SHARD_ENVS guide=$GUIDE failed-of-eval(x$ETRIES) flush_every=$FLUSH_EVERY -> merged $EXPLORE_JSON"
   HB_PID=""
   if [ "${DRY_RUN:-0}" != 1 ]; then
     RID_HB=$($PY - "$RDIR/log" <<'PYEOF'
@@ -346,13 +318,8 @@ print(rid)
 PYEOF
 )
     if [ -n "$RID_HB" ]; then
-      # clear any ORPHANED heartbeat from a crashed phase B (resume path):
-      # it would match the new workers, never see them missing, and double-log
-      # into the same run. Pattern includes "$RDIR " (pkill joins argv with
-      # spaces) so other arms/rounds are never caught by prefix.
       pkill -f "shard_heartbeat.py.*--match $RDIR " 2>/dev/null && sleep 2
-      # 3>&-: do not inherit the DRY_RUN argv fd.
-      nohup $PY soe_scripts/shard_heartbeat.py --project "$WPROJ" --run-id "$RID_HB" \
+      nohup $PY scripts/infra/shard_heartbeat.py --project "$WPROJ" --run-id "$RID_HB" \
         --shard-glob "$RDIR/log/shard*.stdout" --match "$RDIR" \
         --stop-file "$RDIR/all.hdf5" --log-file "$RDIR/heartbeat.log" \
         >> "$RDIR/heartbeat.stdout" 2>&1 3>&- &
@@ -363,7 +330,7 @@ PYEOF
     fi
   fi
   RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU PYTHON=$PY CLEANUP_SHARDS=1 \
-    bash soe_scripts/shard_rollout.sh "$SHARD_P" \
+    bash scripts/infra/shard_rollout.sh "$SHARD_P" \
     "$EXPLORE_JSON" \
     "$RDIR/success.hdf5" \
     "$RDIR/all.hdf5" \
@@ -377,6 +344,7 @@ PYEOF
     --explore-mode rescue --explore-try-times "$ETRIES" \
     --failed-set-json "$RDIR/failed.json" \
     --n-envs "$SHARD_ENVS" \
+    --flush-every "$FLUSH_EVERY" \
     ${VIBARGS[@]+"${VIBARGS[@]}"} \
     ${GEXTRA[@]+"${GEXTRA[@]}"} \
     --no-wandb \
@@ -427,7 +395,6 @@ PYEOF
 fi
 T1=$(date +%s)
 
-# the rollout json carries the shared wandb run id for the retrains
 RID=$($PY - "$RDIR/log" <<'PYEOF'
 import sys, json, glob, os
 rid = ""
@@ -525,9 +492,9 @@ CFG=$OUTDYN/config.yaml
 NEWDP=$(newest_ckpt "$OUTDP")
 DYN_EPOCHS=0
 [ "$XMODE" = soe ] && DYN_EPOCHS=${DYN_EPOCHS_SOE:-100}
-$PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TSEED" "$WPROJ" "$TASK" "$CORE" "$DYN_EPOCHS" <<'PYEOF'
+$PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TSEED" "$WPROJ" "$TASK" "$CORE" "$DYN_EPOCHS" "$WNAME" <<'PYEOF'
 import sys, yaml, glob, os, re
-cfg_path, rdir, outdyn, outdp, a_tag, num, tseed, wproj, task, core_path, dyn_ep = sys.argv[1:12]
+cfg_path, rdir, outdyn, outdp, a_tag, num, tseed, wproj, task, core_path, dyn_ep, wname = sys.argv[1:13]
 sys.path.insert(0, os.getcwd())
 from scout.eval.hdf5_writer import merge_accumulated_hdf5
 
@@ -555,12 +522,12 @@ cfg["cudnn_deterministic"] = True
 if int(dyn_ep) > 0:
     cfg["num_epochs"] = int(dyn_ep)   # soe fixed budget (default 100)
 cfg["save_dir"] = outdyn
-cfg.setdefault("wandb", {})["name"] = f"{a_tag}-s{tseed}-round{num}"
+cfg.setdefault("wandb", {})["name"] = wname
 cfg["wandb"]["project"] = wproj
 cfg["wandb"]["minimal"] = True
 with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f"[dyn-cfg] seed={tseed} ds={accum} es={ck[-1] if ck else None} -> {outdyn}")
+print(f"[dyn-cfg] seed={tseed} ds={accum} es={ck[-1] if ck else None} -> {outdyn} name={wname}")
 PYEOF
 log "[3/3] dyn retrain: seed=$TSEED ep=${DYN_EPOCHS:-cfg} ds=$RDIR/all_accum.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
 RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY -m scout.train_vib \

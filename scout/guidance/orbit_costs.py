@@ -58,19 +58,18 @@ no noise is drawn, and the extra backward consumes no RNG).
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import torch
 
-from scout.guidance.entropy_costs import (AtypicalCostPlanner, _enc_forward,
-                                          _kl_rows)
-from scout.guidance.planner import ScoutPlanner
+from scout.guidance.entropy_costs import KLCostPlanner
 
 
 def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
                        lam: float, delta: float, sigma: float,
                        noise_scale: float = 1.0,
-                       xi_override: Optional[torch.Tensor] = None):
+                       xi_override: Optional[torch.Tensor] = None,
+                       fb_clamp: str = "none"):
     """Pure phase-2 math (unit-tested directly): given the per-row UNCAPPED
     cost ``kl`` (B,) and its per-row gradient w.r.t. the trajectory ``g``
     (B, T, Da) -- block-diagonal, so row slices are per-row gradients of the
@@ -87,14 +86,37 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
     the CURRENT row normal exactly like the i.i.d. draw, so a fixed vector
     yields a persistent great-circle walk on the shell instead of a random
     walk. ``None`` -> the original i.i.d. draw (bit-identical).
+
+    ``fb_clamp`` (user 2026-09-02, option C): "soft" soft-clamps the Newton
+    residual  (kl - kappa) -> delta * tanh((kl - kappa)/delta)  so the
+    feedback pull saturates at lam*delta/||g|| far off the shell instead of
+    growing with the shell-saturated KL (chain VIB KL distributions drift
+    right -- late-round rows sit far above kappa and the unbounded residual
+    turned the feedback into large per-step jerks: sqR5 fb=0.55, canR2
+    fb=0.61 vs the healthy 0.24-0.33). In-band (|kl-kappa| << delta) tanh is
+    linear to O(x^3/delta^2) -- the cold-start regime is untouched
+    analytically. The tangential NOISE is additionally restricted to the
+    band [kappa-delta, kappa+delta] (off-band rows are not on the shell;
+    touring there is meaningless) -- the randn is still DRAWN and the
+    component zeroed afterwards, so the RNG stream stays identical to the
+    other modes (bit-comparability across arms). "none" (default) is
+    bit-identical legacy.
     """
     kl_d = kl.detach()
     p2 = kl_d >= (float(kappa) - float(delta))
     gnorm2 = (g.detach() ** 2).flatten(1).sum(dim=1)             # (B,)
     small = gnorm2 < 1e-16            # flat rows: Newton direction undefined
     safe = gnorm2.clamp(min=1e-16)
+    if str(fb_clamp) == "soft":
+        resid = float(delta) * torch.tanh(
+            (kl_d - float(kappa)) / float(delta))
+    elif str(fb_clamp) == "none":
+        resid = kl_d - float(kappa)
+    else:
+        raise ValueError(f"fb_clamp must be 'none' or 'soft', got "
+                         f"{fb_clamp!r}")
     fb_coeff = torch.where(small, torch.zeros_like(kl_d),
-                           -float(lam) * (kl_d - float(kappa)) / safe)
+                           -float(lam) * resid / safe)
     fb = fb_coeff[:, None, None] * g                               # (B,T,Da)
     noise = torch.zeros_like(g)
     if float(sigma) > 0.0:
@@ -112,6 +134,10 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
             xi = xi_override.detach().to(device=g.device, dtype=g.dtype)
         dot = (xi * ghat).flatten(1).sum(dim=1)
         noise = float(noise_scale) * float(sigma) * (xi - dot[:, None, None] * ghat)
+        if str(fb_clamp) == "soft":
+            band = ((kl_d >= float(kappa) - float(delta))
+                    & (kl_d <= float(kappa) + float(delta)))
+            noise = noise * band.to(noise.dtype)[:, None, None]
     mask = p2.to(g.dtype)[:, None, None]
     disp = (fb + noise) * mask
     stats = ((fb_coeff.abs() * safe.sqrt()).detach(),
@@ -119,17 +145,29 @@ def orbit_displacement(kl: torch.Tensor, g: torch.Tensor, kappa: float,
     return disp, p2.to(g.dtype), stats
 
 
-class OrbitCostPlanner(ScoutPlanner):
-    """Entropy cost + two-phase constrained control (orbit).
+class OrbitCostPlanner(KLCostPlanner):
+    """KL cost + two-phase constrained control (orbit).
 
-    The phase-1 climb (per-chunk KL-to-own-intent, capped) and the phase-2
-    constrained update are computed TOGETHER by :meth:`orbit_step` -- the
-    duck-typed hook consumed by policy.py's injection line -- from ONE
-    encoder forward and ONE backward through the shared graph (merged
-    2026-09-01; the pre-merge code ran a capped compute_loss backward PLUS a
-    second uncapped forward+backward, both traversing the UNet, per guided
-    denoise step). Rows are INDEPENDENT (no inter-particle coupling) -- no
-    group lock, i.i.d. retries exactly as atypical.
+    Subclass of :class:`~scout.guidance.entropy_costs.KLCostPlanner`
+    (2026-09-04 refactor, user order -- previously a wrapper holding an
+    internal AtypicalCostPlanner instance): phase 1 -- the capped KL climb,
+    the merged single-backward guided step and the eta_tilde normalization
+    -- is inherited VERBATIM from the base (identical parameters and
+    structure), and the ONLY additions are phase 2: the per-row two-phase
+    switch at KL >= kappa - delta, the Newton feedback + tangential noise
+    of :func:`orbit_displacement`, and the orbit-only knobs/telemetry
+    (sector / ray / noise-anneal / round-decay / fb-clamp). "atypical vs
+    orbit" is thereby the exact decomposition "phase 1 only" vs
+    "phase 1 + phase 2".
+
+    The phase-1 climb and the phase-2 constrained update are computed
+    TOGETHER by :meth:`guided_step` -- the duck-typed hook consumed by
+    policy.py's injection line -- from ONE encoder forward and ONE backward
+    through the shared graph (merged 2026-09-01; the pre-merge code ran a
+    capped compute_loss backward PLUS a second uncapped forward+backward,
+    both traversing the UNet, per guided denoise step). Rows are
+    INDEPENDENT (no inter-particle coupling) -- no group lock, i.i.d.
+    retries exactly as atypical.
     """
 
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
@@ -138,11 +176,13 @@ class OrbitCostPlanner(ScoutPlanner):
                  orbit_sigma: float = 0.25,
                  orbit_sector: str = "iid", orbit_sector_seed: int = 42,
                  orbit_noise_anneal: float = 1.0,
-                 orbit_climb: str = "grad", orbit_ray_seed: int = 42):
-        super().__init__(scout_vib, bridge=bridge, z=None,
-                         obs_adapter=obs_adapter)
-        self._att = AtypicalCostPlanner(scout_vib, bridge=bridge,
-                                        obs_adapter=obs_adapter, cap=cap)
+                 orbit_climb: str = "grad", orbit_ray_seed: int = 42,
+                 eta_dimless: bool = False,
+                 orbit_round: int = 1,
+                 orbit_sigma_decay: float = 1.0,
+                 orbit_fb_clamp: str = "none"):
+        super().__init__(scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                         cap=cap, eta_dimless=eta_dimless)
         self.orbit_lam = float(orbit_lam)
         # guard: kappa - delta <= 0 would put EVERY row (KL~0 included) in
         # phase 2 and turn the run into unprojected noise-everything; clamp
@@ -154,7 +194,49 @@ class OrbitCostPlanner(ScoutPlanner):
                   f"-- phase 2 would otherwise swallow every row",
                   flush=True)
         self.orbit_delta = float(orbit_delta)
+        # phase-2 handover rows [cap-delta, cap) do not inject the climb
+        # (they get the constrained update instead) -- exclude them from the
+        # inherited eta_tilde divisor as well; the base default is 0 (every
+        # injecting row counts).
+        self._norm_band = self.orbit_delta
         self.orbit_sigma = float(orbit_sigma)
+        # eta-dimless: the normalization itself lives in the base class
+        # (KLCostPlanner._climb_gradient, 2026-09-04 refactor) so atypical
+        # and orbit share it; this subclass only narrows the live-row set
+        # via _norm_band = orbit_delta above. OFF (default) = bit-identical
+        # legacy injection.
+        # Round-dependent sigma ceiling (user order 2026-09-02): the chain's
+        # retrained VIB co-adapts to the guidance's rescued trajectories, so
+        # the DP/VIB stack settles onto the rescue ridge -- late rounds the
+        # tangential noise only kicks retries OFF that ridge (orbit rescue
+        # 36 -> 17 -> 12 -> 14 -> 0 on square while atypical stays 22 at the
+        # same trio). Effective ceiling:
+        #     sigma_eff(round) = orbit_sigma * orbit_sigma_decay ** (round-1)
+        # decay=1.0 (default) = round-independent = bit-identical legacy.
+        # Compose with --orbit-noise-anneal p for the per-DENOISE-step
+        # exponent (noise carries (1-abar_t)^(p/2), already shipped as B3).
+        if int(orbit_round) < 1:
+            raise ValueError(f"orbit_round must be >= 1, got {orbit_round!r}")
+        if not (0.0 < float(orbit_sigma_decay) <= 1.0):
+            raise ValueError(f"orbit_sigma_decay must be in (0, 1], got "
+                             f"{orbit_sigma_decay!r}")
+        self.orbit_round = int(orbit_round)
+        self.orbit_sigma_decay = float(orbit_sigma_decay)
+        self.orbit_sigma_eff = float(orbit_sigma) * (
+            self.orbit_sigma_decay ** (self.orbit_round - 1))
+        # fb soft-clamp (user 2026-09-02, option C): saturate the Newton
+        # residual at delta (tanh) + restrict the tangential noise to the
+        # band -- see orbit_displacement. "none" (default) = bit-identical.
+        if str(orbit_fb_clamp) not in ("none", "soft"):
+            raise ValueError(f"orbit_fb_clamp must be 'none' or 'soft', "
+                             f"got {orbit_fb_clamp!r}")
+        self.orbit_fb_clamp = str(orbit_fb_clamp)
+        if 0.0 < self.orbit_sigma_eff < 1e-12:
+            # the round schedule switched the noise OFF numerically -- snap
+            # to exact 0.0 so orbit_displacement draws NO randn (a residual
+            # 1e-19 magnitude would still shift the trajectory RNG stream;
+            # check 18c). Guard above requires orbit_sigma > 0 to reach here.
+            self.orbit_sigma_eff = 0.0
         # sector mode (B2, 2026-08-31 beat-SOE campaign): "iid" = per-step
         # i.i.d. tangent noise (original, bit-identical default); "det" =
         # per-(init, try) DETERMINISTIC direction vector, cached for the
@@ -210,12 +292,16 @@ class OrbitCostPlanner(ScoutPlanner):
         self._ray_calls = 0
         # telemetry (dose calibration reads this): device-side accumulators,
         # host sync only on the print tick (the pg-telemetry pattern).
-        self._orb_calls = 0          # orbit_step invocations
+        self._orb_calls = 0          # guided_step invocations
         self._orb_rows = 0           # rows seen (host int -- shape, no sync)
         self._orb_p2_rows = 0        # rows that entered phase 2 (print tick)
         self._p2_acc: Optional[torch.Tensor] = None    # device sum of p2
         self._fb_acc: Optional[torch.Tensor] = None    # sum per-row |fb| norm
         self._noise_acc: Optional[torch.Tensor] = None  # sum per-row noise norm
+        # fb soft-clamp diagnostics (device-side; sync on print tick)
+        self._sat_acc: Optional[torch.Tensor] = None
+        self._gsh_n_acc: Optional[torch.Tensor] = None
+        self._gsh_s_acc: Optional[torch.Tensor] = None
 
     @property
     def p2_rows(self) -> int:
@@ -224,8 +310,8 @@ class OrbitCostPlanner(ScoutPlanner):
         return int(self._p2_acc) if self._p2_acc is not None else 0
 
     # -- context plumbing (rollout_vec._replan hooks) ---------------------- #
-    def set_row_context(self, init_ids: Sequence):
-        pass    # rows are independent; hook fires regardless (atypical idem)
+    # set_row_context: inherited no-op from KLCostPlanner (rows are
+    # independent; the hook fires regardless).
 
     def set_row_jobs(self, jobs):
         """Per-replan row jobs ``[(state, init_idx, try_idx), ...]`` (engine
@@ -355,47 +441,29 @@ class OrbitCostPlanner(ScoutPlanner):
                   flush=True)
         return out
 
-    def select_z(self, x0_hat: torch.Tensor, current_obs=None):
-        """Per-chunk intent anchor (mu^0, sigma^0^2) -- delegated verbatim to
-        the atypical planner (captured at the FIRST guided denoise step)."""
-        return self._att.select_z(x0_hat, current_obs)
-
-    def set_current_obs(self, current_obs):
-        self._att.set_current_obs(current_obs)
-
-    # -- the cost (phase 1, verbatim atypical) ------------------------------ #
-    def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
-                     reduction: str = "mean") -> torch.Tensor:
-        return self._att.compute_loss(x0_hat, current_obs, reduction)
+    # select_z / set_current_obs / compute_loss: inherited VERBATIM from
+    # KLCostPlanner (the old wrapper delegated these to its internal
+    # AtypicalCostPlanner -- same code, one object fewer).
 
     # -- the merged guided step (phase 1 + phase 2) ------------------------- #
-    def orbit_step(self, trajectory: torch.Tensor, x0_hat: torch.Tensor,
-                   current_obs=None, noise_scale: float = 1.0):
-        """ONE encoder forward + ONE backward through the shared graph serve
-        BOTH guidance consumers (perf 2026-09-01, 方案一; replaces the
-        pre-merge compute_loss backward + a second ``_encode_and_uncapped``
-        forward + second backward -- the guided denoise loop used to run 2
-        VIB forwards and 2 UNet-traversing backwards per step; py-spy on the
+    def guided_step(self, trajectory: torch.Tensor, x0_hat: torch.Tensor,
+                    current_obs=None, noise_scale: float = 1.0):
+        """Phase 1 (inherited, verbatim) + phase 2 (this subclass): ONE
+        encoder forward + ONE backward through the shared graph serve BOTH
+        guidance consumers (perf 2026-09-01, 方案一; replaces the pre-merge
+        compute_loss backward + a second ``_encode_and_uncapped`` forward +
+        second backward -- the guided denoise loop used to run 2 VIB
+        forwards and 2 UNet-traversing backwards per step; py-spy on the
         running s233 square orbit chain put ~55% of wall clock inside
         guided_conditional_sample, kernel-launch bound).
 
         Returns ``(cond_grad, disp, phase2, row_losses)``:
 
-          * ``cond_grad`` -- the CAPPED atypical climb gradient, exactly what
-            ``-autograd.grad(compute_loss(..., reduction="sum"))`` yielded
-            pre-merge. Equivalence: the cap's gradient mask is
-            ``1[KL <= kappa]`` (torch clamp(max) backward PASSES gradient at
-            input == max -- empirically confirmed, review P1-1), and
-            applying it AFTER the uncapped backward is exact because rows
-            are block-diagonal -- a row's vjp never mixes with other rows,
-            so a row at/below kappa keeps its full uncapped gradient
-            (bitwise: ``where`` returns ``g`` verbatim on the selected
-            branch), and a row above kappa gets exact zeros (the old
-            zero-upstream backward; ``where`` additionally avoids the
-            ``0 * inf = NaN`` pathology of a post-multiply). Only
-            sub-kappa rows' cond_grad survives the policy's ``_keep``
-            anyway (phase-2 rows swap the climb for ``disp``), and those
-            are precisely the uncapped rows.
+          * ``cond_grad`` -- the capped climb from
+            ``KLCostPlanner._climb_gradient`` (phase 1, eta_tilde
+            normalization included); only sub-kappa-delta rows' cond_grad
+            survives the policy's ``_keep`` (phase-2 rows swap the climb
+            for ``disp``).
           * ``disp, phase2`` -- the constrained update, computed from the
             UNCAPPED ``(kl, g)`` verbatim as the pre-merge ``orbit_update``
             did; see :func:`orbit_displacement`.
@@ -417,21 +485,15 @@ class OrbitCostPlanner(ScoutPlanner):
         no floating-point pow on the hot path)."""
         if float(self.orbit_noise_anneal) != 1.0:
             noise_scale = float(noise_scale) ** float(self.orbit_noise_anneal)
-        s_bar_t = self._att._resolve_s_bar_t(current_obs)
-        a = _enc_forward(self, x0_hat)
-        mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
-        kl = _kl_rows(mu, logvar, self._att._base_mu, self._att._base_lv,
-                      x0_hat)
-        g = torch.autograd.grad(kl.sum(), trajectory)[0]
-        cap_mask = (kl.detach() <= float(self._att.cap)).view(
-            -1, *([1] * (g.dim() - 1)))
-        cond_grad = torch.where(cap_mask, g, torch.zeros_like(g))
+        kl, g = self._kl_backward(trajectory, x0_hat, current_obs)
+        cond_grad = self._climb_gradient(kl, g)
         disp, p2, (fb_n, noise_n) = orbit_displacement(
-            kl, g, kappa=self._att.cap, lam=self.orbit_lam,
-            delta=self.orbit_delta, sigma=self.orbit_sigma,
+            kl, g, kappa=self.cap, lam=self.orbit_lam,
+            delta=self.orbit_delta, sigma=self.orbit_sigma_eff,
             noise_scale=noise_scale,
-            xi_override=(self._sector_xi(g) if self.orbit_sigma > 0.0
-                         else None))
+            xi_override=(self._sector_xi(g) if self.orbit_sigma_eff > 0.0
+                         else None),
+            fb_clamp=self.orbit_fb_clamp)
         # telemetry (norms masked to phase-2 rows -- the dose numbers must
         # describe what was actually injected, not the pre-mask values).
         # Device-side accumulation only; the host sync happens on the print
@@ -439,6 +501,30 @@ class OrbitCostPlanner(ScoutPlanner):
         # serializations per guided rollout).
         self._orb_calls += 1
         self._orb_rows += int(p2.shape[0])
+        if self.orbit_fb_clamp != "none":
+            # diagnostics for the soft clamp: rows saturated past the band
+            # (|kl-kappa| >= 2*delta, where tanh(x/delta) >= 0.964) and the
+            # mean ||g|| of phase-2 rows -- the shell-saturation readout the
+            # fb dose analysis needs (lam*delta/||g||_shell is the soft
+            # asymptotic pull). Device-side accumulators, host sync on the
+            # print tick only.
+            with torch.no_grad():
+                _kl = kl.detach()
+                _gn = g.detach().flatten(1).norm(dim=1)
+                _p2m = p2.detach() > 0.5
+                _sat = ((_kl >= float(self.cap) + 2.0 * self.orbit_delta)
+                        & _p2m).to(g.dtype).sum()
+                _gsh_n = _p2m.to(g.dtype).sum()
+                _gsh_s = (_gn * _p2m.to(g.dtype)).sum()
+                self._sat_acc = (_sat if self._sat_acc is None
+                                 or self._sat_acc.device != _sat.device
+                                 else self._sat_acc + _sat)
+                self._gsh_n_acc = (_gsh_n if self._gsh_n_acc is None
+                                   or self._gsh_n_acc.device != _gsh_n.device
+                                   else self._gsh_n_acc + _gsh_n)
+                self._gsh_s_acc = (_gsh_s if self._gsh_s_acc is None
+                                   or self._gsh_s_acc.device != _gsh_s.device
+                                   else self._gsh_s_acc + _gsh_s)
         for attr, val in (("_fb_acc", (fb_n * p2).sum()),
                           ("_noise_acc", (noise_n * p2).sum()),
                           ("_p2_acc", p2.sum())):
@@ -453,7 +539,13 @@ class OrbitCostPlanner(ScoutPlanner):
             print(f"[orbit-telemetry] calls={self._orb_calls} "
                   f"p2_rows={self._orb_p2_rows}/{self._orb_rows} "
                   f"mean|fb|/p2row={float(self._fb_acc) / n:.4g} "
-                  f"mean|noise|/p2row={float(self._noise_acc) / n:.4g}",
+                  f"mean|noise|/p2row={float(self._noise_acc) / n:.4g}"
+                  + ("" if self._gmed_acc is None
+                     else f" mean_g_med={float(self._gmed_acc) / self._orb_calls:.4g}")
+                  + ("" if self.orbit_fb_clamp == "none"
+                     else (f" fbclamp={self.orbit_fb_clamp}"
+                           f" sat_rows={int(self._sat_acc) if self._sat_acc is not None else 0}"
+                           f" g_shell={float(self._gsh_s_acc) / max(int(self._gsh_n_acc), 1) if self._gsh_s_acc is not None else 0:.4g}")),
                   flush=True)
-        row_losses = -torch.clamp(kl.detach(), max=float(self._att.cap))
+        row_losses = -torch.clamp(kl.detach(), max=float(self.cap))
         return cond_grad, disp, p2, row_losses

@@ -157,8 +157,8 @@ class RolloutPipeline:
             # only the cost changes; same injection path, same frozen dyn/VIB
             # encoder.
             from scout.guidance.entropy_costs import (
-                AtypicalCostPlanner,
                 ComboCostPlanner,
+                KLCostPlanner,
                 NoveltyCostPlanner,
                 ShellTargetCostPlanner,
             )
@@ -170,9 +170,10 @@ class RolloutPipeline:
                     sample_z=bool(ek.get("novelty_sample_z", False)),
                 )
             elif self.guide_mode == "atypical":
-                planner = AtypicalCostPlanner(
+                planner = KLCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                     cap=float(ek.get("atypical_cap", 10.0)),
+                    eta_dimless=bool(ek.get("eta_dimless", False)),
                 )
             elif self.guide_mode == "shell":
                 planner = ShellTargetCostPlanner(
@@ -209,13 +210,22 @@ class RolloutPipeline:
                 orbit_noise_anneal=float(ek.get("orbit_noise_anneal", 1.0)),
                 orbit_climb=str(ek.get("orbit_climb", "grad")),
                 orbit_ray_seed=int(ek.get("orbit_ray_seed", 42)),
+                eta_dimless=bool(ek.get("eta_dimless", False)),
+                orbit_round=int(ek.get("orbit_round", 1)),
+                orbit_sigma_decay=float(ek.get("orbit_sigma_decay", 1.0)),
+                orbit_fb_clamp=str(ek.get("orbit_fb_clamp", "none")),
             )
             print(f"[rollout] orbit guidance: lam={planner.orbit_lam} "
                   f"delta={planner.orbit_delta} sigma={planner.orbit_sigma} "
                   f"kappa={ek.get('atypical_cap', 10.0)} "
                   f"sector={planner.orbit_sector} "
                   f"anneal={planner.orbit_noise_anneal} "
-                  f"climb={planner.orbit_climb}")
+                  f"climb={planner.orbit_climb} "
+                  f"eta_dimless={planner.eta_dimless} "
+                  f"round={planner.orbit_round} "
+                  f"sigma_eff={planner.orbit_sigma_eff:.4g} "
+                  f"(decay={planner.orbit_sigma_decay}) "
+                  f"fb_clamp={planner.orbit_fb_clamp}")
         else:
             planner = ScoutPlanner(scout_vib, bridge=bridge,
                                    obs_adapter=obs_adapter, z=None)
@@ -233,7 +243,9 @@ class RolloutPipeline:
             eval_only: bool = False,
             explore_mode: str = "fresh",
             rescue_seed: Optional[int] = None,
-            scene_slice: Optional[tuple] = None) -> dict:
+            scene_slice: Optional[tuple] = None,
+            traj_sink: Optional[Callable[[dict, int, int], None]] = None
+            ) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
         ``on_progress`` is invoked as
@@ -264,23 +276,35 @@ class RolloutPipeline:
         Returns ``{"metrics": {...},
                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
                    "all_trajs": [every traj of the round, with obs]}``.     # dyn
+
+        ``traj_sink`` (2026-09-04 OOM fix, scout.eval.traj_spool.TrajSpool):
+        rescue/split modes only -- every finalized explore trajectory is
+        streamed to this callable (raw form; the CLI's spool converts +
+        incrementally writes hdf5) and the returned ``trajs``/``all_trajs``
+        carry lightweight copies (counts/order identical; obs stripped). The
+        legacy retry-failed mode does not support it.
         """
         if explore_mode == "rescue":
             return self._run_rescue(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
                 try_times=int(explore_try_times), eval_only=eval_only,
-                rescue_seed=rescue_seed, scene_slice=scene_slice)
+                rescue_seed=rescue_seed, scene_slice=scene_slice,
+                traj_sink=traj_sink)
         if scene_slice is not None:
             raise ValueError(
                 "scene_slice is only implemented for explore_mode='rescue' "
                 f"(got {explore_mode!r})")
+        if traj_sink is not None:
+            raise ValueError(
+                "traj_sink requires explore_mode='rescue' or the split "
+                "protocol (legacy retry-failed mode is unsupported)")
         if explore_seed is not None or eval_only:
             return self._run_split(
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
                 explore_seed=int(explore_seed) if explore_seed is not None else 0,
                 n_explore=int(n_explore) if n_explore is not None else 500,
                 explore_try_times=int(explore_try_times),
-                eval_only=eval_only)
+                eval_only=eval_only, traj_sink=traj_sink)
         horizon = int(self.cfg.eval.horizon)
         try_times = int(getattr(self.cfg.eval, "try_times", 5))
         n_init = int(getattr(self.cfg.eval, "n_init_states", 100))
@@ -377,7 +401,9 @@ class RolloutPipeline:
                    on_progress: Optional[Callable[..., None]] = None,
                    explore_seed: int = 1042, n_explore: int = 500,
                    explore_try_times: int = 1,
-                   eval_only: bool = False) -> dict:
+                   eval_only: bool = False,
+                   traj_sink: Optional[Callable[[dict, int, int], None]] = None
+                   ) -> dict:
         """experiment2 split protocol (user 2026-08-17).
 
         eval   : the seed-fixed measurement set (``cfg.eval.seed`` ->
@@ -452,6 +478,7 @@ class RolloutPipeline:
             only_failed_of=None,                    # EVERY scene explored
             guided=self.guided,
             on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
+            traj_sink=traj_sink,
         )
         trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
         all_trajs: List[dict] = [t for e in expl for t in e.get("all_trajs", [])]
@@ -480,7 +507,9 @@ class RolloutPipeline:
                     on_progress: Optional[Callable[..., None]] = None,
                     try_times: int = 5, eval_only: bool = False,
                     rescue_seed: Optional[int] = None,
-                    scene_slice: Optional[tuple] = None) -> dict:
+                    scene_slice: Optional[tuple] = None,
+                    traj_sink: Optional[Callable[[dict, int, int], None]] = None
+                    ) -> dict:
         """SOE rescue protocol (user 2026-08-23) -- explore == eval scenes.
 
         eval   : the seed-fixed measurement set (``cfg.eval.seed`` -> seeds
@@ -637,6 +666,7 @@ class RolloutPipeline:
             n_action_steps=n_action_steps, device=self.device,
             only_failed_of=first_results, guided=self.guided,
             on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
+            traj_sink=traj_sink,
         )
         trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
         all_trajs: List[dict] = []

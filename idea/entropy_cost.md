@@ -1,7 +1,7 @@
 # Entropy Cost：设计意义、实现计算与推导
 
 > 组织方式仿 DIAYN（Eysenbach et al. 2019）第 3 节的推导体例：先给出目标的表达形式，再逐条说明为什么它不可直接计算、每一步做什么替换，最后落到可执行的计算式。每行公式后注释符号；每步标注【恒等式】/【变分界】/【代理】/【定义】。
-> 实现：`scout/guidance/entropy_costs.py:163-208`（AtypicalCostPlanner）、注入 `scout/guidance/policy.py:236-265`。
+> 实现：`scout/guidance/entropy_costs.py`（KLCostPlanner，2026-09-04 由 AtypicalCostPlanner 更名；orbit = 其子类 `scout/guidance/orbit_costs.py`）、注入 `scout/guidance/policy.py`。
 
 ---
 

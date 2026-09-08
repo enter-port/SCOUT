@@ -145,6 +145,43 @@ def main():
                    help="orbit: master seed for climb='ray' design "
                         "directions (dedicated generator -- does NOT follow "
                         "--rescue-seed).")
+    p.add_argument("--orbit-eta-dimless", action="store_true",
+                   help="orbit: eta-dimless mode (2026-09-02 orbit-hparam-"
+                        "dev) -- normalize the climb gradient by the live-"
+                        "climb MEAN per-row ||grad|| (rows with kl < "
+                        "cap-delta, norm > 1e-4), so --guidance-scale "
+                        "carries eta_tilde (a fixed per-step ACTION-SPACE "
+                        "injection magnitude that transfers across tasks "
+                        "with different VIB gradient scales). OFF = "
+                        "bit-identical legacy injection (scale = eta in "
+                        "gradient units).")
+    p.add_argument("--guidance-scale", type=float, default=None,
+                   help="override cfg.exploration.guidance_scale (the "
+                        "multiplier on the injected gradient). With "
+                        "--orbit-eta-dimless this is eta_tilde in action-"
+                        "space units per sqrt(1-abar_t); without it, eta in "
+                        "gradient units (legacy semantics).")
+    p.add_argument("--orbit-round", type=int, default=1,
+                   help="orbit: chain round index for the sigma schedule "
+                        "(user 2026-09-02) -- sigma ceiling decays as "
+                        "orbit_sigma * orbit_sigma_decay**(round-1) because "
+                        "the retrained VIB stack settles onto the rescue "
+                        "ridge and late-round tangential noise only kicks "
+                        "retries off it. 1 = no decay (bit-identical).")
+    p.add_argument("--orbit-fb-clamp", choices=["none", "soft"], default="none",
+                   help="orbit: soft-clamp the Newton feedback residual "
+                        "(kl-kappa) -> delta*tanh((kl-kappa)/delta) and "
+                        "restrict the tangential noise to the band "
+                        "[kappa-delta, kappa+delta] (user 2026-09-02 option "
+                        "C). Saturates the far-off-shell pull at "
+                        "lam*delta/||g|| -- the unbounded residual made "
+                        "shell-saturated rows jerk (sqR5 fb=0.55, canR2 "
+                        "fb=0.61 vs healthy 0.24-0.33). 'none' (default) = "
+                        "bit-identical legacy.")
+    p.add_argument("--orbit-sigma-decay", type=float, default=1.0,
+                   help="orbit: per-round decay factor of the sigma ceiling, "
+                        "in (0,1]. 0.5 halves the noise every round. "
+                        "1.0 = round-independent (bit-identical legacy).")
     p.add_argument("--failed-set-json", default=None,
                    help="rescue mode: load the FROZEN failure set from this "
                         "json (explore-only -- the eval phase is skipped and "
@@ -164,6 +201,16 @@ def main():
                         "per-chunk fixed eps (1, default) or at mu (0)")
     p.add_argument("--atypical-cap", type=float, default=10.0,
                    help="atypical: cap on the KL bonus in nats (default 10)")
+    p.add_argument("--aty-eta-dimless", action="store_true",
+                   help="atypical: eta-dimless mode (2026-09-04 refactor -- "
+                        "same mechanism as --orbit-eta-dimless, now shared "
+                        "in KLCostPlanner): normalize the climb by the "
+                        "live-climb mean per-row ||grad|| so "
+                        "exploration.guidance_scale is eta_tilde in action-"
+                        "space units. Scale->eta conversion on a task: "
+                        "eta_tilde = scale_raw * <g_med> measured on data "
+                        "(per-step exact). OFF (default) = raw-scale legacy, "
+                        "bit-identical.")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -278,6 +325,15 @@ def main():
                         "statistically equivalent to (not bit-identical "
                         "with) the monolithic run -- same protocol, same "
                         "scenes, deterministic per (seed, SHARDS, SLOT).")
+    p.add_argument("--flush-every", type=int, default=0, metavar="N",
+                   help="OOM fix (2026-09-04): spool explore trajectories to "
+                        "staging hdf5 every N kept trajs, then assemble the "
+                        "final success/all hdf5 in the exact one-shot demo "
+                        "order (value-identical outputs; memory bounded by "
+                        "O(N) converted trajs instead of the whole round -- "
+                        "a rescue round holds ~200GB of float obs per worker "
+                        "otherwise). 0 (default) = legacy one-shot write. "
+                        "rescue/split explore only.")
     args = p.parse_args()
 
     scene_slice = None
@@ -350,6 +406,15 @@ def main():
                                         or args.eval_only)
     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
 
+    # --flush-every mode validation BEFORE wandb.init (review P1-2: a p.error
+    # after init leaks the run); 0 = legacy one-shot (default), <0 = refuse.
+    if args.flush_every != 0:
+        if args.flush_every < 0:
+            p.error("--flush-every must be >= 0 (0 = legacy one-shot write)")
+        if not (rescue_mode or split_mode or args.success_only or args.eval_only):
+            p.error("--flush-every requires --explore-mode rescue or the "
+                    "split protocol (legacy retry-failed mode is unsupported)")
+
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
                             "shell", "orbit")) and not args.success_only
     if guided and (args.vib_ckpt is None
@@ -410,6 +475,18 @@ def main():
         json_path = args.output_json or os.path.join(log_dir, f"{args.task}_{tag}_rollout_exp{args.exp_num}.json")
 
     # ---- wandb (live progress; x-axis = completed-init-count) ------------ #
+    # CLI scale override goes into cfg BEFORE wandb.init so the logged config
+    # carries the EFFECTIVE scale (review P1-4: a stale cfg.exploration value
+    # in the wandb panel would mislead any eta sweep), and RolloutPipeline
+    # reads the same attribute at construction.
+    if args.guidance_scale is not None:
+        if not guided:
+            p.error("--guidance-scale requires a guided mode (--guide != off)")
+        cfg.exploration.guidance_scale = float(args.guidance_scale)
+        print(f"[run_rollout] guidance_scale override: "
+              f"{cfg.exploration.guidance_scale}"
+              f"{' (eta_tilde, --orbit-eta-dimless)' if args.orbit_eta_dimless else ''}"
+              f"{' (eta_tilde, --aty-eta-dimless)' if args.aty_eta_dimless else ''}")
     wcfg = cfg.get("wandb", {}) or {}
     use_wandb = bool(wcfg.get("use_wandb", True)) and not args.no_wandb
     wandb_run = None
@@ -540,6 +617,27 @@ def main():
     scout_vib_factory = make_scout_vib_factory(cfg, device) if guided else None
     env_factory = make_default_env_factory(cfg)
 
+    # ---- trajectory spool (OOM fix, --flush-every N) ----------------------- #
+    spool = None
+    if args.flush_every > 0:
+        if args.success_only or args.eval_only:
+            print("[run_rollout] --flush-every ignored (no explore data "
+                  "in success-only/eval-only rounds)")
+        else:
+            from scout.eval.traj_spool import TrajSpool
+            spool = TrajSpool(
+                cfg.dataset.path, success_path, all_path,
+                core_filter_key=cfg.dataset.core_filter_key,
+                aug_mask_key=(args.aug_mask_key
+                              or cfg.get("self_improvement", {}).get(
+                                  "scout_aug_mask", "scout_aug")),
+                rule=("rescue" if rescue_mode else "split"),
+                try_times=int(args.explore_try_times),
+                flush_every=int(args.flush_every))
+            print(f"[run_rollout] traj spool ON: rule={spool.rule} "
+                  f"try_times={spool.try_times} flush_every={spool.flush_every} "
+                  f"staging={success_path}.spool,{all_path}.spool")
+
     print(f"[run_rollout] task={args.task} guide={args.guide} wandb={wandb_name} "
           f"n_init={cfg.eval.n_init_states} try_times={cfg.eval.try_times} "
           f"n_envs={cfg.eval.n_envs} device={device}")
@@ -569,7 +667,12 @@ def main():
                         "orbit_sector_seed": args.orbit_sector_seed,
                         "orbit_noise_anneal": args.orbit_noise_anneal,
                         "orbit_climb": args.orbit_climb,
-                        "orbit_ray_seed": args.orbit_ray_seed},
+                        "orbit_ray_seed": args.orbit_ray_seed,
+                        "eta_dimless": bool(args.orbit_eta_dimless
+                                            or args.aty_eta_dimless),
+                        "orbit_round": args.orbit_round,
+                        "orbit_sigma_decay": args.orbit_sigma_decay,
+                        "orbit_fb_clamp": args.orbit_fb_clamp},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -586,6 +689,7 @@ def main():
             explore_mode=args.explore_mode,
             rescue_seed=args.rescue_seed,
             scene_slice=scene_slice,
+            traj_sink=None if spool is None else spool.on_traj,
         )
         metrics = result["metrics"]
 
@@ -623,7 +727,26 @@ def main():
             aug_mask_key = (args.aug_mask_key
                             or cfg.get("self_improvement", {}).get("scout_aug_mask",
                                                                    "scout_aug"))
-            if trajs:
+            if spool is not None:
+                # engine-vs-spool parity invariant: the pipeline's lists and
+                # the spool implement the SAME selection rules -- divergence
+                # is a bug (finalize would write different data than the
+                # one-shot path), so refuse to write anything.
+                if spool.n_success != len(trajs) or spool.n_all != len(all_trajs):
+                    raise RuntimeError(
+                        f"spool/engine selection divergence: spool "
+                        f"succ={spool.n_success} all={spool.n_all} vs "
+                        f"engine succ={len(trajs)} all={len(all_trajs)} "
+                        f"-- refusing to finalize")
+                # staged writes already happened during explore; assemble the
+                # final files now (canonical one-shot order, value-identical)
+                _sp = spool.finalize()
+                if not _sp["success_written"]:
+                    print("[run_rollout] 0 successful exploration trajs "
+                          "-- skipping success hdf5")
+                if not _sp["all_written"]:
+                    print("[run_rollout] 0 all-trajs -- skipping all hdf5")
+            elif trajs:
                 write_rollouts_to_hdf5(
                     cfg.dataset.path, success_path, trajs,
                     core_filter_key=cfg.dataset.core_filter_key,
@@ -632,13 +755,13 @@ def main():
             else:
                 print("[run_rollout] 0 successful exploration trajs "
                       "-- skipping success hdf5")
-            if all_trajs:
+            if spool is None and all_trajs:
                 write_rollouts_to_hdf5(
                     cfg.dataset.path, all_path, all_trajs,
                     core_filter_key=cfg.dataset.core_filter_key,
                     aug_mask_key=aug_mask_key, include_core=True,
                 )
-            else:
+            elif spool is None:
                 print("[run_rollout] 0 all-trajs -- skipping all hdf5")
 
             # ---- final wandb points (converged values at full scene counts) -- #
@@ -676,6 +799,10 @@ def main():
                                        "explore_init_done": metrics["n_failed"]})
 
             # ---- JSON summary ------------------------------------------------- #
+            _sig_eff = (args.orbit_sigma
+                        * (args.orbit_sigma_decay ** (args.orbit_round - 1)))
+            if 0.0 < _sig_eff < 1e-12:      # same snap as the planner (18c)
+                _sig_eff = 0.0
             summary = {
                 "task": args.task,
                 "mode": args.guide + (":eval-only" if args.eval_only else ""),
@@ -696,6 +823,24 @@ def main():
                 "n_success_trajs": len(trajs),
                 "n_all_trajs": len(all_trajs),
                 "failed_init_indices": metrics.get("failed_init_indices"),
+                "guidance": {
+                    "guide": args.guide,
+                    "guidance_scale": float(cfg.exploration.guidance_scale),
+                    "eta_dimless": int(bool(args.orbit_eta_dimless
+                                           or args.aty_eta_dimless)),
+                    **({"orbit_lam": args.orbit_lam,
+                        "orbit_delta": args.orbit_delta,
+                        "orbit_sigma": args.orbit_sigma,
+                        "orbit_sigma_eff": _sig_eff,
+                        "orbit_round": args.orbit_round,
+                        "orbit_sigma_decay": args.orbit_sigma_decay,
+                        "orbit_fb_clamp": args.orbit_fb_clamp,
+                        "orbit_sector": args.orbit_sector,
+                        "orbit_noise_anneal": args.orbit_noise_anneal,
+                        "orbit_climb": args.orbit_climb,
+                        "atypical_cap": args.atypical_cap}
+                       if args.guide == "orbit" else {}),
+                },
                 "outputs": {"success": success_path, "all": all_path},
             }
             if args.eval_only:
@@ -762,6 +907,8 @@ def main():
             print(f"[run_rollout] all     -> {all_path} ({len(all_trajs)} trajs)")
             print(f"[run_rollout] json    -> {json_path}")
     finally:
+        if spool is not None:
+            spool.close()       # staging handles only; finalize already ran
         if wandb_run is not None:
             wandb_run.finish()
 
