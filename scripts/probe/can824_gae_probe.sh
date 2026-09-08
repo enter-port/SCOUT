@@ -169,6 +169,12 @@ run_arm() { # name gpu guide extra...
 
 echo "[gae-probe] ROUND=$ROUND OFF=$OFF N=$N P=$P TRIES=$TRIES aty(scale/cap/gst)=$ATY_SCALE/$CAP/$GST gae(gamma/norm)=$GAE_GAMMA/$GAE_NORM gpus aty/gae=$GPU_ATY/$GPU_GAE"
 GAE_ARGS=(--atypical-cap "$CAP" --gae-gamma "$GAE_GAMMA" --gae-norm "$GAE_NORM")
+# extra gae-arm CLI flags (reflection-round config sweep, whitespace-split):
+# e.g. GAE_EXTRA="--gae-agg add --gae-hist-weight 0.15"
+if [ -n "${GAE_EXTRA:-}" ]; then
+  read -ra _GE <<< "$GAE_EXTRA"
+  GAE_ARGS+=("${_GE[@]}")
+fi
 run_arm gae "$GPU_GAE" gaelike ${GAE_ARGS[@]+"${GAE_ARGS[@]}"} &
 GAE_PID=$!
 run_arm aty "$GPU_ATY" atypical --atypical-cap "$CAP" &

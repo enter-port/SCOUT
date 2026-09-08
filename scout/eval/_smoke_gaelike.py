@@ -170,7 +170,7 @@ def main():
         t2[0, 0, 0] += s * eps
         with torch.no_grad():
             mu, logvar = vib.vib_enc(s1, t2[:, 0, :])
-            kl2 = g1._gae_rows(mu, logvar, t2 * 1.0)
+            _, kl2 = g1._gae_rows(mu, logvar, t2 * 1.0)
         fd.append(float(kl2[0]))
     num = (fd[1] - fd[0]) / (2 * eps)
     assert abs(ana - num) < 1e-3 * max(1.0, abs(num)), f"grad {ana} vs fd {num}"
@@ -216,7 +216,104 @@ def main():
     assert g3._hist_mu.shape[:2] == (B, 1), "buffer corrupted by B mismatch"
     print("[8] pre-select_z / B-mismatch guards OK (zeros, no corruption)")
 
+    # ---------------- 9. add-mode: lambda=0 / gamma=0 == atypical --------- #
+    for kw in ({"gae_agg": "add", "gae_hist_weight": 0.0, "gae_gamma": 0.9},
+               {"gae_agg": "add", "gae_hist_weight": 0.15, "gae_gamma": 0.0}):
+        van2 = KLCostPlanner(vib, cap=2.5)
+        gad = GAELikeCostPlanner(vib, cap=2.5, **kw)
+        for pl in (van2, gad):
+            pl.set_current_obs(s_bar)
+            pl.select_z(anchor_x.unsqueeze(1) * 1.0)
+        for step in range(4):
+            x = anchor_x + 0.3 * (step + 1) * torch.randn(B, Da)
+            t_v, x_v = _traj(x)
+            t_g, x_g = _traj(x)
+            cg_v, _, _, rl_v = van2.guided_step(t_v, x_v, None)
+            cg_g, _, _, rl_g = gad.guided_step(t_g, x_g, None)
+            assert torch.equal(cg_v, cg_g), f"{kw} step {step}: grad mismatch"
+            assert torch.equal(rl_v, rl_g), f"{kw} step {step}: rl mismatch"
+    print("[9] add-mode lambda=0 / gamma=0 == atypical bitwise OK")
+
+    # ---------------- 10. add-mode: anchor trust region + value form ------- #
+    ga = GAELikeCostPlanner(vib, cap=2.5, gae_gamma=0.5,
+                            gae_agg="add", gae_hist_weight=0.3)
+    ga.set_current_obs(s_bar)
+    ga.select_z(torch.zeros(B, Da).unsqueeze(1) * 1.0)
+    # walk far from the anchor: anchor KL saturates at kappa, history terms
+    # are live -> the row must die (cond_grad exactly 0) because the ANCHOR
+    # is the trust region in add mode
+    for step in range(4):
+        t, x0 = _traj(torch.full((B, Da), 4.0 * (step + 1)))
+        kl, g = ga._kl_backward(t, x0, None)
+    assert float(kl.detach().max()) <= 2.5 + 1e-5
+    cg, _, _, rl = ga.guided_step(*_traj(torch.full((B, Da), 20.0)), None)
+    assert torch.equal(cg, torch.zeros_like(cg)), \
+        "saturated anchor must kill the row in add mode"
+    # value form: anchor + lambda*sum_{k>=1} g^k*min(KL_k,kappa)
+    ga2 = GAELikeCostPlanner(vib, cap=2.5, gae_gamma=0.5,
+                             gae_agg="add", gae_hist_weight=0.3)
+    ga2.set_current_obs(s_bar)
+    ga2.select_z(torch.zeros(B, Da).unsqueeze(1) * 1.0)
+    hist_mu = [ga2._hist_mu[:, 0].clone()]
+    hist_lv = [ga2._hist_lv[:, 0].clone()]
+    for step in range(3):
+        x = torch.full((B, Da), 0.4 * (step + 1))
+        t, x0 = _traj(x)
+        anchor, agg = ga2._gae_rows(*_enc(ga2, x, s_bar), x0)
+        with torch.no_grad():
+            mu, logvar = vib.vib_enc(s_bar, x)
+            ref_a = torch.clamp(_kl_diag(mu, logvar, hist_mu[0], hist_lv[0]),
+                                max=2.5)
+            ref_h = torch.zeros(B)
+            for k, (m0, lv0) in enumerate(zip(hist_mu, hist_lv)):
+                if k == 0:
+                    continue
+                ref_h += (0.5 ** k) * torch.clamp(
+                    _kl_diag(mu, logvar, m0, lv0), max=2.5)
+            ref = ref_a + 0.3 * ref_h
+        assert torch.allclose(agg, ref, atol=1e-6), f"add form step {step}"
+        hist_mu.append(mu.clone())
+        hist_lv.append(logvar.clone())
+        ga2._push_history(mu, logvar)          # advance like _kl_backward
+        ga2._gae_fresh = False
+    print("[10] add-mode anchor trust region + value form OK")
+
+    # ---------------- 11. add-mode finite differences ---------------------- #
+    gb = GAELikeCostPlanner(vib, cap=2.5, gae_gamma=0.5,
+                            gae_agg="add", gae_hist_weight=0.3)
+    gb.set_current_obs(s1 := s_bar[0:1])
+    gb.select_z(torch.randn(1, Da).unsqueeze(1) * 1.0)
+    for d in (0.02, 0.05):
+        t, x0 = _traj(torch.full((1, Da), d))
+        anchor, agg = gb._gae_rows(*_enc(gb, t[:, 0, :], s1), x0)
+        gb._push_history(*_enc(gb, t[:, 0, :], s1))
+        gb._gae_fresh = False
+    x = torch.full((1, Da), 0.07)
+    t, x0 = _traj(x)
+    mu, logvar = _enc(gb, t[:, 0, :], s1)
+    anchor, agg = gb._gae_rows(mu, logvar, x0)
+    g_ = torch.autograd.grad(agg.sum(), t)[0]
+    ana = float(g_[0, 0, 0])
+    eps = 1e-4
+    fd = []
+    for sgn in (-1, +1):
+        t2 = x.unsqueeze(1).clone()
+        t2[0, 0, 0] += sgn * eps
+        with torch.no_grad():
+            m2, l2 = _enc(gb, t2[:, 0, :], s1)
+            _, a2 = gb._gae_rows(m2, l2, t2 * 1.0)
+        fd.append(float(a2[0]))
+    num = (fd[1] - fd[0]) / (2 * eps)
+    assert abs(ana - num) < 1e-3 * max(1.0, abs(num)), f"{ana} vs fd {num}"
+    print(f"[11] add-mode autograd == finite differences ({ana:.6f} vs "
+          f"{num:.6f}) OK")
+
     print("\n[gae-smoke] ALL CHECKS GREEN")
+
+
+def _enc(planner, a, s_bar):
+    mu, logvar = planner.scout_vib.vib_enc(s_bar, a)
+    return mu, logvar
 
 
 if __name__ == "__main__":

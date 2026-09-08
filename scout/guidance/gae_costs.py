@@ -75,15 +75,24 @@ class GAELikeCostPlanner(KLCostPlanner):
 
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
                  cap: float = 10.0, eta_dimless: bool = False,
-                 gae_gamma: float = 0.9, gae_normalize: bool = True):
+                 gae_gamma: float = 0.9, gae_normalize: bool = True,
+                 gae_agg: str = "avg", gae_hist_weight: float = 0.15):
         super().__init__(scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                          cap=cap, eta_dimless=eta_dimless)
         self.gae_gamma = float(gae_gamma)
         self.gae_normalize = bool(gae_normalize)
+        self.gae_agg = str(gae_agg)
+        self.gae_hist_weight = float(gae_hist_weight)
         if not (0.0 <= self.gae_gamma <= 1.0):
             raise ValueError(
                 f"gae_gamma must be in [0, 1] (0 = vanilla atypical); got "
                 f"{self.gae_gamma}")
+        if self.gae_agg not in ("avg", "add"):
+            raise ValueError(
+                f"gae_agg must be 'avg' or 'add'; got {self.gae_agg!r}")
+        if self.gae_hist_weight < 0.0:
+            raise ValueError(
+                f"gae_hist_weight must be >= 0; got {self.gae_hist_weight}")
         # history buffer: (B, H, dz) posteriors of the anchor + the guided
         # steps since it, detached (constants w.r.t. the climb gradient --
         # same treatment as the vanilla anchor (_base_mu/_base_lv)).
@@ -120,18 +129,37 @@ class GAELikeCostPlanner(KLCostPlanner):
         self._gae_fresh = False
 
     # ------------------------------------------------------------------ #
-    # the GAE-weighted per-row cost (B,)
+    # the GAE-weighted per-row cost (B,) -- two aggregation forms
     # ------------------------------------------------------------------ #
     def _gae_rows(self, mu: torch.Tensor, logvar: torch.Tensor,
-                  x0_hat: torch.Tensor) -> torch.Tensor:
-        """Per-row sum_k g^k * min(KL(q_t ‖ q_k), κ), optionally weight-sum
-        normalized. Graph-connected zeros when no history is usable (direct
-        calls before select_z -- unreachable via the public rollout path;
-        mirrors ``_kl_rows``' None-baseline contract)."""
+                  x0_hat: torch.Tensor):
+        """Returns ``(anchor_kl, agg)`` per row.
+
+        avg (original, default): ``agg = sum_k g^k*min(KL_k,kappa) / sum_k g^k``
+        (``gae_normalize`` OFF skips the division) -- the climbed scalar AND
+        the inherited row-mask value are this weighted average.
+
+        add (reflection round 1, 2026-09-09): ``agg = min(KL_0,kappa) +
+        lambda * sum_{k>=1} g^k*min(KL_k,kappa)`` -- the anchor keeps its FULL
+        vanilla weight (no divisor dilution: the avg form's 1/S coefficient
+        cut the calibrated anchor escape force ~7-10x at g=0.9, measured
+        mean_inject 1.27 vs atypical's 1.76) and the decayed history enters
+        as a PURE ADDITIVE anti-return perturbation at ``gae_hist_weight``
+        (lambda). The climbed scalar is ``agg`` but the value handed to the
+        inherited cap mask / row_losses is the ANCHOR kl alone, so the trust
+        region is exactly atypical's (a row dies when its ANCHOR KL reaches
+        kappa -- not when the aggregate does, the P1-1 pathology).
+        ``gae_normalize`` is ignored in add mode. lambda=0 or g=0 in add
+        mode is bitwise atypical.
+
+        Graph-connected zeros (both returns) when no history is usable
+        (direct calls before select_z -- unreachable via the public rollout
+        path; mirrors ``_kl_rows``' None-baseline contract)."""
+        zero = x0_hat.flatten(1).sum(dim=1).to(mu.dtype) * 0.0
         if (self._hist_mu is None or self._hist_lv is None
                 or self._hist_mu.shape[0] != mu.shape[0]
                 or self._hist_mu.shape[1] < 1):
-            return x0_hat.flatten(1).sum(dim=1).to(mu.dtype) * 0.0
+            return zero, zero
         H = self._hist_mu.shape[1]
         # (B, H, dz) pairwise diagonal-Gaussian KL, elementwise identical to
         # _kl_rows per (row, history column): 0.5*sum_d[(mu-m0)^2/var0 +
@@ -142,13 +170,17 @@ class GAELikeCostPlanner(KLCostPlanner):
                     + (var / var0) - 1.0
                     - (logvar.unsqueeze(1) - self._hist_lv)).sum(dim=-1)  # (B,H)
         kl = torch.clamp(kl, max=float(self.cap))               # per-term κ
+        anchor = kl[:, 0]                                       # (B,)
         w = torch.as_tensor(
             [self.gae_gamma ** k for k in range(H)],
             device=mu.device, dtype=mu.dtype)                    # (H,)
+        if self.gae_agg == "add":
+            hist = (kl[:, 1:] * w[1:]).sum(dim=1)               # (B,)
+            return anchor, anchor + self.gae_hist_weight * hist
         total = (kl * w).sum(dim=1)                              # (B,)
         if self.gae_normalize:
             total = total / w.sum()
-        return total
+        return anchor, total
 
     def _push_history(self, mu: torch.Tensor, logvar: torch.Tensor):
         """Append this step's (detached) posterior as the newest history
@@ -173,8 +205,12 @@ class GAELikeCostPlanner(KLCostPlanner):
         s_bar_t = self._resolve_s_bar_t(current_obs)
         a = _enc_forward(self, x0_hat)
         mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
-        kl = self._gae_rows(mu, logvar, x0_hat)
-        g = torch.autograd.grad(kl.sum(), trajectory)[0]
+        anchor, agg = self._gae_rows(mu, logvar, x0_hat)
+        g = torch.autograd.grad(agg.sum(), trajectory)[0]
+        # the value handed to the inherited machinery (cap mask / live mask /
+        # row_losses): the weighted average in avg mode (historical
+        # behavior), the ANCHOR kl in add mode (atypical's trust region).
+        kl = anchor if self.gae_agg == "add" else agg
         # history advance: the anchor step's posterior IS the anchor (same
         # pre-injection x̂₀, deterministic encoder) -- skip the duplicate.
         if self._gae_fresh:
@@ -193,18 +229,22 @@ class GAELikeCostPlanner(KLCostPlanner):
             print(f"[gae-telemetry] calls={self._gae_calls} "
                   f"mean_hist_len={self._hist_len_acc / self._gae_calls:.1f} "
                   f"mean_kl={float(self._kl_acc) / self._gae_calls:.4g} "
-                  f"gamma={self.gae_gamma} norm={int(self.gae_normalize)}",
+                  f"gamma={self.gae_gamma} norm={int(self.gae_normalize)} "
+                  f"agg={self.gae_agg}",
                   flush=True)
         return kl, g
 
     def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
                      reduction: str = "mean") -> torch.Tensor:
         """Read-only view of the GAElike row cost (NO history append), for
-        monitoring / diagnostics; the rollout hot path uses guided_step."""
+        monitoring / diagnostics; the rollout hot path uses guided_step.
+        Mirrors guided_step's row_losses (avg mode: weighted average; add
+        mode: anchor kl)."""
         s_bar_t = self._resolve_s_bar_t(current_obs)
         a = _enc_forward(self, x0_hat)
         mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
-        kl = self._gae_rows(mu, logvar, x0_hat)
+        anchor, agg = self._gae_rows(mu, logvar, x0_hat)
+        kl = anchor if self.gae_agg == "add" else agg
         nll = -torch.clamp(kl, max=float(self.cap))
         if reduction == "mean":
             return nll.mean()

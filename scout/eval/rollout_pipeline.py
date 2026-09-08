@@ -194,9 +194,13 @@ class RolloutPipeline:
                     eta_dimless=bool(ek.get("eta_dimless", False)),
                     gae_gamma=float(ek.get("gae_gamma", 0.9)),
                     gae_normalize=bool(ek.get("gae_norm", 1)),
+                    gae_agg=str(ek.get("gae_agg", "avg")),
+                    gae_hist_weight=float(ek.get("gae_hist_weight", 0.15)),
                 )
                 print(f"[rollout] GAElike guidance: gamma={planner.gae_gamma} "
                       f"normalize={planner.gae_normalize} "
+                      f"agg={planner.gae_agg} "
+                      f"hist_weight={planner.gae_hist_weight} "
                       f"kappa={planner.cap} "
                       f"eta_dimless={planner.eta_dimless}")
             else:

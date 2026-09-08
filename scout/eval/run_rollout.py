@@ -122,6 +122,25 @@ def main():
                         "die EARLIER than atypical (NOT a dose uplift; "
                         "review P1-1, semantics pending user decision -- "
                         "calibrate with 1).")
+    p.add_argument("--gae-agg", choices=["avg", "add"], default="avg",
+                   help="gaelike aggregation form (reflection round 1, "
+                        "2026-09-09). 'avg' (default) = original weighted "
+                        "AVERAGE of capped KLs (divisor dilutes the anchor "
+                        "escape force ~7-10x at gamma=0.9: measured "
+                        "mean_inject 1.27 vs atypical 1.76). 'add' = anchor "
+                        "at FULL vanilla weight + lambda-weighted decayed "
+                        "history as a pure additive anti-return term; the "
+                        "inherited kappa trust region reads the ANCHOR kl "
+                        "alone (row dies exactly when atypical's would; "
+                        "gae-norm ignored). lambda=0 or gamma=0 = bitwise "
+                        "atypical.")
+    p.add_argument("--gae-hist-weight", type=float, default=0.15,
+                   help="gaelike add mode: lambda, the weight of the "
+                        "gamma-decayed history sum around the full-weight "
+                        "anchor term (default 0.15 ~ 1/S at gamma=0.9, "
+                        "keeping the history force near the avg-form's "
+                        "measured level). 0 = history off (bitwise "
+                        "atypical).")
     p.add_argument("--orbit-lam", type=float, default=0.5,
                    help="orbit: feedback gain lambda of the Newton term "
                         "-lam*(KL-kappa)*grad KL/||grad KL||^2 (dimensionless "
@@ -704,7 +723,9 @@ def main():
                         "orbit_sigma_decay": args.orbit_sigma_decay,
                         "orbit_fb_clamp": args.orbit_fb_clamp,
                         "gae_gamma": args.gae_gamma,
-                        "gae_norm": int(args.gae_norm)},
+                        "gae_norm": int(args.gae_norm),
+                        "gae_agg": args.gae_agg,
+                        "gae_hist_weight": args.gae_hist_weight},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -873,7 +894,9 @@ def main():
                         "atypical_cap": args.atypical_cap}
                        if args.guide == "orbit" else {}),
                     **({"gae_gamma": args.gae_gamma,
-                        "gae_norm": int(args.gae_norm)}
+                        "gae_norm": int(args.gae_norm),
+                        "gae_agg": args.gae_agg,
+                        "gae_hist_weight": args.gae_hist_weight}
                        if args.guide == "gaelike" else {}),
                 },
                 "outputs": {"success": success_path, "all": all_path},
