@@ -229,7 +229,9 @@ def lookat_camera_frame(pos, target, up=(0.0, 0.0, 1.0)):
 WORKSPACE_CENTER = np.array([0.0, -0.15, 0.9])   # can task table workspace
 
 
-def build_views(sim, fit_points: Optional[np.ndarray] = None) -> dict:
+def build_views(sim, fit_points: Optional[np.ndarray] = None,
+                stock_camera: str = "agentview",
+                center: Optional[np.ndarray] = None) -> dict:
     """Every implemented camera view for the can workspace.
 
     Re-posed views share the model's ``agentview`` camera (pos + quat set per
@@ -241,32 +243,42 @@ def build_views(sim, fit_points: Optional[np.ndarray] = None) -> dict:
     ``fit_points`` (optional): trajectory points the top-down camera should
     cover; None -> a generous fixed workspace box (stable scale across video
     frames).
+
+    ``stock_camera``: the stock camera the re-posed views share AND whose
+    own entry carries the STOCK pose. Tasks without an ``agentview``
+    (tool_hang = ``sideview``) pass their own; the views dict key equals
+    the camera name, so callers select views by the stock camera's real
+    name. ``center``: look-at target of the re-posed front/side/corner
+    views (default = WORKSPACE_CENTER, the can task's).
     """
-    cid = sim.model.camera_name2id("agentview")
+    cid = sim.model.camera_name2id(stock_camera)
     fov = float(sim.model.cam_fovy[cid])
-    # "agentview" = the STOCK robomimic camera pose (XML values, read from
+    # stock_camera = the STOCK robomimic camera pose (XML values, read from
     # the fresh model before any re-pose). The projection now handles its
     # frame exactly (column-axes rule; red-mask verified err 18px @512).
     views = {
-        "agentview": {"camera": "agentview",
-                      "pos": np.array(sim.model.cam_pos[cid], dtype=np.float64),
-                      "quat": np.array(sim.model.cam_quat[cid],
-                                       dtype=np.float64)},
+        stock_camera: {"camera": stock_camera,
+                       "pos": np.array(sim.model.cam_pos[cid],
+                                       dtype=np.float64),
+                       "quat": np.array(sim.model.cam_quat[cid],
+                                        dtype=np.float64)},
     }
     if fit_points is None:
         fit_points = np.array(
             [[dx, dy, dz]
              for dx in (-0.35, 0.35) for dy in (-0.6, 0.3)
              for dz in (0.85, 1.3)], dtype=np.float64)
-    views["topdown"] = {"camera": "agentview",
+    views["topdown"] = {"camera": stock_camera,
                         "pos": topdown_camera_pose(fit_points, fov),
                         "quat": np.array([1.0, 0.0, 0.0, 0.0])}
+    lookat_center = (WORKSPACE_CENTER if center is None
+                     else np.asarray(center, dtype=np.float64))
     for name, pos in (("front", np.array([0.0, 1.35, 1.45])),
                       ("side_left", np.array([-1.35, -0.15, 1.35])),
                       ("side_right", np.array([1.35, -0.15, 1.35])),
                       ("corner45", np.array([0.95, 1.0, 1.75]))):
-        p, q = lookat_camera_frame(pos, WORKSPACE_CENTER)
-        views[name] = {"camera": "agentview", "pos": p, "quat": q}
+        p, q = lookat_camera_frame(pos, lookat_center)
+        views[name] = {"camera": stock_camera, "pos": p, "quat": q}
     views["eye_in_hand"] = {"camera": "robot0_eye_in_hand"}
     return views
 
