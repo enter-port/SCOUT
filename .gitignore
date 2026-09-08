@@ -10,6 +10,8 @@ CLAUDE.md
 # ZCode 本地指令文件(从 Claude Code memory 迁移,本地私有,不提交)
 AGENTS.md
 .zcode/
+# 本地 scratch(orbit 重构期临时脚本/diff,留盘不入库)
+.tmp_orb/
 
 # ===== Python =====
 __pycache__/
