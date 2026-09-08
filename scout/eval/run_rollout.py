@@ -79,7 +79,8 @@ def main():
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
     p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo", "shell", "orbit"],
+                                        "atypical", "combo", "shell", "orbit",
+                                        "gaelike"],
                    default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
@@ -98,7 +99,25 @@ def main():
                         "kappa-delta (verbatim atypical), then Newton feedback "
                         "+ tangential noise pinned to the kappa shell "
                         "(math session 2026-08-31; needs --vib-ckpt); "
+                        "'gaelike' = GAE-style history-weighted entropy cost: "
+                        "gamma^k-weighted sum of capped KLs to EVERY intent "
+                        "visited since the per-chunk anchor (user 2026-09-08, "
+                        "GAElike-dev; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
+    p.add_argument("--gae-gamma", type=float, default=0.9,
+                   help="gaelike: GAE discount gamma -- per-term weight "
+                        "gamma^k on the KL to the k-th intent since the "
+                        "anchor (k=0 anchor weight 1). Bounds the history "
+                        "sum (<= kappa/(1-gamma) raw). gamma=0 = ONLY the "
+                        "anchor term = --guide atypical exactly (value and "
+                        "gradient; dose-compatible).")
+    p.add_argument("--gae-norm", type=int, default=1,
+                   help="gaelike: 1 (default) = divide the weighted sum by "
+                        "sum_k gamma^k so the row cost envelope stays [0, "
+                        "kappa] and the atypical-calibrated guidance_scale "
+                        "carries over; 0 = raw GAE sum (envelope "
+                        "kappa/(1-gamma) -- a ~(1/(1-gamma))x dose uplift, "
+                        "re-calibrate eta first).")
     p.add_argument("--orbit-lam", type=float, default=0.5,
                    help="orbit: feedback gain lambda of the Newton term "
                         "-lam*(KL-kappa)*grad KL/||grad KL||^2 (dimensionless "
@@ -416,7 +435,7 @@ def main():
                     "split protocol (legacy retry-failed mode is unsupported)")
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell", "orbit")) and not args.success_only
+                            "shell", "orbit", "gaelike")) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -672,7 +691,9 @@ def main():
                                             or args.aty_eta_dimless),
                         "orbit_round": args.orbit_round,
                         "orbit_sigma_decay": args.orbit_sigma_decay,
-                        "orbit_fb_clamp": args.orbit_fb_clamp},
+                        "orbit_fb_clamp": args.orbit_fb_clamp,
+                        "gae_gamma": args.gae_gamma,
+                        "gae_norm": int(args.gae_norm)},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )

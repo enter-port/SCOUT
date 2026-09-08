@@ -152,7 +152,8 @@ class RolloutPipeline:
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
                   f"entries from {bank_src}")
-        elif self.guide_mode in ("novelty", "atypical", "combo", "shell"):
+        elif self.guide_mode in ("novelty", "atypical", "combo", "shell",
+                                 "gaelike"):
             # entropy-dev (user 2026-08-24 方案二/三; 2026-08-27 方案A shell):
             # only the cost changes; same injection path, same frozen dyn/VIB
             # encoder.
@@ -181,6 +182,23 @@ class RolloutPipeline:
                     shell_kappa=float(ek.get("shell_kappa", 2.5)),
                     shell_seed=int(ek.get("shell_seed", 42)),
                 )
+            elif self.guide_mode == "gaelike":
+                # GAElike (user 2026-09-08, GAElike-dev): gamma^k-weighted
+                # sum of capped KLs to EVERY intent visited since the
+                # per-chunk anchor -- same injection path / frozen VIB as
+                # atypical; gamma=0 + norm=1 reduces to it exactly.
+                from scout.guidance.gae_costs import GAELikeCostPlanner
+                planner = GAELikeCostPlanner(
+                    scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                    cap=float(ek.get("atypical_cap", 10.0)),
+                    eta_dimless=bool(ek.get("eta_dimless", False)),
+                    gae_gamma=float(ek.get("gae_gamma", 0.9)),
+                    gae_normalize=bool(ek.get("gae_norm", 1)),
+                )
+                print(f"[rollout] GAElike guidance: gamma={planner.gae_gamma} "
+                      f"normalize={planner.gae_normalize} "
+                      f"kappa={planner.cap} "
+                      f"eta_dimless={planner.eta_dimless}")
             else:
                 planner = ComboCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
