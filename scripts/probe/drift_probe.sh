@@ -41,6 +41,10 @@ GST=${GST:-100}
 GPU_ATY=${GPU_ATY:-3}
 GPU_CREP=${GPU_CREP:-1}
 BACKSTOP=${BACKSTOP:-2700}
+# single-arm mode for window rotation (ARM=aty|crep|both, default both):
+# the summary tolerates the other arm's missing round (NOJSON), the ledger
+# CUMULATIVE line carries the across-rounds comparison.
+ARM=${ARM:-both}
 # worktree root: CPFS is at 0 available (2026-09-09) -- the drift-dev
 # deployment lives on the pod-local 1TB NVMe (/tmp/scout-drift, 671G free)
 # so the probe never writes to the full shared volume; ckpts/datasets on
@@ -185,13 +189,18 @@ run_arm() { # name gpu guide extra...
   echo "[drift-probe] arm=$name rc=$rc wall=$(( (t1-t0)/60 ))m$(( (t1-t0)%60 ))s"
 }
 
-echo "[drift-probe] TASK=$TASK ROUND=$ROUND OFF=$OFF N=$N P=$P TRIES=$TRIES scale/cap/gst=$SCALE/$CAP/$GST tau=$TAU gpus aty/crep=$GPU_ATY/$GPU_CREP"
+echo "[drift-probe] TASK=$TASK ROUND=$ROUND OFF=$OFF N=$N P=$P TRIES=$TRIES scale/cap/gst=$SCALE/$CAP/$GST tau=$TAU arm=$ARM gpus aty/crep=$GPU_ATY/$GPU_CREP"
 CREP_ARGS=(--atypical-cap "$CAP" --cloudrep-tau "$TAU")
-run_arm crep "$GPU_CREP" cloudrep ${CREP_ARGS[@]+"${CREP_ARGS[@]}"} &
-CREP_PID=$!
-run_arm aty "$GPU_ATY" atypical --atypical-cap "$CAP" &
-ATY_PID=$!
-wait "$CREP_PID"; wait "$ATY_PID"
+if [ "$ARM" = "both" ] || [ "$ARM" = "crep" ]; then
+  run_arm crep "$GPU_CREP" cloudrep ${CREP_ARGS[@]+"${CREP_ARGS[@]}"} &
+  CREP_PID=$!
+fi
+if [ "$ARM" = "both" ] || [ "$ARM" = "aty" ]; then
+  run_arm aty "$GPU_ATY" atypical --atypical-cap "$CAP" &
+  ATY_PID=$!
+fi
+[ -n "${CREP_PID:-}" ] && wait "$CREP_PID"
+[ -n "${ATY_PID:-}" ] && wait "$ATY_PID"
 [ "${DRY_RUN:-0}" = "1" ] && { echo "[drift-probe] DRY_RUN done"; exit 0; }
 
 # ---- summary: pass@5 per arm + telemetry tails --------------------------- #
