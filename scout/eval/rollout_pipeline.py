@@ -195,9 +195,15 @@ class RolloutPipeline:
                     eta_dimless=bool(ek.get("eta_dimless", False)),
                     cloud_tau=float(ek.get("cloudrep_tau", 0.5)),
                     cloud_max=int(ek.get("cloudrep_max", 8)),
+                    cloud_tau_mode=str(ek.get("cloudrep_tau_mode", "fixed")),
+                    cloud_tau_frac=float(ek.get("cloudrep_tau_frac", 0.3)),
+                    cloud_tau_min=float(ek.get("cloudrep_tau_min", 0.02)),
                 )
                 print(f"[rollout] cloudrep guidance: tau={planner.cloud_tau} "
                       f"cloud_max={planner.cloud_max} "
+                      f"tau_mode={planner.cloud_tau_mode} "
+                      f"frac={planner.cloud_tau_frac} "
+                      f"tau_min={planner.cloud_tau_min} "
                       f"kappa={planner.cap} "
                       f"eta_dimless={planner.eta_dimless}")
             else:

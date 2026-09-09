@@ -230,6 +230,23 @@ def main():
                    help="cloudrep: per-scene cloud capacity (most recent "
                         "chunk-0 anchors kept; the pool is this + the "
                         "current anchor).")
+    p.add_argument("--cloudrep-tau-mode", choices=["fixed", "adapt"],
+                   default="fixed",
+                   help="cloudrep tau mode (reflection iter-2 FIX-1, "
+                        "2026-09-10): 'fixed' (default) = iteration-1 "
+                        "absolute temperature; 'adapt' = per-row "
+                        "tau_i = clamp(frac*(max_j KL - min_j KL), "
+                        "tau_min, tau_0) with tau_0 = --cloudrep-tau as the "
+                        "CEILING (adaptive can only sharpen -- tasks with "
+                        "compressed KL scales like square keep their "
+                        "nearest-neighbor focus instead of averaging the "
+                        "cloud).")
+    p.add_argument("--cloudrep-tau-frac", type=float, default=0.3,
+                   help="cloudrep adapt mode: rho, the pool-spread "
+                        "fraction setting the per-row temperature.")
+    p.add_argument("--cloudrep-tau-min", type=float, default=0.02,
+                   help="cloudrep adapt mode: numerical floor on the "
+                        "per-row temperature.")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -685,6 +702,9 @@ def main():
                         "atypical_cap": args.atypical_cap,
                         "cloudrep_tau": args.cloudrep_tau,
                         "cloudrep_max": args.cloudrep_max,
+                        "cloudrep_tau_mode": args.cloudrep_tau_mode,
+                        "cloudrep_tau_frac": args.cloudrep_tau_frac,
+                        "cloudrep_tau_min": args.cloudrep_tau_min,
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
@@ -859,6 +879,9 @@ def main():
                                            or args.aty_eta_dimless)),
                     **({"cloudrep_tau": args.cloudrep_tau,
                         "cloudrep_max": args.cloudrep_max,
+                        "cloudrep_tau_mode": args.cloudrep_tau_mode,
+                        "cloudrep_tau_frac": args.cloudrep_tau_frac,
+                        "cloudrep_tau_min": args.cloudrep_tau_min,
                         "atypical_cap": args.atypical_cap}
                        if args.guide == "cloudrep" else {}),
                     **({"orbit_lam": args.orbit_lam,

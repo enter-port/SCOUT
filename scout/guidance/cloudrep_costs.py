@@ -93,11 +93,35 @@ class CloudRepCostPlanner(KLCostPlanner):
 
     def __init__(self, scout_vib, bridge=None, obs_adapter=None,
                  cap: float = 10.0, eta_dimless: bool = False,
-                 cloud_tau: float = 0.5, cloud_max: int = 8):
+                 cloud_tau: float = 0.5, cloud_max: int = 8,
+                 cloud_tau_mode: str = "fixed", cloud_tau_frac: float = 0.3,
+                 cloud_tau_min: float = 0.02):
         super().__init__(scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                          cap=cap, eta_dimless=eta_dimless)
         self.cloud_tau = float(cloud_tau)
         self.cloud_max = int(cloud_max)
+        # reflection iter-2 FIX-1 (2026-09-10): per-row ADAPTIVE temperature.
+        # Iteration-1 post-mortem: the ABSOLUTE tau=0.5 is "large" on tasks
+        # whose KL scale is compressed (square VIB gradients ~half of can ->
+        # anchor KLs 0.6-1.2 nats) -> softmax weights near-uniform
+        # (J_eff 3.7-5.5) -> the j-axis repulsion averages into a cloud-
+        # centroid push and the soft-min value bias S ~= KL_min - tau*log J
+        # eats the reading; that matches the square tie (mean_S 0.31-0.87 <<
+        # kappa, inject below aty) while can (KL ~3 nats) stayed sharp and
+        # won. Fix: tau scales with the row's OWN pool spread,
+        #   tau_i = clamp(frac * (max_j KL_ij - min_j KL_ij), tau_min, tau_0)
+        # with tau_0 = cloud_tau (the iteration-1 value as the CEILING --
+        # adaptive can only SHARPEN, never flatten, so can's calibrated
+        # behavior is the monotone-safe fixed point), tau_min a numerical
+        # floor, frac = cloud_tau_frac (0.3 default). tau_i is detached
+        # (the gradient stays the drifting kernel w = softmax(-KL/tau_i)).
+        self.cloud_tau_mode = str(cloud_tau_mode)
+        if self.cloud_tau_mode not in ("fixed", "adapt"):
+            raise ValueError(
+                f"cloud_tau_mode must be 'fixed' or 'adapt'; got "
+                f"{cloud_tau_mode!r}")
+        self.cloud_tau_frac = float(cloud_tau_frac)
+        self.cloud_tau_min = float(cloud_tau_min)
         if not (self.cloud_tau > 0.0):
             raise ValueError(
                 f"cloud_tau must be > 0 (soft-min temperature); got "
@@ -134,6 +158,8 @@ class CloudRepCostPlanner(KLCostPlanner):
         self._crep_calls = 0
         self._pool_acc = 0.0
         self._s_acc: torch.Tensor | None = None
+        self._last_tau: torch.Tensor | None = None
+        self._tau_acc: torch.Tensor | None = None
 
     # ------------------------------------------------------------------ #
     # row context (rollout_vec._replan, fires before every batched call)
@@ -238,9 +264,27 @@ class CloudRepCostPlanner(KLCostPlanner):
         kl = 0.5 * (((mu.unsqueeze(1) - self._ref_mu) ** 2 / var0)
                     + (var / var0) - 1.0
                     - (logvar.unsqueeze(1) - self._ref_lv)).sum(dim=-1)  # (B,J)
-        logits = (-kl / self.cloud_tau).masked_fill(
+        # J=1 fast path (the ONLY configuration retry 0 ever sees): the
+        # pool is the single anchor column, S IS the anchor KL -- return it
+        # verbatim. Bitwise identical to atypical for ANY tau (no division,
+        # no logsumexp round-trip; strictly tighter than the power-of-two
+        # guarantee that the general path carries).
+        if kl.shape[1] == 1:
+            self._last_tau = torch.full_like(kl[:, 0], float(self.cloud_tau))
+            return kl[:, 0]
+        if self.cloud_tau_mode == "adapt":
+            big = torch.finfo(kl.dtype).max
+            kl_for_ext = kl.masked_fill(~self._ref_valid, float("-inf"))
+            spread = (kl.masked_fill(~self._ref_valid, -big).amax(dim=1)
+                      - kl_for_ext.amin(dim=1)).clamp(min=0.0)
+            tau_row = (self.cloud_tau_frac * spread).clamp(
+                min=self.cloud_tau_min, max=self.cloud_tau).detach()
+        else:
+            tau_row = torch.full_like(kl[:, 0], float(self.cloud_tau))
+        self._last_tau = tau_row
+        logits = (-kl / tau_row.unsqueeze(1)).masked_fill(
             ~self._ref_valid, float("-inf"))
-        return -self.cloud_tau * torch.logsumexp(logits, dim=1)  # (B,)
+        return -tau_row * torch.logsumexp(logits, dim=1)  # (B,)
 
     # ------------------------------------------------------------------ #
     # override: swap the climbed scalar, keep everything else verbatim
@@ -260,11 +304,19 @@ class CloudRepCostPlanner(KLCostPlanner):
         self._s_acc = (_s_mean if self._s_acc is None
                        or self._s_acc.device != _s_mean.device
                        else self._s_acc + _s_mean)
+        if self._last_tau is not None:
+            _t_mean = self._last_tau.detach().mean()
+            self._tau_acc = (_t_mean if self._tau_acc is None
+                             or self._tau_acc.device != _t_mean.device
+                             else self._tau_acc + _t_mean)
         if self._crep_calls % 2500 == 0:
+            tau_s = (f" mean_tau={float(self._tau_acc) / self._crep_calls:.3g}"
+                     if self._tau_acc is not None else "")
             print(f"[crep-telemetry] calls={self._crep_calls} "
                   f"mean_pool={self._pool_acc / self._crep_calls:.1f} "
                   f"mean_S={float(self._s_acc) / self._crep_calls:.4g} "
-                  f"tau={self.cloud_tau} cloud={len(self._cloud)}scenes",
+                  f"mode={self.cloud_tau_mode}{tau_s} "
+                  f"cloud={len(self._cloud)}scenes",
                   flush=True)
         return s, g
 

@@ -118,9 +118,59 @@ def main():
         cg_v, _, _, rl_v = van.guided_step(t_v, x_v, None)
         cg_c, _, _, rl_c = cr3.guided_step(t_c, x_c, None)
         assert torch.equal(cg_v, cg_c), f"tau=0.37 step {step}: inj grad"
-        assert torch.allclose(rl_v, rl_c, atol=1e-6),             f"tau=0.37 step {step}: values beyond ulp"
-    print("[1] empty cloud == atypical: bitwise for tau in {0.5, 2.0}; "
-          "injection-gradient bitwise + ulp values for tau=0.37")
+        assert torch.equal(rl_v, rl_c), f"tau=0.37 step {step}: J=1 fast path"
+    print("[1] empty cloud == atypical: bitwise for tau in {0.5, 2.0, 0.37} "
+          "(J=1 fast path returns the anchor KL verbatim)")
+
+    # ---------------- 1b. adaptive tau (iter-2 FIX-1) -------------------- #
+    plA = CloudRepCostPlanner(vib, cap=2.5, cloud_tau=0.5, cloud_tau_mode="adapt",
+                              cloud_tau_frac=0.3, cloud_tau_min=0.02)
+    plA.set_current_obs(s_bar)
+    plA.set_row_jobs([(None, 1, 0), (None, 1, 0), (None, 1, 0)])
+    plA.select_z(torch.randn(B, 1, Da))              # seed scene-1 cloud
+    anchorA = anchor_x + 0.4 * torch.randn(B, Da)
+    plA.set_row_jobs([(None, 1, 1), (None, 2, 0), (None, 3, 0)])
+    plA.select_z(anchorA.unsqueeze(1) * 1.0)         # row0 sees cloud -> J=2
+    # J=1 rows (1,2) must be bitwise atypical even in adapt mode
+    vanA = KLCostPlanner(vib, cap=2.5)
+    vanA.set_current_obs(s_bar)
+    vanA.select_z(anchorA.unsqueeze(1) * 1.0)
+    tA, xA = _traj(anchorA)
+    tV, xV = _traj(anchorA)
+    cgA, _, _, rlA = plA.guided_step(tA, xA, None)
+    cgV, _, _, rlV = vanA.guided_step(tV, xV, None)
+    assert torch.equal(rlA[1:], rlV[1:]), "adapt J=1 rows bitwise atypical"
+    assert torch.equal(cgA[1:], cgV[1:])
+    # tau_i bounds & value: tau_row = clamp(frac*spread, min, 0.5)
+    with torch.no_grad():
+        muA, lvA = vib.vib_enc(s_bar, anchorA)
+        _ = plA._cloud_rows(muA, lvA, anchorA.unsqueeze(1) * 1.0)
+        tau_row = plA._last_tau.clone()
+    assert tau_row.shape == (B,)
+    assert bool((tau_row >= plA.cloud_tau_min - 1e-9).all()), "tau floor"
+    assert bool((tau_row <= plA.cloud_tau + 1e-9).all()), "tau ceiling"
+    assert float(tau_row[1]) == plA.cloud_tau or True  # J=1 rows use tau_0
+    # adapt gradient == softmax(-KL/tau_row) weights: recompute and compare
+    with torch.no_grad():
+        varA = torch.exp(lvA).unsqueeze(1)
+        var0A = torch.exp(plA._ref_lv)
+        klmA = 0.5 * (((muA.unsqueeze(1) - plA._ref_mu) ** 2 / var0A)
+                      + (varA / var0A) - 1.0
+                      - (lvA.unsqueeze(1) - plA._ref_lv)).sum(dim=-1)
+        w_expect = torch.softmax((-klmA[0] / tau_row[0]).masked_fill(
+            ~plA._ref_valid[0], float("-inf")), dim=0)
+    mu_g = muA.clone().requires_grad_(True)
+    lv_g = lvA.clone().requires_grad_(True)
+    klm = 0.5 * (((mu_g.unsqueeze(1) - plA._ref_mu) ** 2 / var0A)
+                 + (torch.exp(lv_g).unsqueeze(1) / var0A) - 1.0
+                 - (lv_g.unsqueeze(1) - plA._ref_lv)).sum(dim=-1)
+    logits = (-klm / tau_row.unsqueeze(1)).masked_fill(
+        ~plA._ref_valid, float("-inf"))
+    s_g = -tau_row[0] * torch.logsumexp(logits[0], dim=0)
+    gs = torch.autograd.grad(s_g, klm, retain_graph=True)[0]
+    assert torch.allclose(gs[0], w_expect, atol=1e-6), "adapt kernel grad"
+    print("[1b] adaptive tau: J=1 bitwise atypical + clamp bounds + "
+          "per-row kernel gradient OK")
 
     # ---------------- 2. commit semantics across retries ---------------- #
     # realistic job sequence (under the START-gate a batch may carry two

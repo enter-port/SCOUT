@@ -45,6 +45,8 @@ BACKSTOP=${BACKSTOP:-2700}
 # the summary tolerates the other arm's missing round (NOJSON), the ledger
 # CUMULATIVE line carries the across-rounds comparison.
 ARM=${ARM:-both}
+TAU_MODE=${TAU_MODE:-fixed}
+export TAU_MODE
 # worktree root: CPFS is at 0 available (2026-09-09) -- the drift-dev
 # deployment lives on the pod-local 1TB NVMe (/tmp/scout-drift, 671G free)
 # so the probe never writes to the full shared volume; ckpts/datasets on
@@ -189,8 +191,11 @@ run_arm() { # name gpu guide extra...
   echo "[drift-probe] arm=$name rc=$rc wall=$(( (t1-t0)/60 ))m$(( (t1-t0)%60 ))s"
 }
 
-echo "[drift-probe] TASK=$TASK ROUND=$ROUND OFF=$OFF N=$N P=$P TRIES=$TRIES scale/cap/gst=$SCALE/$CAP/$GST tau=$TAU arm=$ARM gpus aty/crep=$GPU_ATY/$GPU_CREP"
+echo "[drift-probe] TASK=$TASK ROUND=$ROUND OFF=$OFF N=$N P=$P TRIES=$TRIES scale/cap/gst=$SCALE/$CAP/$GST tau=$TAU mode=$TAU_MODE arm=$ARM gpus aty/crep=$GPU_ATY/$GPU_CREP"
 CREP_ARGS=(--atypical-cap "$CAP" --cloudrep-tau "$TAU")
+if [ "$TAU_MODE" != "fixed" ]; then
+  CREP_ARGS+=(--cloudrep-tau-mode "$TAU_MODE")
+fi
 if [ "$ARM" = "both" ] || [ "$ARM" = "crep" ]; then
   run_arm crep "$GPU_CREP" cloudrep ${CREP_ARGS[@]+"${CREP_ARGS[@]}"} &
   CREP_PID=$!
@@ -211,7 +216,8 @@ T, rnd, tau, ledger = sys.argv[1:5]
 rows = []
 for arm in ("aty", "crep"):
     row = {"round": rnd, "arm": arm,
-           "params": (f"tau{tau}" if arm == "crep" else "aty"),
+           "params": (f"tau{tau},{os.environ.get('TAU_MODE', 'fixed')}"
+                      if arm == "crep" else "aty"),
            "tau": tau}
     rc_f = f"{T}/{arm}.rc"
     row["rc"] = open(rc_f).read().strip() if os.path.exists(rc_f) else "?"
