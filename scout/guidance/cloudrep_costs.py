@@ -43,7 +43,14 @@ KLs:
     for other τ the INJECTION gradient stays bit-identical (single-ref
     softmax weights are τ-free) while the cost VALUES may differ by 1 ulp
     (logsumexp's internal max-shift) -- telemetry-level only. The A/B
-    contrast IS the cloud effect, appearing from retry 1 onward.
+    contrast IS the cloud effect, appearing from retry 1 onward --
+    MECHANISM-LEVEL. Arm-level trajectories are NOT bitwise paired: the
+    start-gate changes the crep arm's batch composition (first wave is one
+    try-0 per scene vs the ungated aty arm's scene-major all-tries fill),
+    so the shared RNG stream is dealt to different scenes -- A/B reads as
+    a same-failed-set STATISTICAL comparison, never as paired bitwise
+    replay (attribution discipline: retry-0 flips between arms are RNG
+    realization noise, not cloud effect).
   * Anti-repetition across retries (the j-axis anchor bank that the GAElike
     post-mortem pre-registered as the untried axis -- the i-axis within a
     denoise walk was falsified there): retry k is pushed away from what

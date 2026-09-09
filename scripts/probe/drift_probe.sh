@@ -9,8 +9,11 @@
 #     gae-era recount was 61-63 -- the runtime derivation is authoritative).
 #   * both arms: P=4 CPU shard workers, n_envs=25, ETRIES=5 (pass@5),
 #     eta 3.0 / kappa 2.5 / gst 100 -- IDENTICAL except --guide atypical vs
-#     cloudrep. Retry 0 of cloudrep is bitwise atypical, so the A/B contrast
-#     IS the cloud effect from retry 1 on.
+#     cloudrep. Retry 0 is MECHANISM-bitwise atypical (empty cloud), but the
+#     start-gate forks the two arms' batch composition -> the shared RNG
+#     stream lands on different scenes: read the A/B as a same-failed-set
+#     STATISTICAL comparison (retry-0 flips = RNG realization noise, never
+#     cloud effect).
 #   * 45-min hard backstop per arm (timeout -k 60 2700); orphans pkill'd by
 #     the unique probe path pattern.
 #   * read-only reuse of the campaigns' train/ ckpts; outputs ONLY under

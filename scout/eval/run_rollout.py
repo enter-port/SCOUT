@@ -440,6 +440,14 @@ def main():
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
                          "(SCOUT VIB ckpt). --guide off does not.")
+    if (args.guide == "cloudrep"
+            and int(getattr(cfg.exploration, "guidance_start_timestep", 1)) < 1):
+        # review P2-1 dead-hole guard: with gst=0 the start-gate never
+        # advances (no guided step -> no chunk-0 select_z commit) and every
+        # try >= 1 blocks forever while rollout_vec busy-spins.
+        raise SystemExit("[run_rollout] --guide cloudrep needs exploration."
+                         "guidance_start_timestep >= 1 (the start-gate "
+                         "advances on chunk-0 anchor commits).")
     if guided and args.guide == "expert" and args.core_hdf5 is None:
         raise SystemExit("[run_rollout] --guide expert needs --core-hdf5 "
                          "(the expert z-bank is built from it).")

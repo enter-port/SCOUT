@@ -123,8 +123,9 @@ def main():
           "injection-gradient bitwise + ulp values for tau=0.37")
 
     # ---------------- 2. commit semantics across retries ---------------- #
-    # realistic job sequence (the job gate serializes a scene's tries, so
-    # one batch never carries two tries of the SAME scene):
+    # realistic job sequence (under the START-gate a batch may carry two
+    # tries of the same scene once both started -- pools/commits are keyed
+    # per row, so the assertions below hold either way):
     #   batch 1 = chunk 0 of (7,0),(9,0),(8,0)   -> all commit once, J=1
     #   batch 2 = later chunks, same tries       -> no commit, J stays 1
     #   batch 3 = chunk 0 of (7,1),(9,1),(8,1)   -> pools J=2, commit again
