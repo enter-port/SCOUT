@@ -247,6 +247,18 @@ def main():
     p.add_argument("--cloudrep-tau-min", type=float, default=0.02,
                    help="cloudrep adapt mode: numerical floor on the "
                         "per-row temperature.")
+    p.add_argument("--cloudrep-agg", choices=["softmin", "add"],
+                   default="softmin",
+                   help="cloudrep aggregation (reflection iter-3 FIX-2): "
+                        "'softmin' (default) = temperature soft-min over "
+                        "[anchor]+cloud (iter-1/2 form); 'add' = anchor KL "
+                        "at FULL weight + lam * cloud soft-min -- the "
+                        "calibrated atypical escape stays intact and the "
+                        "j-axis anti-repetition enters as a pure additive "
+                        "perturbation (GAElike add-mode lesson).")
+    p.add_argument("--cloudrep-lam", type=float, default=0.15,
+                   help="cloudrep add mode: lambda, the weight of the "
+                        "cloud soft-min term.")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -705,6 +717,8 @@ def main():
                         "cloudrep_tau_mode": args.cloudrep_tau_mode,
                         "cloudrep_tau_frac": args.cloudrep_tau_frac,
                         "cloudrep_tau_min": args.cloudrep_tau_min,
+                        "cloudrep_agg": args.cloudrep_agg,
+                        "cloudrep_lam": args.cloudrep_lam,
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
@@ -882,6 +896,8 @@ def main():
                         "cloudrep_tau_mode": args.cloudrep_tau_mode,
                         "cloudrep_tau_frac": args.cloudrep_tau_frac,
                         "cloudrep_tau_min": args.cloudrep_tau_min,
+                        "cloudrep_agg": args.cloudrep_agg,
+                        "cloudrep_lam": args.cloudrep_lam,
                         "atypical_cap": args.atypical_cap}
                        if args.guide == "cloudrep" else {}),
                     **({"orbit_lam": args.orbit_lam,

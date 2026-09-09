@@ -95,7 +95,8 @@ class CloudRepCostPlanner(KLCostPlanner):
                  cap: float = 10.0, eta_dimless: bool = False,
                  cloud_tau: float = 0.5, cloud_max: int = 8,
                  cloud_tau_mode: str = "fixed", cloud_tau_frac: float = 0.3,
-                 cloud_tau_min: float = 0.02):
+                 cloud_tau_min: float = 0.02,
+                 cloud_agg: str = "softmin", cloud_lam: float = 0.15):
         super().__init__(scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                          cap=cap, eta_dimless=eta_dimless)
         self.cloud_tau = float(cloud_tau)
@@ -122,6 +123,24 @@ class CloudRepCostPlanner(KLCostPlanner):
                 f"{cloud_tau_mode!r}")
         self.cloud_tau_frac = float(cloud_tau_frac)
         self.cloud_tau_min = float(cloud_tau_min)
+        # reflection iter-3 FIX-2 (2026-09-10, pre-registered backup): ADD
+        # aggregation -- the anchor keeps its FULL atypical escape force and
+        # the cloud soft-min enters as a pure additive anti-repetition
+        # perturbation at weight lambda (the GAElike add-mode lesson: any
+        # pooling that shares the anchor's budget diluted the calibrated
+        # escape 7-10x; square iter-2 confirmed -- softmax MIXTURE over the
+        # pool lost 16v23 to aty while can won, i.e. the redirect cost
+        # dominates where the KL scale is compressed).
+        #   softmin (default): S = softmin over [anchor] + cloud (iter-1/2)
+        #   add:               S = KL_anchor + lam * softmin over cloud cols
+        # Empty cloud -> S = KL_anchor exactly (bitwise atypical, any mode).
+        self.cloud_agg = str(cloud_agg)
+        if self.cloud_agg not in ("softmin", "add"):
+            raise ValueError(
+                f"cloud_agg must be 'softmin' or 'add'; got {cloud_agg!r}")
+        self.cloud_lam = float(cloud_lam)
+        if self.cloud_lam < 0.0:
+            raise ValueError(f"cloud_lam must be >= 0; got {cloud_lam}")
         if not (self.cloud_tau > 0.0):
             raise ValueError(
                 f"cloud_tau must be > 0 (soft-min temperature); got "
@@ -272,6 +291,36 @@ class CloudRepCostPlanner(KLCostPlanner):
         if kl.shape[1] == 1:
             self._last_tau = torch.full_like(kl[:, 0], float(self.cloud_tau))
             return kl[:, 0]
+        if self.cloud_agg == "add":
+            # FIX-2: anchor at FULL weight; cloud soft-min (over the cloud
+            # columns ONLY, anchor excluded) as a lambda-weighted additive
+            # anti-repetition term. tau for the cloud soft-min follows the
+            # same fixed/adapt rule computed on the cloud columns' own
+            # spread.
+            kl_cloud = kl[:, 1:]
+            val_cloud = self._ref_valid[:, 1:]
+            if self.cloud_tau_mode == "adapt":
+                big = torch.finfo(kl.dtype).max
+                spread = (kl_cloud.masked_fill(~val_cloud, -big).amax(dim=1)
+                          - kl_cloud.masked_fill(~val_cloud, float("-inf"))
+                          .amin(dim=1)).clamp(min=0.0)
+                tau_row = (self.cloud_tau_frac * spread).clamp(
+                    min=self.cloud_tau_min, max=self.cloud_tau).detach()
+            else:
+                tau_row = torch.full_like(kl[:, 0], float(self.cloud_tau))
+            self._last_tau = tau_row
+            logits = (-kl_cloud / tau_row.unsqueeze(1)).masked_fill(
+                ~val_cloud, float("-inf"))
+            has_cloud = val_cloud.any(dim=1)
+            soft = -tau_row * torch.logsumexp(
+                logits.masked_fill(~has_cloud.unsqueeze(1), float("-inf")),
+                dim=1)
+            # rows with an empty cloud: graph-connected zero for the cloud
+            # term (soft is -0*...=0? logsumexp of all -inf = -inf -> nan;
+            # use where on a zero built from the graph)
+            zero = (kl[:, 0] * 0.0)
+            soft = torch.where(has_cloud, soft, zero)
+            return kl[:, 0] + self.cloud_lam * soft
         if self.cloud_tau_mode == "adapt":
             big = torch.finfo(kl.dtype).max
             kl_for_ext = kl.masked_fill(~self._ref_valid, float("-inf"))

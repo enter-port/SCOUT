@@ -46,7 +46,9 @@ BACKSTOP=${BACKSTOP:-2700}
 # CUMULATIVE line carries the across-rounds comparison.
 ARM=${ARM:-both}
 TAU_MODE=${TAU_MODE:-fixed}
-export TAU_MODE
+CREP_AGG=${CREP_AGG:-softmin}
+CREP_LAM=${CREP_LAM:-0.15}
+export TAU_MODE CREP_AGG CREP_LAM
 # worktree root: CPFS is at 0 available (2026-09-09) -- the drift-dev
 # deployment lives on the pod-local 1TB NVMe (/tmp/scout-drift, 671G free)
 # so the probe never writes to the full shared volume; ckpts/datasets on
@@ -196,6 +198,9 @@ CREP_ARGS=(--atypical-cap "$CAP" --cloudrep-tau "$TAU")
 if [ "$TAU_MODE" != "fixed" ]; then
   CREP_ARGS+=(--cloudrep-tau-mode "$TAU_MODE")
 fi
+if [ "$CREP_AGG" != "softmin" ]; then
+  CREP_ARGS+=(--cloudrep-agg "$CREP_AGG" --cloudrep-lam "$CREP_LAM")
+fi
 if [ "$ARM" = "both" ] || [ "$ARM" = "crep" ]; then
   run_arm crep "$GPU_CREP" cloudrep ${CREP_ARGS[@]+"${CREP_ARGS[@]}"} &
   CREP_PID=$!
@@ -216,7 +221,8 @@ T, rnd, tau, ledger = sys.argv[1:5]
 rows = []
 for arm in ("aty", "crep"):
     row = {"round": rnd, "arm": arm,
-           "params": (f"tau{tau},{os.environ.get('TAU_MODE', 'fixed')}"
+           "params": (f"tau{tau},{os.environ.get('TAU_MODE', 'fixed')},"
+                      f"{os.environ.get('CREP_AGG', 'softmin')}"
                       if arm == "crep" else "aty"),
            "tau": tau}
     rc_f = f"{T}/{arm}.rc"

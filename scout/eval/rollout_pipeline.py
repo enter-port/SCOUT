@@ -198,12 +198,15 @@ class RolloutPipeline:
                     cloud_tau_mode=str(ek.get("cloudrep_tau_mode", "fixed")),
                     cloud_tau_frac=float(ek.get("cloudrep_tau_frac", 0.3)),
                     cloud_tau_min=float(ek.get("cloudrep_tau_min", 0.02)),
+                    cloud_agg=str(ek.get("cloudrep_agg", "softmin")),
+                    cloud_lam=float(ek.get("cloudrep_lam", 0.15)),
                 )
                 print(f"[rollout] cloudrep guidance: tau={planner.cloud_tau} "
                       f"cloud_max={planner.cloud_max} "
                       f"tau_mode={planner.cloud_tau_mode} "
                       f"frac={planner.cloud_tau_frac} "
                       f"tau_min={planner.cloud_tau_min} "
+                      f"agg={planner.cloud_agg} lam={planner.cloud_lam} "
                       f"kappa={planner.cap} "
                       f"eta_dimless={planner.eta_dimless}")
             else:
