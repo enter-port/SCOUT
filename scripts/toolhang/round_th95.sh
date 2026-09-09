@@ -478,6 +478,7 @@ accum = os.path.join(rdir, "success_accum.hdf5")
 info = merge_accumulated_hdf5(core_path, succs, accum)
 print(f"[dp-accum] merged {info} -> {accum}")
 PYEOF
+DP_BATCH=${DP_BATCH:-256}   # 09-09 user order: DP retrain batch 64->256 from next round (LR untouched; dyn/round0 untouched; rollback: DP_BATCH=64)
 if [ "$XMODE" = soe ]; then
   EP=${DP_EPOCHS_SOE:-300}
   CKE=150                   # 300ep -> ckpts 149/299 (final epoch is saved)
@@ -490,6 +491,7 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="
   --config-path configs --config-name base_dp_${TASK}_image \
   task.dataset_path="$RDIR/success_accum.hdf5" \
   task.train_filter_key=scout_aug \
+  dataloader.batch_size=$DP_BATCH \
   "${DPOPTS[@]}" \
   training.num_epochs=$EP \
   training.checkpoint_every=$CKE \
@@ -507,6 +509,7 @@ if [ $RC -ne 0 ]; then
     --config-path configs --config-name base_dp_${TASK}_image \
     task.dataset_path="$RDIR/success_accum.hdf5" \
     task.train_filter_key=scout_aug \
+    dataloader.batch_size=$DP_BATCH \
     "${DPOPTS[@]}" \
     training.num_epochs=$EP \
     training.checkpoint_every=$CKE \
