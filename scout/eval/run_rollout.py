@@ -79,7 +79,8 @@ def main():
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
     p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo", "shell", "orbit"],
+                                        "atypical", "combo", "shell", "orbit",
+                                        "cloudrep"],
                    default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
@@ -98,6 +99,10 @@ def main():
                         "kappa-delta (verbatim atypical), then Newton feedback "
                         "+ tangential noise pinned to the kappa shell "
                         "(math session 2026-08-31; needs --vib-ckpt); "
+                        "'cloudrep' = drifting-style cloud-referenced "
+                        "repulsion: soft-min KL over {current anchor} ∪ "
+                        "{per-scene anchor cloud of earlier retries} "
+                        "(drift-dev 方案一, 2026-09-09; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
     p.add_argument("--orbit-lam", type=float, default=0.5,
                    help="orbit: feedback gain lambda of the Newton term "
@@ -211,6 +216,20 @@ def main():
                         "eta_tilde = scale_raw * <g_med> measured on data "
                         "(per-step exact). OFF (default) = raw-scale legacy, "
                         "bit-identical.")
+    p.add_argument("--cloudrep-tau", type=float, default=0.5,
+                   help="cloudrep (drift-dev 方案一): soft-min temperature "
+                        "τ over the reference pool {current anchor} ∪ "
+                        "{scene cloud of earlier-retry chunk-0 anchors}. "
+                        "The climb gradient is the drifting normalized "
+                        "kernel (softmax over references); small τ = escape "
+                        "the NEAREST tried thing, large τ = average over "
+                        "the cloud. Empty cloud (retry 0) = bitwise "
+                        "atypical for power-of-two τ (default 0.5); other "
+                        "τ keep the injection bitwise, values at 1 ulp.")
+    p.add_argument("--cloudrep-max", type=int, default=8,
+                   help="cloudrep: per-scene cloud capacity (most recent "
+                        "chunk-0 anchors kept; the pool is this + the "
+                        "current anchor).")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -416,7 +435,7 @@ def main():
                     "split protocol (legacy retry-failed mode is unsupported)")
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell", "orbit")) and not args.success_only
+                            "shell", "orbit", "cloudrep")) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -656,6 +675,8 @@ def main():
         entropy_kwargs={"novelty_h": args.novelty_h,
                         "novelty_sample_z": bool(args.novelty_sample_z),
                         "atypical_cap": args.atypical_cap,
+                        "cloudrep_tau": args.cloudrep_tau,
+                        "cloudrep_max": args.cloudrep_max,
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
@@ -828,6 +849,10 @@ def main():
                     "guidance_scale": float(cfg.exploration.guidance_scale),
                     "eta_dimless": int(bool(args.orbit_eta_dimless
                                            or args.aty_eta_dimless)),
+                    **({"cloudrep_tau": args.cloudrep_tau,
+                        "cloudrep_max": args.cloudrep_max,
+                        "atypical_cap": args.atypical_cap}
+                       if args.guide == "cloudrep" else {}),
                     **({"orbit_lam": args.orbit_lam,
                         "orbit_delta": args.orbit_delta,
                         "orbit_sigma": args.orbit_sigma,
