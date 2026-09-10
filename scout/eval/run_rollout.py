@@ -725,6 +725,7 @@ def main():
                         "cloudrep_tau_min": args.cloudrep_tau_min,
                         "cloudrep_agg": args.cloudrep_agg,
                         "cloudrep_lam": args.cloudrep_lam,
+                        "cloudrep_k": args.cloudrep_k,
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,

@@ -459,8 +459,12 @@ class CloudRepCostPlanner(KLCostPlanner):
             return zero, g0
         kl = self._kl_matrix(mu, logvar)                          # (B, J)
         kl_a = kl[:, 0]
+        # retain unconditionally: BOTH the K=1 else-branch (two grads
+        # every step) and the K>1 need-steps run a SECOND backward through
+        # the same graph -- the only single-grad case (K>1 cache-hit step)
+        # loses nothing by retaining (the graph dies with the step).
         g_a = torch.autograd.grad(kl_a.sum(), trajectory,
-                                  retain_graph=(self.cloud_k > 1))[0]
+                                  retain_graph=True)[0]
         if self.cloud_k > 1:
             # K-refresh: fresh cloud backward every K-th step (or when the
             # cache is stale/shape-mismatched); otherwise reuse the cached

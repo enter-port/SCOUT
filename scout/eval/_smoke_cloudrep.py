@@ -213,6 +213,43 @@ def main():
     print("[1c] ort: empty-cloud bitwise atypical + tangential increment "
           "orthogonal to anchor grad OK")
 
+    # ---------------- 1d. ort K-refresh paths (iter-5) ------------------- #
+    # K=1 (two fresh grads EVERY step -- the branch that crashed when
+    # retain_graph was made conditional) and K=4 (cache + re-projection),
+    # both multi-step with a live cloud.
+    for kk in (1, 4):
+        plK = CloudRepCostPlanner(vib, cap=2.5, cloud_agg="ort",
+                                  cloud_lam=0.3, cloud_tau_mode="adapt",
+                                  cloud_k=kk)
+        plK.set_current_obs(s_bar)
+        plK.set_row_jobs([(None, 1, 0)] * B)
+        plK.select_z(torch.randn(B, 1, Da))
+        plK.set_row_jobs([(None, 1, 1), (None, 2, 0), (None, 3, 0)])
+        plK.select_z((anchor_x + 0.2).unsqueeze(1) * 1.0)
+        for step in range(6):
+            xk = anchor_x + 0.3 * (step + 1) * torch.randn(B, Da)
+            t_k, x_k = _traj(xk)
+            kl_k, g_k = plK._kl_backward(t_k, x_k, None)
+            assert torch.isfinite(g_k).all(), f"K={kk} step {step} grad"
+        # tangential part still orthogonal on a cache-refresh step
+        plK.cloud_lam = 0.0
+        t_k, x_k = _traj(xk)
+        _, g0_k = plK._kl_backward(t_k, x_k, None)
+        plK.cloud_lam = 0.3
+        t_k2, x_k2 = _traj(xk)
+        _, g1_k = plK._kl_backward(t_k2, x_k2, None)
+        delta = (g1_k - g0_k).detach()
+        ga_d = g0_k.detach()
+        live = delta.flatten(1).norm(dim=1) > 1e-9
+        if bool(live.any()):
+            rel = ((delta * ga_d).flatten(1).sum(dim=1)[live]
+                   / (delta.flatten(1).norm(dim=1)[live]
+                      * ga_d.flatten(1).norm(dim=1)[live].clamp(min=1e-12)
+                      )).abs().max()
+            assert rel < 1e-5, f"K={kk} orthogonality {rel}"
+    print("[1d] ort K-refresh (K=1 two-fresh-grads + K=4 cached): "
+          "multi-step stability + orthogonality OK")
+
     # ---------------- 2. commit semantics across retries ---------------- #
     # realistic job sequence (under the START-gate a batch may carry two
     # tries of the same scene once both started -- pools/commits are keyed
