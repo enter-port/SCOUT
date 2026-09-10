@@ -33,13 +33,17 @@
 
 | 任务 | aty 基线 | crep iter-1 | crep iter-2(adapt) | crep iter-3(add) |
 |---|---|---|---|---|
-| can 43 失败 | 14 | 18 | **21** | r3 在跑 |
+| can 43 失败 | 14 | 18 | **21** | 16 |
 | square 63 失败 | 23(r1 9 + r4 14) | 9([0:32],未续) | 16 | **20** |
 
 - **can:cloudrep 胜**(adapt 21 vs 14,+7;iter-1 的 McNemar 10/4/8,单侧 p=.19;
   iter-2 的 +7 更强)。pass@5 = .78 vs .71。
 - **square:cloudrep 负**(最好 add 20 vs 23,−3;迭代轨迹 9→16→20 改善但未过线)。
   pass@5 = .53 vs .60。
+- can r3(add)=16/43:加法在 can 回退——λ 云项把 S 推到 8.5 nats ≫ κ,行提前
+  断锚点力(GAElike P1-1「聚合 κ 预算杀死整行」病理在 add 模式的复现)。
+- **无单一配置双任务全胜**:adapt 赢 can、add 是 square 最好但仍差 3。
+  迭代硬上限(3 轮)用尽,按协议停。
 - 机制读数:can(KL 尺度大)上云排斥是净收益;square(KL 压缩、aty 本身强)上
   任何形式的云项都净亏——j 轴反重复的价值是任务依赖的。
 - jerk:crep 系全程 ≈ aty(can .365-.380 vs .381;square add .22-.29 vs .26)。
