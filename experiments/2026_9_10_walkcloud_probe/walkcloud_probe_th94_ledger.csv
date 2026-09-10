@@ -1,0 +1,5 @@
+round,arm,params,tau_mode,tau,hist_max,rc,rescued,n,p5_rescue_rate,pass_at_5,jerk,collected,shard_tally,mean_inject,wc_mean_S,wc_hist_len
+1,aty,aty,adapt,0.5,0,124,NOJSON,NOJSON,NOJSON,NOJSON,NOJSON,,9,0.1966,,
+1,wc,"adapt,t0.5,h0",adapt,0.5,0,124,NOJSON,NOJSON,NOJSON,NOJSON,NOJSON,,2,10.74,5.265,50.5
+2,aty,aty,adapt,0.5,0,0,9,21,0.429,0.88,0.0794,14,9,0.1167,,
+2,wc,"adapt,t0.5,h0",adapt,0.5,0,0,3,21,0.143,0.82,0.1987,3,3,5.214,3.996,50.5

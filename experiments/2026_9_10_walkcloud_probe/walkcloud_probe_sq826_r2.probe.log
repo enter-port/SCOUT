@@ -1,0 +1,17 @@
+[sq-wc-probe] failed set: 63 inits, recorded SR 37/100 (drift campaign reference: 63 failed / SR .37)
+[sq-wc-probe] window [32:63] = [53, 55, 56, 57, 58, 59, 60, 62, 63, 64, 67, 68, 69, 70, 71, 75, 78, 79, 80, 81, 84, 87, 88, 89, 90, 92, 93, 95, 96, 98, 99]
+[wc-probe-cfg] data/walkcloud_probe_sq826/r2/cfg_aty.yaml: guidance_scale=3.0 gst=100
+[wc-probe-cfg] data/walkcloud_probe_sq826/r2/cfg_wc.yaml: guidance_scale=3.0 gst=100
+[sq-wc-probe] ROUND=2 OFF=32 N=31 P=6 TRIES=5 aty(scale/cap/gst)=3.0/2.5/100 wc(tau_mode/tau/hist_max)=adapt/0.5/0 gpus aty/wc=6/5
+[sq-wc-probe] arm=wc gpu=5 guide=walkcloud P=6 extra=--atypical-cap 2.5 --cloud-tau-mode adapt --cloud-tau 0.5 --cloud-hist-max 0 (backstop 2700s)
+[sq-wc-probe] arm=aty gpu=6 guide=atypical P=6 extra=--atypical-cap 2.5 (backstop 2700s)
+[sq-wc-probe] arm=aty rc=0 wall=25m13s
+[sq-wc-probe] arm=wc rc=0 wall=31m5s
+[sq-wc-probe] aty: {'round': '2', 'arm': 'aty', 'params': 'aty', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 11, 'n': 31, 'p5_rescue_rate': 0.355, 'pass_at_5': 0.8, 'jerk': 0.2628, 'collected': 29, 'shard_tally': 11, 'mean_inject': '1.647', 'wc_mean_S': '', 'wc_hist_len': ''}
+[sq-wc-probe] wc: {'round': '2', 'arm': 'wc', 'params': 'adapt,t0.5,h0', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 11, 'n': 31, 'p5_rescue_rate': 0.355, 'pass_at_5': 0.8, 'jerk': 0.1454, 'collected': 26, 'shard_tally': 11, 'mean_inject': '0.6765', 'wc_mean_S': '-1.395', 'wc_hist_len': '50.5'}
+[sq-wc-probe] VERDICT: TIE (rescued@5 wc=11 vs aty=11)
+[sq-wc-probe] PRE-REGISTERED FALSIFICATION LINE: wc<=14 -- if mean_S telemetry is normal, the i-axis falsification EXTENDS to kernel aggregation (walkcloud_plan §5): STOP.
+[sq-wc-probe] CUMULATIVE (last row per round/arm/params): aty=23/63 rescue_rate=0.365 wc=18/63 rescue_rate=0.286
+[sq-wc-probe] aty render: data/walkcloud_probe_sq826/r2/aty/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[sq-wc-probe] wc render: data/walkcloud_probe_sq826/r2/wc/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[sq-wc-probe] ROUND 2 DONE 2026-09-10 19:46:04

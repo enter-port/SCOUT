@@ -1,0 +1,16 @@
+[sq-wc-probe] failed set: 63 inits, recorded SR 37/100 (drift campaign reference: 63 failed / SR .37)
+[sq-wc-probe] window [0:32] = [0, 6, 8, 9, 10, 11, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24, 27, 29, 32, 33, 34, 36, 37, 38, 39, 40, 42, 43, 45, 50, 51, 52]
+[wc-probe-cfg] data/walkcloud_probe_sq826/r1/cfg_aty.yaml: guidance_scale=3.0 gst=100
+[wc-probe-cfg] data/walkcloud_probe_sq826/r1/cfg_wc.yaml: guidance_scale=3.0 gst=100
+[sq-wc-probe] ROUND=1 OFF=0 N=32 P=6 TRIES=5 aty(scale/cap/gst)=3.0/2.5/100 wc(tau_mode/tau/hist_max)=adapt/0.5/0 gpus aty/wc=6/5
+[sq-wc-probe] arm=wc gpu=5 guide=walkcloud P=6 extra=--atypical-cap 2.5 --cloud-tau-mode adapt --cloud-tau 0.5 --cloud-hist-max 0 (backstop 2700s)
+[sq-wc-probe] arm=aty gpu=6 guide=atypical P=6 extra=--atypical-cap 2.5 (backstop 2700s)
+[sq-wc-probe] arm=wc rc=0 wall=25m20s
+[sq-wc-probe] arm=aty rc=0 wall=27m19s
+[sq-wc-probe] aty: {'round': '1', 'arm': 'aty', 'params': 'aty', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 12, 'n': 32, 'p5_rescue_rate': 0.375, 'pass_at_5': 0.8, 'jerk': 0.278, 'collected': 22, 'shard_tally': 12, 'mean_inject': '1.562', 'wc_mean_S': '', 'wc_hist_len': ''}
+[sq-wc-probe] wc: {'round': '1', 'arm': 'wc', 'params': 'adapt,t0.5,h0', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 7, 'n': 32, 'p5_rescue_rate': 0.219, 'pass_at_5': 0.75, 'jerk': 0.1179, 'collected': 21, 'shard_tally': 7, 'mean_inject': '0.3964', 'wc_mean_S': '-1.232', 'wc_hist_len': '50.5'}
+[sq-wc-probe] VERDICT: SCOUT(aty) wins (rescued@5 wc=7 vs aty=12)
+[sq-wc-probe] PRE-REGISTERED FALSIFICATION LINE: wc<=14 -- if mean_S telemetry is normal, the i-axis falsification EXTENDS to kernel aggregation (walkcloud_plan §5): STOP.
+[sq-wc-probe] aty render: data/walkcloud_probe_sq826/r1/aty/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[sq-wc-probe] wc render: data/walkcloud_probe_sq826/r1/wc/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[sq-wc-probe] ROUND 1 DONE 2026-09-10 19:14:53

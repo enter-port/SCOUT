@@ -1,0 +1,17 @@
+[th-wc-probe] failed set: 69 inits, recorded SR 31/100 (TH9-4 round0 r1 reference: 69 failed / SR .31)
+[th-wc-probe] window [48:69] = [71, 72, 74, 76, 77, 78, 82, 83, 84, 85, 86, 87, 89, 90, 91, 92, 95, 96, 97, 98, 99]
+[wc-probe-cfg] data/walkcloud_probe_th94/r2/cfg_aty.yaml: guidance_scale=3.0 gst=100
+[wc-probe-cfg] data/walkcloud_probe_th94/r2/cfg_wc.yaml: guidance_scale=3.0 gst=100
+[th-wc-probe] ROUND=2 OFF=48 N=21 P=4 TRIES=5 aty(scale/cap/gst)=3.0/2.5/100 wc(tau_mode/tau/hist_max)=adapt/0.5/0 gpus aty/wc=3/1
+[th-wc-probe] arm=wc gpu=1 guide=walkcloud P=4 extra=--atypical-cap 2.5 --cloud-tau-mode adapt --cloud-tau 0.5 --cloud-hist-max 0 (backstop 2700s)
+[th-wc-probe] arm=aty gpu=3 guide=atypical P=4 extra=--atypical-cap 2.5 (backstop 2700s)
+[th-wc-probe] arm=wc rc=0 wall=23m17s
+[th-wc-probe] arm=aty rc=0 wall=30m9s
+[th-wc-probe] aty: {'round': '2', 'arm': 'aty', 'params': 'aty', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 9, 'n': 21, 'p5_rescue_rate': 0.429, 'pass_at_5': 0.88, 'jerk': 0.0794, 'collected': 14, 'shard_tally': 9, 'mean_inject': '0.1167', 'wc_mean_S': '', 'wc_hist_len': ''}
+[th-wc-probe] wc: {'round': '2', 'arm': 'wc', 'params': 'adapt,t0.5,h0', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 3, 'n': 21, 'p5_rescue_rate': 0.143, 'pass_at_5': 0.82, 'jerk': 0.1987, 'collected': 3, 'shard_tally': 3, 'mean_inject': '5.214', 'wc_mean_S': '3.996', 'wc_hist_len': '50.5'}
+[th-wc-probe] VERDICT: SCOUT(aty) wins (rescued@5 wc=3 vs aty=9)
+[th-wc-probe] PRE-REGISTERED FALSIFICATION LINE: wc<=14 -- if mean_S telemetry is normal, the i-axis falsification EXTENDS to kernel aggregation (walkcloud_plan §5): STOP.
+[th-wc-probe] CUMULATIVE (last row per round/arm/params): aty=9/21 rescue_rate=0.429 wc=3/21 rescue_rate=0.143
+[th-wc-probe] aty render: data/walkcloud_probe_th94/r2/aty/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[th-wc-probe] wc render: data/walkcloud_probe_th94/r2/wc/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[th-wc-probe] ROUND 2 DONE 2026-09-10 20:33:53

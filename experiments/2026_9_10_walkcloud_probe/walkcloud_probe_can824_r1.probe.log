@@ -1,0 +1,16 @@
+[wc-probe] failed set: 43 inits, recorded SR 57/100 (drift campaign reference: 43 failed / SR .57; gae probe saw 38)
+[wc-probe] window [0:all] = [3, 4, 6, 9, 12, 18, 20, 21, 28, 31, 33, 35, 39, 40, 42, 45, 46, 49, 50, 51, 52, 53, 56, 57, 58, 59, 63, 64, 67, 70, 71, 73, 75, 76, 77, 78, 83, 86, 87, 93, 94, 95, 99]
+[wc-probe-cfg] data/walkcloud_probe_can824/r1/cfg_aty.yaml: guidance_scale=3.0 gst=100
+[wc-probe-cfg] data/walkcloud_probe_can824/r1/cfg_wc.yaml: guidance_scale=3.0 gst=100
+[wc-probe] ROUND=1 OFF=0 N=0 P=4 TRIES=5 aty(scale/cap/gst)=3.0/2.5/100 wc(tau_mode/tau/hist_max)=adapt/0.5/0 gpus aty/wc=3/1
+[wc-probe] arm=wc gpu=1 guide=walkcloud P=4 extra=--atypical-cap 2.5 --cloud-tau-mode adapt --cloud-tau 0.5 --cloud-hist-max 0 (backstop 2700s)
+[wc-probe] arm=aty gpu=3 guide=atypical P=4 extra=--atypical-cap 2.5 (backstop 2700s)
+[wc-probe] arm=aty rc=0 wall=29m10s
+[wc-probe] arm=wc rc=0 wall=31m0s
+[wc-probe] aty: {'round': '1', 'arm': 'aty', 'params': 'aty', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 14, 'n': 43, 'p5_rescue_rate': 0.326, 'pass_at_5': 0.71, 'jerk': 0.3814, 'collected': 33, 'shard_tally': 14, 'mean_inject': '1.055', 'wc_mean_S': '', 'wc_hist_len': ''}
+[wc-probe] wc: {'round': '1', 'arm': 'wc', 'params': 'adapt,t0.5,h0', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 10, 'n': 43, 'p5_rescue_rate': 0.233, 'pass_at_5': 0.67, 'jerk': 0.1253, 'collected': 33, 'shard_tally': 10, 'mean_inject': '0.5732', 'wc_mean_S': '-1.205', 'wc_hist_len': '50.5'}
+[wc-probe] VERDICT: SCOUT(aty) wins (rescued@5 wc=10 vs aty=14)
+[wc-probe] PRE-REGISTERED FALSIFICATION LINE: wc<=14 -- if mean_S telemetry is normal, the i-axis falsification EXTENDS to kernel aggregation (walkcloud_plan §5): STOP.
+[wc-probe] aty render: data/walkcloud_probe_can824/r1/aty/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[wc-probe] wc render: data/walkcloud_probe_can824/r1/wc/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[wc-probe] ROUND 1 DONE 2026-09-10 19:18:33
