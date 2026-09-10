@@ -42,6 +42,10 @@
 #        [WC_HIST_MAX=0] [P=6] [TRIES=5] [ATY_SCALE=3.0] [CAP=2.5] [GST=100]
 #        [GPU_ATY=6] [GPU_WC=5] [BACKSTOP=2700] [SCOUT_DIR=/tmp/scout-drift]
 #        [WC_EXTRA="--cloud-tau-frac 0.15"] [DRY_RUN=1]
+#        [ARMS="aty wc"] [ROOT=data/walkcloud_probe_sq826]
+# ARMS/ROOT exist for the 2026-09-10 k/gst sweep: run the wc arm alone under
+# a per-config ROOT (kappa/gst recorded in the ledger params key) so 4
+# configs can share the frozen failed set without colliding on r${ROUND}/.
 # Step 0 (failed-set derivation) runs automatically when failed_dp.json is
 # missing (~10 min, unguided eval); force with PREP_ONLY=1.
 set -uo pipefail
@@ -60,6 +64,7 @@ GPU_ATY=${GPU_ATY:-6}
 GPU_WC=${GPU_WC:-5}
 BACKSTOP=${BACKSTOP:-2700}
 SCOUT_DIR=${SCOUT_DIR:-/tmp/scout-drift}
+ARMS=${ARMS:-"aty wc"}
 
 cd "$SCOUT_DIR" || { echo "[sq-wc-probe] FATAL: scout dir $SCOUT_DIR missing"; exit 1; }
 PY=/root/workspace/baojiachun/.venv/bin/python
@@ -67,7 +72,7 @@ TH=/root/workspace/baojiachun/scout-entropy/data/2026_8_26_entropy/SQUARE-entrop
 DP=$TH/train/DP/DP-base/checkpoints/599.ckpt
 VIB=$TH/train/dyn/dyn-base/20260826-112119/scout_vib.ckpt
 OFFICIAL=/root/workspace/baojiachun/scout/data/robomimic/square/ph/image_v141_abs.hdf5
-ROOT=data/walkcloud_probe_sq826
+ROOT=${ROOT:-data/walkcloud_probe_sq826}
 CORE=$ROOT/square_core.hdf5
 FAILED=$ROOT/failed_dp.json
 T=$ROOT/r${ROUND}
@@ -130,8 +135,8 @@ PYEOF
 WIN=$T/win.json
 
 # ---- per-arm config copies (dose is config-only, th_p10_probe pattern) --- #
-for spec in "aty:${ATY_SCALE}" "wc:${ATY_SCALE}"; do
-  arm=${spec%%:*}; sc=${spec#*:}
+for arm in $ARMS; do
+  sc=$ATY_SCALE
   $PY - "configs/eval_square_entropy.yaml" "$T/cfg_${arm}.yaml" "$sc" "$GST" <<'PYEOF'
 import sys, yaml
 src, out, sc, gst = sys.argv[1:5]
@@ -176,7 +181,7 @@ run_arm() { # name gpu guide extra...
       > "$T/$name.stdout" 2>&1
   local rc=$?
   if [ "$rc" = "124" ]; then
-    local pat="walkcloud_probe_sq826/r${ROUND}/${name}"
+    local pat="${ROOT}/r${ROUND}/${name}"
     pkill -f "$pat" 2>/dev/null && sleep 3
   fi
   local t1=$(date +%s)
@@ -193,22 +198,28 @@ if [ -n "${WC_EXTRA:-}" ]; then
   read -ra _WE <<< "$WC_EXTRA"
   WC_ARGS+=("${_WE[@]}")
 fi
-run_arm wc "$GPU_WC" walkcloud ${WC_ARGS[@]+"${WC_ARGS[@]}"} &
-WC_PID=$!
-run_arm aty "$GPU_ATY" atypical --atypical-cap "$CAP" &
-ATY_PID=$!
-wait "$WC_PID"; wait "$ATY_PID"
+for arm in $ARMS; do
+  if [ "$arm" = wc ]; then
+    run_arm wc "$GPU_WC" walkcloud ${WC_ARGS[@]+"${WC_ARGS[@]}"} &
+  else
+    run_arm aty "$GPU_ATY" atypical --atypical-cap "$CAP" &
+  fi
+done
+wait
 [ "${DRY_RUN:-0}" = "1" ] && { echo "[sq-wc-probe] DRY_RUN done"; exit 0; }
 
 # ---- summary: pass@5 per arm + shard-grep hard tally + telemetry tails --- #
 sleep 2
-$PY - "$T" "$ROUND" "$WC_TAU_MODE" "$WC_TAU" "$WC_HIST_MAX" "$ROOT/ledger.csv" <<'PYEOF'
+$PY - "$T" "$ROUND" "$WC_TAU_MODE" "$WC_TAU" "$WC_HIST_MAX" "$ROOT/ledger.csv" \
+     "$CAP" "$GST" "$ARMS" <<'PYEOF'
 import csv, glob, json, os, re, sys
-T, rnd, tau_mode, tau, hmax, ledger = sys.argv[1:7]
+T, rnd, tau_mode, tau, hmax, ledger, cap, gst, arms_s = sys.argv[1:10]
+arms = arms_s.split()
 rows = []
-for arm in ("aty", "wc"):
+for arm in arms:
     row = {"round": rnd, "arm": arm,
-           "params": (f"{tau_mode},t{tau},h{hmax}" if arm == "wc" else "aty"),
+           "params": (f"{tau_mode},t{tau},h{hmax},k{cap},g{gst}" if arm == "wc"
+                      else f"aty,k{cap},g{gst}"),
            "tau_mode": tau_mode, "tau": tau, "hist_max": hmax}
     rc_f = f"{T}/{arm}.rc"
     row["rc"] = open(rc_f).read().strip() if os.path.exists(rc_f) else "?"
@@ -270,7 +281,10 @@ def _n(r, k):
 
 a_r, w_r = _n(aty, "shard_tally") or _n(aty, "rescued"), \
            _n(wc, "shard_tally") or _n(wc, "rescued")
-if w_r is not None and a_r is not None:
+if w_r is not None and a_r is None:
+    print(f"[sq-wc-probe] wc-only readout (no aty arm this run): "
+          f"rescued@5 wc={w_r:g} of {(_n(wc, 'n') or float('nan')):g}")
+elif w_r is not None and a_r is not None:
     partial = any(str(r.get("rc")) not in ("0", "?") for r in (aty, wc))
     verdict = "WALKCLOUD WINS" if w_r > a_r else ("TIE" if w_r == a_r
                                                   else "SCOUT(aty) wins")
@@ -300,8 +314,9 @@ if not new:
     acc = defaultdict(lambda: [0, 0])
     for r in last.values():
         try:
-            acc[r["arm"]][0] += int(r["rescued"])
-            acc[r["arm"]][1] += int(r["n"])
+            key = f"{r['arm']}|{r['params']}"
+            acc[key][0] += int(r["rescued"])
+            acc[key][1] += int(r["n"])
         except (TypeError, ValueError, KeyError):
             pass
     print("[sq-wc-probe] CUMULATIVE (last row per round/arm/params): " + " ".join(
@@ -310,7 +325,7 @@ if not new:
 PYEOF
 
 # ---- post-hoc render-integrity check (report-only) ----------------------- #
-for arm in aty wc; do
+for arm in $ARMS; do
   if [ -f "$T/$arm/all.hdf5" ]; then
     $PY scripts/viz/vis_validate.py "$T/$arm/all.hdf5" \
       > "$T/$arm.vischeck.txt" 2>&1 \
