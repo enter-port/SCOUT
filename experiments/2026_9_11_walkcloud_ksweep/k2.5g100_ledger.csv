@@ -1,0 +1,3 @@
+round,arm,params,tau_mode,tau,hist_max,rc,rescued,n,p5_rescue_rate,pass_at_5,jerk,collected,shard_tally,mean_inject,wc_mean_S,wc_hist_len
+1,wc,"adapt,t0.5,h0,k2.5,g100",adapt,0.5,0,0,7,32,0.219,0.75,0.1179,21,7,0.3964,-1.232,50.5
+2,wc,"adapt,t0.5,h0,k2.5,g100",adapt,0.5,0,0,11,31,0.355,0.8,0.1454,26,11,0.6765,-1.395,50.5

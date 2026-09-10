@@ -1,0 +1,11 @@
+[sq-wc-probe] failed set: 63 inits, recorded SR 37/100 (drift campaign reference: 63 failed / SR .37)
+[sq-wc-probe] window [32:63] = [53, 55, 56, 57, 58, 59, 60, 62, 63, 64, 67, 68, 69, 70, 71, 75, 78, 79, 80, 81, 84, 87, 88, 89, 90, 92, 93, 95, 96, 98, 99]
+[wc-probe-cfg] data/walkcloud_ksweep_sq/k2.5g50/r2/cfg_wc.yaml: guidance_scale=3.0 gst=50
+[sq-wc-probe] ROUND=2 OFF=32 N=31 P=6 TRIES=5 aty(scale/cap/gst)=3.0/2.5/50 wc(tau_mode/tau/hist_max)=adapt/0.5/0 gpus aty/wc=6/6
+[sq-wc-probe] arm=wc gpu=6 guide=walkcloud P=6 extra=--atypical-cap 2.5 --cloud-tau-mode adapt --cloud-tau 0.5 --cloud-hist-max 0 (backstop 2700s)
+[sq-wc-probe] arm=wc rc=0 wall=25m14s
+[sq-wc-probe] wc: {'round': '2', 'arm': 'wc', 'params': 'adapt,t0.5,h0,k2.5,g50', 'tau_mode': 'adapt', 'tau': '0.5', 'hist_max': '0', 'rc': '0', 'rescued': 10, 'n': 31, 'p5_rescue_rate': 0.323, 'pass_at_5': 0.79, 'jerk': 0.1275, 'collected': 26, 'shard_tally': 10, 'mean_inject': '0.01432', 'wc_mean_S': '-0.06242', 'wc_hist_len': '25.5'}
+[sq-wc-probe] wc-only readout (no aty arm this run): rescued@5 wc=10 of 31
+[sq-wc-probe] CUMULATIVE (last row per round/arm/params): wc|adapt,t0.5,h0,k2.5,g50=18/63 rescue_rate=0.286
+[sq-wc-probe] wc render: data/walkcloud_ksweep_sq/k2.5g50/r2/wc/all.hdf5: HEALTHY (gate disabled by user order 2026-08-26)
+[sq-wc-probe] ROUND 2 DONE 2026-09-11 01:49:11
