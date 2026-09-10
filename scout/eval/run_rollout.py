@@ -79,7 +79,8 @@ def main():
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
     p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo", "shell", "orbit"],
+                                        "atypical", "combo", "shell", "orbit",
+                                        "walkcloud"],
                    default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
@@ -98,7 +99,39 @@ def main():
                         "kappa-delta (verbatim atypical), then Newton feedback "
                         "+ tangential noise pinned to the kappa shell "
                         "(math session 2026-08-31; needs --vib-ckpt); "
+                        "'walkcloud' = soft-min drifting-kernel repulsion "
+                        "from the cloud of every x0-hat iterate of this "
+                        "chunk's denoise walk (user 2026-09-10, "
+                        "idea/walkcloud_plan.md, drift-dev; pure cost swap, "
+                        "t=2 is bitwise atypical; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
+    p.add_argument("--cloud-tau", type=float, default=0.5,
+                   help="walkcloud: kernel temperature tau of the soft-min "
+                        "drifting kernel S = -tau*log sum_j exp(-KL_j/tau). "
+                        "'fixed' mode uses this verbatim; 'adapt' mode uses "
+                        "it as the clamp CEILING.")
+    p.add_argument("--cloud-tau-mode", choices=["adapt", "fixed"],
+                   default="adapt",
+                   help="walkcloud: 'adapt' (default) = per-row "
+                        "tau = clamp(frac * KL-pool range, tau_min, "
+                        "cloud-tau) -- the cloudrep iter-2 per-row rule "
+                        "transplanted verbatim (an absolute tau on "
+                        "compressed KL scales flattens the kernel weights "
+                        "and averages the force away); 'fixed' = "
+                        "--cloud-tau verbatim.")
+    p.add_argument("--cloud-tau-frac", type=float, default=0.3,
+                   help="walkcloud adapt mode: rho, the fraction of the "
+                        "per-row KL-pool range (max_j - min_j) used as the "
+                        "kernel temperature before clamping.")
+    p.add_argument("--cloud-tau-min", type=float, default=0.02,
+                   help="walkcloud adapt mode: lower clamp of the kernel "
+                        "temperature (keeps the soft-min from becoming a "
+                        "hard min with spiky gradients).")
+    p.add_argument("--cloud-hist-max", type=int, default=0,
+                   help="walkcloud: keep only the NEWEST N cloud entries "
+                        "(0 = unbounded; a full 100-step walk holds "
+                        "(B,100,dz) -- tiny). 1 = repel only the previous "
+                        "iterate.")
     p.add_argument("--orbit-lam", type=float, default=0.5,
                    help="orbit: feedback gain lambda of the Newton term "
                         "-lam*(KL-kappa)*grad KL/||grad KL||^2 (dimensionless "
@@ -416,7 +449,7 @@ def main():
                     "split protocol (legacy retry-failed mode is unsupported)")
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell", "orbit")) and not args.success_only
+                            "shell", "orbit", "walkcloud")) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
@@ -672,7 +705,12 @@ def main():
                                             or args.aty_eta_dimless),
                         "orbit_round": args.orbit_round,
                         "orbit_sigma_decay": args.orbit_sigma_decay,
-                        "orbit_fb_clamp": args.orbit_fb_clamp},
+                        "orbit_fb_clamp": args.orbit_fb_clamp,
+                        "cloud_tau": args.cloud_tau,
+                        "cloud_tau_mode": args.cloud_tau_mode,
+                        "cloud_tau_frac": args.cloud_tau_frac,
+                        "cloud_tau_min": args.cloud_tau_min,
+                        "cloud_hist_max": args.cloud_hist_max},
         failed_set_json=args.failed_set_json,
         save_failed_set=args.save_failed_set,
     )
@@ -840,6 +878,13 @@ def main():
                         "orbit_climb": args.orbit_climb,
                         "atypical_cap": args.atypical_cap}
                        if args.guide == "orbit" else {}),
+                    **({"cloud_tau": args.cloud_tau,
+                        "cloud_tau_mode": args.cloud_tau_mode,
+                        "cloud_tau_frac": args.cloud_tau_frac,
+                        "cloud_tau_min": args.cloud_tau_min,
+                        "cloud_hist_max": args.cloud_hist_max,
+                        "atypical_cap": args.atypical_cap}
+                       if args.guide == "walkcloud" else {}),
                 },
                 "outputs": {"success": success_path, "all": all_path},
             }

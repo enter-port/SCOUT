@@ -152,7 +152,8 @@ class RolloutPipeline:
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
                   f"entries from {bank_src}")
-        elif self.guide_mode in ("novelty", "atypical", "combo", "shell"):
+        elif self.guide_mode in ("novelty", "atypical", "combo", "shell",
+                                 "walkcloud"):
             # entropy-dev (user 2026-08-24 方案二/三; 2026-08-27 方案A shell):
             # only the cost changes; same injection path, same frozen dyn/VIB
             # encoder.
@@ -181,6 +182,35 @@ class RolloutPipeline:
                     shell_kappa=float(ek.get("shell_kappa", 2.5)),
                     shell_seed=int(ek.get("shell_seed", 42)),
                 )
+            elif self.guide_mode == "walkcloud":
+                # WalkCloud (user 2026-09-10, idea/walkcloud_plan.md,
+                # drift-dev): soft-min drifting-kernel repulsion from the
+                # cloud of every x̂₀ iterate of THIS chunk's denoise walk
+                # -- same injection path / frozen VIB as atypical; t=2
+                # (cloud = {x̂₀_1} = anchor) is bitwise atypical, the
+                # cloud only starts to matter at t>=3. Pure cost swap:
+                # no ledger, no gates, rollout_vec untouched.
+                from scout.guidance.walk_cloud_costs import (
+                    WalkCloudCostPlanner,
+                )
+                planner = WalkCloudCostPlanner(
+                    scout_vib, bridge=bridge, obs_adapter=obs_adapter,
+                    cap=float(ek.get("atypical_cap", 10.0)),
+                    eta_dimless=bool(ek.get("eta_dimless", False)),
+                    cloud_tau=float(ek.get("cloud_tau", 0.5)),
+                    cloud_tau_mode=str(ek.get("cloud_tau_mode", "adapt")),
+                    cloud_tau_frac=float(ek.get("cloud_tau_frac", 0.3)),
+                    cloud_tau_min=float(ek.get("cloud_tau_min", 0.02)),
+                    cloud_hist_max=int(ek.get("cloud_hist_max", 0)),
+                )
+                print(f"[rollout] walkcloud guidance: "
+                      f"tau={planner.cloud_tau} "
+                      f"mode={planner.cloud_tau_mode} "
+                      f"frac={planner.cloud_tau_frac} "
+                      f"tau_min={planner.cloud_tau_min} "
+                      f"hist_max={planner.cloud_hist_max} "
+                      f"kappa={planner.cap} "
+                      f"eta_dimless={planner.eta_dimless}")
             else:
                 planner = ComboCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
