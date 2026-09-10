@@ -79,8 +79,7 @@ def main():
                         "(falls back to base-DP config task.dataset_path for env_meta).")
     # ---- exploration mode ----
     p.add_argument("--guide", choices=["dyn", "off", "expert", "novelty",
-                                        "atypical", "combo", "shell", "orbit",
-                                        "cloudrep"],
+                                        "atypical", "combo", "shell", "orbit"],
                    default="off",
                    help="'dyn' = VIB-guided exploration (z ~ prior per rollout; "
                         "needs --vib-ckpt); 'expert' = expert z-bank guidance "
@@ -99,10 +98,6 @@ def main():
                         "kappa-delta (verbatim atypical), then Newton feedback "
                         "+ tangential noise pinned to the kappa shell "
                         "(math session 2026-08-31; needs --vib-ckpt); "
-                        "'cloudrep' = drifting-style cloud-referenced "
-                        "repulsion: soft-min KL over {current anchor} ∪ "
-                        "{per-scene anchor cloud of earlier retries} "
-                        "(drift-dev 方案一, 2026-09-09; needs --vib-ckpt); "
                         "'off' (default) = plain base-DP rollout (baseline).")
     p.add_argument("--orbit-lam", type=float, default=0.5,
                    help="orbit: feedback gain lambda of the Newton term "
@@ -216,55 +211,6 @@ def main():
                         "eta_tilde = scale_raw * <g_med> measured on data "
                         "(per-step exact). OFF (default) = raw-scale legacy, "
                         "bit-identical.")
-    p.add_argument("--cloudrep-tau", type=float, default=0.5,
-                   help="cloudrep (drift-dev 方案一): soft-min temperature "
-                        "τ over the reference pool {current anchor} ∪ "
-                        "{scene cloud of earlier-retry chunk-0 anchors}. "
-                        "The climb gradient is the drifting normalized "
-                        "kernel (softmax over references); small τ = escape "
-                        "the NEAREST tried thing, large τ = average over "
-                        "the cloud. Empty cloud (retry 0) = bitwise "
-                        "atypical for power-of-two τ (default 0.5); other "
-                        "τ keep the injection bitwise, values at 1 ulp.")
-    p.add_argument("--cloudrep-max", type=int, default=8,
-                   help="cloudrep: per-scene cloud capacity (most recent "
-                        "chunk-0 anchors kept; the pool is this + the "
-                        "current anchor).")
-    p.add_argument("--cloudrep-tau-mode", choices=["fixed", "adapt"],
-                   default="fixed",
-                   help="cloudrep tau mode (reflection iter-2 FIX-1, "
-                        "2026-09-10): 'fixed' (default) = iteration-1 "
-                        "absolute temperature; 'adapt' = per-row "
-                        "tau_i = clamp(frac*(max_j KL - min_j KL), "
-                        "tau_min, tau_0) with tau_0 = --cloudrep-tau as the "
-                        "CEILING (adaptive can only sharpen -- tasks with "
-                        "compressed KL scales like square keep their "
-                        "nearest-neighbor focus instead of averaging the "
-                        "cloud).")
-    p.add_argument("--cloudrep-tau-frac", type=float, default=0.3,
-                   help="cloudrep adapt mode: rho, the pool-spread "
-                        "fraction setting the per-row temperature.")
-    p.add_argument("--cloudrep-tau-min", type=float, default=0.02,
-                   help="cloudrep adapt mode: numerical floor on the "
-                        "per-row temperature.")
-    p.add_argument("--cloudrep-agg", choices=["softmin", "add", "ort"],
-                   default="softmin",
-                   help="cloudrep aggregation (reflection iter-3 FIX-2): "
-                        "'softmin' (default) = temperature soft-min over "
-                        "[anchor]+cloud (iter-1/2 form); 'add' = anchor KL "
-                        "at FULL weight + lam * cloud soft-min -- the "
-                        "calibrated atypical escape stays intact and the "
-                        "j-axis anti-repetition enters as a pure additive "
-                        "perturbation (GAElike add-mode lesson).")
-    p.add_argument("--cloudrep-lam", type=float, default=0.15,
-                   help="cloudrep add mode: lambda, the weight of the "
-                        "cloud soft-min term.")
-    p.add_argument("--cloudrep-k", type=int, default=1,
-                   help="cloudrep ort mode: K-step cloud-gradient refresh "
-                        "(K=1 = fresh every step, the slow original; K=4 "
-                        "amortizes (1+1/K) backwards/step into the add-"
-                        "mode speed band while the per-step re-projection "
-                        "against the fresh anchor direction stays exact).")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -470,19 +416,11 @@ def main():
                     "split protocol (legacy retry-failed mode is unsupported)")
 
     guided = (args.guide in ("dyn", "expert", "novelty", "atypical", "combo",
-                            "shell", "orbit", "cloudrep")) and not args.success_only
+                            "shell", "orbit")) and not args.success_only
     if guided and (args.vib_ckpt is None
                    or str(getattr(cfg.vib, "ckpt_path", "")).startswith("<")):
         raise SystemExit(f"[run_rollout] --guide {args.guide} needs --vib-ckpt "
                          "(SCOUT VIB ckpt). --guide off does not.")
-    if (args.guide == "cloudrep"
-            and int(getattr(cfg.exploration, "guidance_start_timestep", 1)) < 1):
-        # review P2-1 dead-hole guard: with gst=0 the start-gate never
-        # advances (no guided step -> no chunk-0 select_z commit) and every
-        # try >= 1 blocks forever while rollout_vec busy-spins.
-        raise SystemExit("[run_rollout] --guide cloudrep needs exploration."
-                         "guidance_start_timestep >= 1 (the start-gate "
-                         "advances on chunk-0 anchor commits).")
     if guided and args.guide == "expert" and args.core_hdf5 is None:
         raise SystemExit("[run_rollout] --guide expert needs --core-hdf5 "
                          "(the expert z-bank is built from it).")
@@ -718,14 +656,6 @@ def main():
         entropy_kwargs={"novelty_h": args.novelty_h,
                         "novelty_sample_z": bool(args.novelty_sample_z),
                         "atypical_cap": args.atypical_cap,
-                        "cloudrep_tau": args.cloudrep_tau,
-                        "cloudrep_max": args.cloudrep_max,
-                        "cloudrep_tau_mode": args.cloudrep_tau_mode,
-                        "cloudrep_tau_frac": args.cloudrep_tau_frac,
-                        "cloudrep_tau_min": args.cloudrep_tau_min,
-                        "cloudrep_agg": args.cloudrep_agg,
-                        "cloudrep_lam": args.cloudrep_lam,
-                        "cloudrep_k": args.cloudrep_k,
                         "combo_nov_weight": args.combo_nov_weight,
                         "combo_att_weight": args.combo_att_weight,
                         "shell_kappa": args.shell_kappa,
@@ -898,16 +828,6 @@ def main():
                     "guidance_scale": float(cfg.exploration.guidance_scale),
                     "eta_dimless": int(bool(args.orbit_eta_dimless
                                            or args.aty_eta_dimless)),
-                    **({"cloudrep_tau": args.cloudrep_tau,
-                        "cloudrep_max": args.cloudrep_max,
-                        "cloudrep_tau_mode": args.cloudrep_tau_mode,
-                        "cloudrep_tau_frac": args.cloudrep_tau_frac,
-                        "cloudrep_tau_min": args.cloudrep_tau_min,
-                        "cloudrep_agg": args.cloudrep_agg,
-                        "cloudrep_lam": args.cloudrep_lam,
-                        "cloudrep_k": args.cloudrep_k,
-                        "atypical_cap": args.atypical_cap}
-                       if args.guide == "cloudrep" else {}),
                     **({"orbit_lam": args.orbit_lam,
                         "orbit_delta": args.orbit_delta,
                         "orbit_sigma": args.orbit_sigma,

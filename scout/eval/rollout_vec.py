@@ -664,29 +664,14 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                      f"collected={collected} "
                      f"solved={solved_fini}/{init_done_failed}", _hb_t0)
 
-    # job gate: (a) planners with on_try_done (novelty family) serialize a
-    # scene's retries to COMPLETION (retry k waits for k-1 finalized --
-    # their scene buffer commits at finalize); (b) planners with only
-    # try_started_gate (cloudrep, drift-dev 方案一) admit retry k once k-1
-    # has STARTED (its chunk-0 anchor committed) -- j-axis ordering at full
-    # slot parallelism; (c) everyone else (atypical/orbit/... ) runs
-    # ungated, bit-identical to history.
-    _gate_planner = (dp.scout_planner if (guided and hasattr(dp, "scout_planner"))
-                     else None)
-    if _gate_planner is not None and hasattr(_gate_planner, "on_try_done"):
-        job_gate = (lambda job: job[2] == 0
-                    or done_tries.get(job[1], -1) >= job[2] - 1)
-    elif _gate_planner is not None and hasattr(_gate_planner,
-                                               "try_started_gate"):
-        job_gate = (lambda job: _gate_planner.try_started_gate(job[1], job[2]))
-    else:
-        job_gate = None
-
     runner = _VecRunner(
         dp, env_factory, n_envs, n_action_steps, horizon, device,
         guided=guided, on_done=on_done, progress_cb=progress_cb,
         wandb_run=wandb_run, log_every=log_every,
-        job_gate=job_gate,
+        job_gate=(lambda job: job[2] == 0
+                  or done_tries.get(job[1], -1) >= job[2] - 1)
+        if (guided and hasattr(dp, "scout_planner")
+           and hasattr(dp.scout_planner, "on_try_done")) else None,
     )
     try:
         runner.run(job_queue, record_obs=True)

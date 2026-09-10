@@ -152,8 +152,7 @@ class RolloutPipeline:
                                          bridge=bridge, obs_adapter=obs_adapter)
             print(f"[rollout] expert z-bank guidance: {bank.shape[0]} "
                   f"entries from {bank_src}")
-        elif self.guide_mode in ("novelty", "atypical", "combo", "shell",
-                                 "cloudrep"):
+        elif self.guide_mode in ("novelty", "atypical", "combo", "shell"):
             # entropy-dev (user 2026-08-24 方案二/三; 2026-08-27 方案A shell):
             # only the cost changes; same injection path, same frozen dyn/VIB
             # encoder.
@@ -182,34 +181,6 @@ class RolloutPipeline:
                     shell_kappa=float(ek.get("shell_kappa", 2.5)),
                     shell_seed=int(ek.get("shell_seed", 42)),
                 )
-            elif self.guide_mode == "cloudrep":
-                # cloudrep (drift-dev, user 2026-09-09 方案一): soft-min KL
-                # to the policy's own per-scene anchor cloud (drifting
-                # repulsion transplanted into the KL-cost family) -- same
-                # injection path / frozen VIB as atypical; empty cloud
-                # (retry 0) reduces to it exactly.
-                from scout.guidance.cloudrep_costs import CloudRepCostPlanner
-                planner = CloudRepCostPlanner(
-                    scout_vib, bridge=bridge, obs_adapter=obs_adapter,
-                    cap=float(ek.get("atypical_cap", 10.0)),
-                    eta_dimless=bool(ek.get("eta_dimless", False)),
-                    cloud_tau=float(ek.get("cloudrep_tau", 0.5)),
-                    cloud_max=int(ek.get("cloudrep_max", 8)),
-                    cloud_tau_mode=str(ek.get("cloudrep_tau_mode", "fixed")),
-                    cloud_tau_frac=float(ek.get("cloudrep_tau_frac", 0.3)),
-                    cloud_tau_min=float(ek.get("cloudrep_tau_min", 0.02)),
-                    cloud_agg=str(ek.get("cloudrep_agg", "softmin")),
-                    cloud_lam=float(ek.get("cloudrep_lam", 0.15)),
-                    cloud_k=int(ek.get("cloudrep_k", 1)),
-                )
-                print(f"[rollout] cloudrep guidance: tau={planner.cloud_tau} "
-                      f"cloud_max={planner.cloud_max} "
-                      f"tau_mode={planner.cloud_tau_mode} "
-                      f"frac={planner.cloud_tau_frac} "
-                      f"tau_min={planner.cloud_tau_min} "
-                      f"agg={planner.cloud_agg} lam={planner.cloud_lam} "
-                      f"kappa={planner.cap} "
-                      f"eta_dimless={planner.eta_dimless}")
             else:
                 planner = ComboCostPlanner(
                     scout_vib, bridge=bridge, obs_adapter=obs_adapter,
