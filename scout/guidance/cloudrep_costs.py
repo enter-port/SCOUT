@@ -133,11 +133,25 @@ class CloudRepCostPlanner(KLCostPlanner):
         # dominates where the KL scale is compressed).
         #   softmin (default): S = softmin over [anchor] + cloud (iter-1/2)
         #   add:               S = KL_anchor + lam * softmin over cloud cols
+        #   ort (iter-4, reflection 2026-09-10 #2): the cloud term enters
+        #      as a GRADIENT, projected onto the anchor escape's normal
+        #      plane -- g = mask * (g_anchor + lam * (g_cloud -
+        #      (g_cloud.g_hat_a) g_hat_a)). CPU evidence: where the cloud
+        #      anchors cluster (stuck scenes), g_cloud is 0.91-0.98 parallel
+        #      to g_anchor = pure dose redundancy (the component that ate
+        #      the aty-friendly windows in iters 1-3); where they spread,
+        #      cos 0-0.55 = genuine redirect (the j-axis value). The
+        #      projection is a continuous conditioner that keeps the latter
+        #      and deletes the former; the cloud no longer touches the
+        #      kappa budget (mask/row_losses use the ANCHOR kl alone --
+        #      aty's stop semantics verbatim). Empty cloud -> g_cloud = 0
+        #      exactly -> bitwise atypical.
         # Empty cloud -> S = KL_anchor exactly (bitwise atypical, any mode).
         self.cloud_agg = str(cloud_agg)
-        if self.cloud_agg not in ("softmin", "add"):
+        if self.cloud_agg not in ("softmin", "add", "ort"):
             raise ValueError(
-                f"cloud_agg must be 'softmin' or 'add'; got {cloud_agg!r}")
+                f"cloud_agg must be 'softmin', 'add' or 'ort'; got "
+                f"{cloud_agg!r}")
         self.cloud_lam = float(cloud_lam)
         if self.cloud_lam < 0.0:
             raise ValueError(f"cloud_lam must be >= 0; got {cloud_lam}")
@@ -179,6 +193,13 @@ class CloudRepCostPlanner(KLCostPlanner):
         self._s_acc: torch.Tensor | None = None
         self._last_tau: torch.Tensor | None = None
         self._tau_acc: torch.Tensor | None = None
+        # ort-mode telemetry (detached means over live rows): cos(g_c, g_a),
+        # phi = ||g_c_perp||/||g_c|| (orthogonality fraction), and the
+        # injected tangential dose ratio ||lam*g_c_perp||/||g_a||.
+        self._cos_acc: torch.Tensor | None = None
+        self._phi_acc: torch.Tensor | None = None
+        self._ratio_acc: torch.Tensor | None = None
+        self._ort_rows = 0
 
     # ------------------------------------------------------------------ #
     # row context (rollout_vec._replan, fires before every batched call)
@@ -259,6 +280,41 @@ class CloudRepCostPlanner(KLCostPlanner):
         self._ref_valid = None
 
     # ------------------------------------------------------------------ #
+    # the (B, J) pairwise KL matrix to the reference pool
+    # ------------------------------------------------------------------ #
+    def _kl_matrix(self, mu: torch.Tensor, logvar: torch.Tensor):
+        """Elementwise identical to ``_kl_rows`` per (row, reference
+        column): 0.5*sum_d[(mu-m_j)^2/var_j + var/var_j - 1 - (logvar-lv_j)]
+        -- shared by every aggregation form (softmin/add/ort)."""
+        var = torch.exp(logvar).unsqueeze(1)                    # (B, 1, dz)
+        var0 = torch.exp(self._ref_lv)                          # (B, J, dz)
+        return 0.5 * (((mu.unsqueeze(1) - self._ref_mu) ** 2 / var0)
+                      + (var / var0) - 1.0
+                      - (logvar.unsqueeze(1) - self._ref_lv)).sum(dim=-1)
+
+    def _cloud_softmin(self, kl: torch.Tensor, cols_slice=slice(1, None)):
+        """adapt/fixed-tau soft-min over the CLOUD columns of a (B, J) KL
+        matrix (anchor column excluded); graph-connected zeros on rows
+        without cloud refs. Returns (soft, tau_row)."""
+        kl_c = kl[:, cols_slice]
+        val = self._ref_valid[:, cols_slice]
+        if self.cloud_tau_mode == "adapt":
+            big = torch.finfo(kl.dtype).max
+            spread = (kl_c.masked_fill(~val, -big).amax(dim=1)
+                      - kl_c.masked_fill(~val, float("-inf")).amin(dim=1)
+                      ).clamp(min=0.0)
+            tau_row = (self.cloud_tau_frac * spread).clamp(
+                min=self.cloud_tau_min, max=self.cloud_tau).detach()
+        else:
+            tau_row = torch.full_like(kl[:, 0], float(self.cloud_tau))
+        logits = (-kl_c / tau_row.unsqueeze(1)).masked_fill(~val, float("-inf"))
+        has = val.any(dim=1)
+        soft = -tau_row * torch.logsumexp(
+            logits.masked_fill(~has.unsqueeze(1), float("-inf")), dim=1)
+        soft = torch.where(has, soft, kl[:, 0] * 0.0)
+        return soft, tau_row
+
+    # ------------------------------------------------------------------ #
     # the per-row soft-min over the pool (B,)
     # ------------------------------------------------------------------ #
     def _cloud_rows(self, mu: torch.Tensor, logvar: torch.Tensor,
@@ -278,11 +334,7 @@ class CloudRepCostPlanner(KLCostPlanner):
                 or self._ref_valid is None
                 or self._ref_mu.shape[0] != mu.shape[0]):
             return zero
-        var = torch.exp(logvar).unsqueeze(1)                    # (B, 1, dz)
-        var0 = torch.exp(self._ref_lv)                          # (B, J, dz)
-        kl = 0.5 * (((mu.unsqueeze(1) - self._ref_mu) ** 2 / var0)
-                    + (var / var0) - 1.0
-                    - (logvar.unsqueeze(1) - self._ref_lv)).sum(dim=-1)  # (B,J)
+        kl = self._kl_matrix(mu, logvar)
         # J=1 fast path (the ONLY configuration retry 0 ever sees): the
         # pool is the single anchor column, S IS the anchor KL -- return it
         # verbatim. Bitwise identical to atypical for ANY tau (no division,
@@ -343,6 +395,8 @@ class CloudRepCostPlanner(KLCostPlanner):
         s_bar_t = self._resolve_s_bar_t(current_obs)
         a = _enc_forward(self, x0_hat)
         mu, logvar = self.scout_vib.vib_enc(s_bar_t.detach(), a)
+        if self.cloud_agg == "ort":
+            return self._ort_backward(trajectory, mu, logvar, x0_hat)
         s = self._cloud_rows(mu, logvar, x0_hat)
         g = torch.autograd.grad(s.sum(), trajectory)[0]
         # telemetry tick (mirrors the base [kl-telemetry] cadence).
@@ -361,13 +415,69 @@ class CloudRepCostPlanner(KLCostPlanner):
         if self._crep_calls % 2500 == 0:
             tau_s = (f" mean_tau={float(self._tau_acc) / self._crep_calls:.3g}"
                      if self._tau_acc is not None else "")
+            ort_s = (f" cos={float(self._cos_acc) / max(self._ort_rows, 1):.3f}"
+                     f" phi={float(self._phi_acc) / max(self._ort_rows, 1):.3f}"
+                     f" lam_ratio={float(self._ratio_acc) / max(self._ort_rows, 1):.3f}"
+                     if self._ort_rows > 0 else "")
             print(f"[crep-telemetry] calls={self._crep_calls} "
                   f"mean_pool={self._pool_acc / self._crep_calls:.1f} "
                   f"mean_S={float(self._s_acc) / self._crep_calls:.4g} "
-                  f"mode={self.cloud_tau_mode}{tau_s} "
+                  f"mode={self.cloud_tau_mode}{tau_s}{ort_s} "
                   f"cloud={len(self._cloud)}scenes",
                   flush=True)
         return s, g
+
+    def _ort_backward(self, trajectory, mu, logvar, x0_hat):
+        """ort aggregation (iter-4): anchor climb at FULL weight plus a
+        lam-weighted CLOUD soft-min gradient projected onto the anchor
+        escape's normal plane. Returns ``(kl_anchor, g)`` so the inherited
+        cap mask / row_losses keep aty's stop semantics verbatim (the cloud
+        never touches the kappa budget). Empty cloud -> g_cloud = 0
+        exactly -> bitwise atypical. Zero RNG; one extra encoder-sized
+        backward (retain_graph on the first grad)."""
+        zero = x0_hat.flatten(1).sum(dim=1).to(mu.dtype) * 0.0
+        if (self._ref_mu is None or self._ref_lv is None
+                or self._ref_valid is None
+                or self._ref_mu.shape[0] != mu.shape[0]):
+            g0 = torch.autograd.grad(zero.sum(), trajectory)[0]
+            return zero, g0
+        kl = self._kl_matrix(mu, logvar)                          # (B, J)
+        kl_a = kl[:, 0]
+        if kl.shape[1] == 1:
+            soft_c, self._last_tau = kl_a * 0.0, torch.full_like(
+                kl_a, float(self.cloud_tau))
+        else:
+            soft_c, self._last_tau = self._cloud_softmin(kl)
+        g_a = torch.autograd.grad(kl_a.sum(), trajectory,
+                                  retain_graph=True)[0]
+        g_c = torch.autograd.grad(soft_c.sum(), trajectory)[0]
+        # row-wise projection of g_c onto g_a's normal plane
+        view = (-1, *([1] * (g_a.dim() - 1)))
+        ga_n = g_a.flatten(1).norm(dim=1).clamp(min=1e-4)
+        ga_hat = g_a / ga_n.view(*view)
+        dot = (g_c * ga_hat).flatten(1).sum(dim=1)
+        g_c_perp = g_c - dot.view(*view) * ga_hat
+        g = g_a + self.cloud_lam * g_c_perp
+        # ort telemetry (detached; live rows have a nonzero cloud gradient)
+        with torch.no_grad():
+            gc_n = g_c.flatten(1).norm(dim=1)
+            live = gc_n > 1e-8
+            n_live = int(live.sum())
+            if n_live > 0:
+                cos = (dot / (gc_n * ga_n.clamp(min=1e-8)))[live].mean()
+                phi = (g_c_perp.flatten(1).norm(dim=1)
+                       / gc_n.clamp(min=1e-12))[live].mean()
+                ratio = (self.cloud_lam
+                         * g_c_perp.flatten(1).norm(dim=1)
+                         / ga_n.clamp(min=1e-12))[live].mean()
+                self._cos_acc = (cos if self._cos_acc is None
+                                 else self._cos_acc + cos)
+                self._phi_acc = (phi if self._phi_acc is None
+                                 else self._phi_acc + phi)
+                self._ratio_acc = (ratio if self._ratio_acc is None
+                                   else self._ratio_acc + ratio)
+                self._ort_rows += n_live
+        return kl_a, g
 
     def compute_loss(self, x0_hat: torch.Tensor, current_obs=None,
                      reduction: str = "mean") -> torch.Tensor:

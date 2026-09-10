@@ -247,7 +247,7 @@ def main():
     p.add_argument("--cloudrep-tau-min", type=float, default=0.02,
                    help="cloudrep adapt mode: numerical floor on the "
                         "per-row temperature.")
-    p.add_argument("--cloudrep-agg", choices=["softmin", "add"],
+    p.add_argument("--cloudrep-agg", choices=["softmin", "add", "ort"],
                    default="softmin",
                    help="cloudrep aggregation (reflection iter-3 FIX-2): "
                         "'softmin' (default) = temperature soft-min over "

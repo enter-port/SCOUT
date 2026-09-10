@@ -172,6 +172,47 @@ def main():
     print("[1b] adaptive tau: J=1 bitwise atypical + clamp bounds + "
           "per-row kernel gradient OK")
 
+    # ---------------- 1c. ort aggregation (iter-4) ----------------------- #
+    # empty cloud: bitwise atypical
+    vanO = KLCostPlanner(vib, cap=2.5)
+    plO = CloudRepCostPlanner(vib, cap=2.5, cloud_agg="ort", cloud_lam=0.3,
+                              cloud_tau_mode="adapt")
+    for pl in (vanO, plO):
+        pl.set_current_obs(s_bar)
+        pl.select_z(anchor_x.unsqueeze(1) * 1.0)
+    for step in range(3):
+        x = anchor_x + 0.3 * (step + 1) * torch.randn(B, Da)
+        t_v, x_v = _traj(x)
+        t_o, x_o = _traj(x)
+        cg_v, _, _, rl_v = vanO.guided_step(t_v, x_v, None)
+        cg_o, _, _, rl_o = plO.guided_step(t_o, x_o, None)
+        assert torch.equal(cg_v, cg_o), f"ort empty-cloud grad step {step}"
+        assert torch.equal(rl_v, rl_o), f"ort empty-cloud losses step {step}"
+    # with cloud: the tangential increment is orthogonal to the anchor grad
+    plO.set_row_jobs([(None, 1, 0)] * B)
+    plO.select_z(torch.randn(B, 1, Da))            # seed scene-1 cloud
+    plO.set_row_jobs([(None, 1, 1), (None, 2, 0), (None, 3, 0)])
+    plO.select_z((anchor_x + 0.2).unsqueeze(1) * 1.0)
+    xw = anchor_x + 0.5 * torch.randn(B, Da)
+    outs = {}
+    for lam in (0.0, 0.3):
+        plO.cloud_lam = lam
+        t_w, x_w = _traj(xw)
+        kl_w, g_w = plO._kl_backward(t_w, x_w, None)
+        outs[lam] = (kl_w.detach().clone(), g_w.detach().clone())
+    assert torch.equal(outs[0.0][0], outs[0.3][0]), "kl_a is lam-independent"
+    delta = outs[0.3][1] - outs[0.0][1]
+    ga = outs[0.0][1]
+    dot_per_row = (delta * ga).flatten(1).sum(dim=1)
+    gn = ga.flatten(1).norm(dim=1).clamp(min=1e-12)
+    dn = delta.flatten(1).norm(dim=1)
+    live = dn > 1e-9
+    assert bool(live.any()), "cloud rows present for the ort check"
+    rel = (dot_per_row[live] / (dn[live] * gn[live])).abs().max()
+    assert rel < 1e-5, f"tangential increment not orthogonal ({rel})"
+    print("[1c] ort: empty-cloud bitwise atypical + tangential increment "
+          "orthogonal to anchor grad OK")
+
     # ---------------- 2. commit semantics across retries ---------------- #
     # realistic job sequence (under the START-gate a batch may carry two
     # tries of the same scene once both started -- pools/commits are keyed
