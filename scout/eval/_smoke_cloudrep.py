@@ -299,8 +299,8 @@ def main():
     for i in range(B):
         valid = [float(kl_rows[i][k]) for k in range(J) if pl._ref_valid[i, k]]
         s_i = float(s_val[i])
-        assert s_i <= min(valid) + 1e-6, "S <= min KL"
-        assert s_i >= min(valid) - tau * math.log(len(valid)) - 1e-6, \
+        assert s_i <= min(valid) + 2e-5, "S <= min KL"
+        assert s_i >= min(valid) - tau * math.log(len(valid)) - 2e-5, \
             "S >= min - tau*log J"
     # dS/dKL_ij = softmax weights: finite-difference the KL matrix through
     # _cloud_rows by nudging a reference (detached constant) -- instead

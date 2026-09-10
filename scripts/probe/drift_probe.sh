@@ -48,7 +48,8 @@ ARM=${ARM:-both}
 TAU_MODE=${TAU_MODE:-fixed}
 CREP_AGG=${CREP_AGG:-softmin}
 CREP_LAM=${CREP_LAM:-0.15}
-export TAU_MODE CREP_AGG CREP_LAM
+CREP_K=${CREP_K:-1}
+export TAU_MODE CREP_AGG CREP_LAM CREP_K
 # worktree root: CPFS is at 0 available (2026-09-09) -- the drift-dev
 # deployment lives on the pod-local 1TB NVMe (/tmp/scout-drift, 671G free)
 # so the probe never writes to the full shared volume; ckpts/datasets on
@@ -200,6 +201,9 @@ if [ "$TAU_MODE" != "fixed" ]; then
 fi
 if [ "$CREP_AGG" != "softmin" ]; then
   CREP_ARGS+=(--cloudrep-agg "$CREP_AGG" --cloudrep-lam "$CREP_LAM")
+fi
+if [ "$CREP_K" != "1" ]; then
+  CREP_ARGS+=(--cloudrep-k "$CREP_K")
 fi
 if [ "$ARM" = "both" ] || [ "$ARM" = "crep" ]; then
   run_arm crep "$GPU_CREP" cloudrep ${CREP_ARGS[@]+"${CREP_ARGS[@]}"} &

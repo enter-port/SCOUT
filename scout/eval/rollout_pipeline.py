@@ -200,6 +200,7 @@ class RolloutPipeline:
                     cloud_tau_min=float(ek.get("cloudrep_tau_min", 0.02)),
                     cloud_agg=str(ek.get("cloudrep_agg", "softmin")),
                     cloud_lam=float(ek.get("cloudrep_lam", 0.15)),
+                    cloud_k=int(ek.get("cloudrep_k", 1)),
                 )
                 print(f"[rollout] cloudrep guidance: tau={planner.cloud_tau} "
                       f"cloud_max={planner.cloud_max} "

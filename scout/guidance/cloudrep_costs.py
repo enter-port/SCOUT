@@ -96,7 +96,8 @@ class CloudRepCostPlanner(KLCostPlanner):
                  cloud_tau: float = 0.5, cloud_max: int = 8,
                  cloud_tau_mode: str = "fixed", cloud_tau_frac: float = 0.3,
                  cloud_tau_min: float = 0.02,
-                 cloud_agg: str = "softmin", cloud_lam: float = 0.15):
+                 cloud_agg: str = "softmin", cloud_lam: float = 0.15,
+                 cloud_k: int = 4):
         super().__init__(scout_vib, bridge=bridge, obs_adapter=obs_adapter,
                          cap=cap, eta_dimless=eta_dimless)
         self.cloud_tau = float(cloud_tau)
@@ -155,6 +156,21 @@ class CloudRepCostPlanner(KLCostPlanner):
         self.cloud_lam = float(cloud_lam)
         if self.cloud_lam < 0.0:
             raise ValueError(f"cloud_lam must be >= 0; got {cloud_lam}")
+        # iter-5 (reflection #5): K-REFRESH cached ort -- the anchor backward
+        # runs EVERY step (aty's injection, exact); the cloud soft-min
+        # backward runs every K-th step and is CACHED; each step re-projects
+        # the cached g_c against the FRESH anchor direction (pure vector
+        # math, zero backward). Amortized (1+1/K) backwards/step -- the
+        # only single-backward-family form of ort (the naive lagged-
+        # projection idea saves nothing: both grads must still be fresh).
+        # Telemetry cos(g_c_fresh, g_c_stale) monitors the staleness angle;
+        # if it drifts fast the form degenerates toward add (kill switch).
+        self.cloud_k = int(cloud_k)
+        if self.cloud_k < 1:
+            raise ValueError(f"cloud_k must be >= 1; got {cloud_k}")
+        self._g_c_cache = None
+        self._ortk_tick = 0
+        self._stale_acc: torch.Tensor | None = None
         if not (self.cloud_tau > 0.0):
             raise ValueError(
                 f"cloud_tau must be > 0 (soft-min temperature); got "
@@ -443,14 +459,44 @@ class CloudRepCostPlanner(KLCostPlanner):
             return zero, g0
         kl = self._kl_matrix(mu, logvar)                          # (B, J)
         kl_a = kl[:, 0]
-        if kl.shape[1] == 1:
-            soft_c, self._last_tau = kl_a * 0.0, torch.full_like(
-                kl_a, float(self.cloud_tau))
-        else:
-            soft_c, self._last_tau = self._cloud_softmin(kl)
         g_a = torch.autograd.grad(kl_a.sum(), trajectory,
-                                  retain_graph=True)[0]
-        g_c = torch.autograd.grad(soft_c.sum(), trajectory)[0]
+                                  retain_graph=(self.cloud_k > 1))[0]
+        if self.cloud_k > 1:
+            # K-refresh: fresh cloud backward every K-th step (or when the
+            # cache is stale/shape-mismatched); otherwise reuse the cached
+            # direction and let the per-step projection do the work.
+            need = (self._g_c_cache is None
+                    or self._g_c_cache.shape != trajectory.shape
+                    or self._ortk_tick % self.cloud_k == 0)
+            if need and kl.shape[1] > 1:
+                soft_c, self._last_tau = self._cloud_softmin(kl)
+                g_c = torch.autograd.grad(soft_c.sum(), trajectory)[0]
+                if self._g_c_cache is not None and                         self._g_c_cache.shape == g_c.shape:
+                    with torch.no_grad():
+                        cn = g_c.flatten(1).norm(dim=1).clamp(min=1e-12)
+                        sn = self._g_c_cache.flatten(1).norm(dim=1).clamp(
+                            min=1e-12)
+                        cosv = ((g_c * self._g_c_cache).flatten(1)
+                                .sum(dim=1) / (cn * sn)).mean()
+                        self._stale_acc = (
+                            cosv if self._stale_acc is None
+                            or self._stale_acc.device != cosv.device
+                            else self._stale_acc + cosv)
+                        self._ort_rows += 1
+                self._g_c_cache = g_c.detach()
+            elif kl.shape[1] == 1:
+                # empty cloud: the cloud gradient is EXACTLY zero (the
+                # ort increment vanishes -> bitwise atypical)
+                self._g_c_cache = torch.zeros_like(trajectory)
+            g_c = self._g_c_cache
+            self._ortk_tick += 1
+        else:
+            if kl.shape[1] == 1:
+                soft_c, self._last_tau = kl_a * 0.0, torch.full_like(
+                    kl_a, float(self.cloud_tau))
+            else:
+                soft_c, self._last_tau = self._cloud_softmin(kl)
+            g_c = torch.autograd.grad(soft_c.sum(), trajectory)[0]
         # row-wise projection of g_c onto g_a's normal plane
         view = (-1, *([1] * (g_a.dim() - 1)))
         ga_n = g_a.flatten(1).norm(dim=1).clamp(min=1e-4)

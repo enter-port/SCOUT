@@ -259,6 +259,12 @@ def main():
     p.add_argument("--cloudrep-lam", type=float, default=0.15,
                    help="cloudrep add mode: lambda, the weight of the "
                         "cloud soft-min term.")
+    p.add_argument("--cloudrep-k", type=int, default=1,
+                   help="cloudrep ort mode: K-step cloud-gradient refresh "
+                        "(K=1 = fresh every step, the slow original; K=4 "
+                        "amortizes (1+1/K) backwards/step into the add-"
+                        "mode speed band while the per-step re-projection "
+                        "against the fresh anchor direction stays exact).")
     p.add_argument("--shell-kappa", type=float, default=2.5,
                    help="shell (方案A): target-shell radius in nats -- the "
                         "random target posterior sits exactly this many nats "
@@ -898,6 +904,7 @@ def main():
                         "cloudrep_tau_min": args.cloudrep_tau_min,
                         "cloudrep_agg": args.cloudrep_agg,
                         "cloudrep_lam": args.cloudrep_lam,
+                        "cloudrep_k": args.cloudrep_k,
                         "atypical_cap": args.atypical_cap}
                        if args.guide == "cloudrep" else {}),
                     **({"orbit_lam": args.orbit_lam,
