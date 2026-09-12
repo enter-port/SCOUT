@@ -1,0 +1,418 @@
+diff --git a/scout/eval/rollout_pipeline.py b/scout/eval/rollout_pipeline.py
+index 4ba3429..2c14632 100644
+--- a/scout/eval/rollout_pipeline.py
++++ b/scout/eval/rollout_pipeline.py
+@@ -154,7 +154,8 @@ class RolloutPipeline:
+             explore_seed: Optional[int] = None,
+             n_explore: Optional[int] = None,
+             explore_try_times: int = 1,
+-            eval_only: bool = False) -> dict:
++            eval_only: bool = False,
++            explore_mode: str = "fresh") -> dict:
+         """Run SOE step 2 (eval) + step 3 (explore failed only).
+ 
+         ``on_progress`` is invoked as
+@@ -173,10 +174,20 @@ class RolloutPipeline:
+         rollouts; successes -> DP retrain data, ALL trajs -> dyn retrain data
+         (eval-phase trajs are measurement only and are NOT collected).
+ 
++        Rescue mode (user 2026-08-23, ``explore_mode="rescue"``): SOE protocol
++        -- explore retries ONLY the failed eval inits (same initial states)
++        ``explore_try_times`` each; DP data = successful retries, dyn data =
++        per failed init {successful retries if any, else FIRST retry}. See
++        :meth:`_run_rescue`.
++
+         Returns ``{"metrics": {...},
+                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
+                    "all_trajs": [every traj of the round, with obs]}``.     # dyn
+         """
++        if explore_mode == "rescue":
++            return self._run_rescue(
++                dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
++                try_times=int(explore_try_times), eval_only=eval_only)
+         if explore_seed is not None or eval_only:
+             return self._run_split(
+                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
+@@ -376,6 +387,118 @@ class RolloutPipeline:
+         }
+         return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
+ 
++    # ------------------------------------------------------------------ #
++    def _run_rescue(self, dp_ckpt: str, vib_ckpt: Optional[str] = None,
++                    on_progress: Optional[Callable[..., None]] = None,
++                    try_times: int = 5, eval_only: bool = False) -> dict:
++        """SOE rescue protocol (user 2026-08-23) -- explore == eval scenes.
++
++        eval   : the seed-fixed measurement set (``cfg.eval.seed`` -> seeds
++                 seed..seed+n_eval-1, default 42..141, 100 scenes), 1 try
++                 each, NO data collection (record_obs=False).
++        explore: retry ONLY the failed eval inits, ``try_times`` each
++                 (default 5), from the SAME initial states, guided or plain
++                 per ``self.guided`` (SOE run.py:121-149 semantics).
++                 DP data  = every SUCCESSFUL retry (``trajs``).
++                 dyn data = per failed init: its successful retries if any,
++                 else its FIRST retry (``all_trajs``) -- user rule: scenes
++                 solved by exploration contribute their successes, all-failed
++                 scenes contribute one representative (first) trajectory.
++        """
++        horizon = int(self.cfg.eval.horizon)
++        n_eval = int(self.cfg.eval.n_init_states)
++        print(f"[rollout:rescue] dp_ckpt={dp_ckpt} guided={self.guided} "
++              f"eval: n={n_eval} seed={self.base_seed} | "
++              f"explore: failed-of-eval x{try_times} n_envs={self.n_envs}"
++              + (f" vib_ckpt={vib_ckpt}" if self.guided else ""))
++        if self.base_seed is not None:
++            torch.manual_seed(int(self.base_seed))
++            np.random.seed(int(self.base_seed))
++
++        dp = self.dp_factory(dp_ckpt)
++        n_action_steps = int(getattr(dp, "n_action_steps", 1))
++
++        # ---- phase 1: eval on the seed-fixed scene set (measurement only) -- #
++        eval_states = collect_initial_states(
++            self.env_factory, n_init_states=n_eval, base_seed=self.base_seed)
++        eval_cb = (lambda p: on_progress("eval", p)) if on_progress else None
++        first_results, _, _ = evaluate_baseline_vec(
++            dp, self.env_factory, eval_states, horizon=horizon,
++            n_envs=self.n_envs, n_action_steps=n_action_steps, device=self.device,
++            n_tries=1, metric_prefix="eval",
++            record_obs=False,                      # eval trajs are NOT data
++            on_progress=eval_cb, wandb_run=None, log_every=self.log_every,
++        )
++        baseline_solved = int(sum(1 for s, _ in first_results if s))
++        n_failed = n_eval - baseline_solved
++        print(f"[rollout:rescue] eval: success_rate={baseline_solved}/{n_eval} "
++              f"({baseline_solved / max(n_eval, 1):.3f}); "
++              f"{n_failed} failed inits -> explore")
++
++        if eval_only:
++            metrics = {
++                "success_rate": success_rate_per_round(first_results),
++                "jerk_baseline": jerk_of_results(first_results, only_successful=True),
++                "baseline_solved": baseline_solved,
++                "n_failed": n_failed,
++                "eval_only": True,
++            }
++            print("[rollout:rescue] eval-only round -- skipping explore phase")
++            return {"metrics": metrics, "trajs": [], "all_trajs": []}
++
++        # ---- phase 2: explore = retry FAILED eval inits -------------------- #
++        if self.guided:
++            if self.scout_vib_factory is None:
++                raise ValueError("guided=True requires a scout_vib_factory")
++            scout_vib = (self.scout_vib_factory(vib_ckpt)
++                         if vib_ckpt is not None else self.scout_vib_factory())
++            self._attach_planner(dp, scout_vib)
++        expl_cb = (lambda p: on_progress("explore", p, baseline_solved, n_eval)
++                   ) if on_progress else None
++        expl = evaluate_exploration_vec(
++            dp, self.env_factory, eval_states, horizon=horizon,
++            try_times=try_times, n_envs=self.n_envs,
++            n_action_steps=n_action_steps, device=self.device,
++            only_failed_of=first_results, guided=self.guided,
++            on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
++        )
++        trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
++        all_trajs: List[dict] = []
++        for e in expl:
++            if e["baseline_solved"]:
++                continue                       # eval-solved scenes add no data
++            if e["solved"]:
++                all_trajs.extend(e["successful_trajs"])
++            else:
++                first = e.get("first_traj")
++                if first is None:
++                    raise RuntimeError(
++                        "rescue: all-failed init has no first_traj "
++                        "(engine must tag try_idx==0)")
++                all_trajs.append(first)
++        rescued = int(sum(1 for e in expl
++                          if e["solved"] and not e["baseline_solved"]))
++        print(f"[rollout:rescue] explore: rescued {rescued}/{n_failed} "
++              f"failed inits; {len(trajs)} successful trajs -> DP retrain; "
++              f"{len(all_trajs)} selected trajs -> dyn retrain")
++        metrics = {
++            "success_rate": success_rate_per_round(first_results),
++            "pass_at_5": pass_at_k(expl, first_results, k=try_times),
++            "avg_jerk": _jerk_all_explore_trajs(expl),
++            "jerk_baseline": jerk_of_results(first_results, only_successful=True),
++            "baseline_solved": baseline_solved,
++            "n_failed": n_failed,
++            "exploration_rescued": rescued,
++            "explore_solved": rescued,
++            "explore_total": n_failed,
++            "explore_try_times": try_times,
++            "collected_trajs": len(trajs),
++            "n_all_trajs": len(all_trajs),
++            "failed_init_indices": [i for i, (s, _) in enumerate(first_results)
++                                    if not s],
++        }
++        return {"metrics": metrics, "trajs": trajs, "all_trajs": all_trajs}
++
+ 
+ # --------------------------------------------------------------------------- #
+ # helpers
+diff --git a/scout/eval/rollout_vec.py b/scout/eval/rollout_vec.py
+index aa7bc4b..df60f1f 100644
+--- a/scout/eval/rollout_vec.py
++++ b/scout/eval/rollout_vec.py
+@@ -456,10 +456,12 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
+         if only_failed_of is not None and only_failed_of[i][0]:
+             results.append({"solved": True, "n_tries": 0,
+                             "successful_trajs": [], "all_trajs": [],
++                            "first_traj": None,
+                             "baseline_solved": True})
+             continue
+         entry = {"solved": False, "n_tries": 0,
+                  "successful_trajs": [], "all_trajs": [],
++                 "first_traj": None,
+                  "baseline_solved": False}
+         results.append(entry)
+         for j in range(int(try_times)):
+@@ -477,6 +479,11 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
+         _init_state, init_idx, try_idx = slot.job
+         entry = results[init_idx]
+         entry["all_trajs"].append(slot.traj)
++        if try_idx == 0:
++            # rescue-protocol dyn rule (user 2026-08-23): an all-failed init
++            # contributes its FIRST retry to the dyn data -- completion order
++            # is NOT try order under parallel envs, so tag try 0 explicitly.
++            entry["first_traj"] = slot.traj
+         j = _traj_jerk(slot.traj["actions"])
+         if j > 0.0:                              # T<4 -> 0.0, skipped
+             jerk_sum += j
+diff --git a/scout/eval/run_rollout.py b/scout/eval/run_rollout.py
+index 5402a73..2ae8a33 100644
+--- a/scout/eval/run_rollout.py
++++ b/scout/eval/run_rollout.py
+@@ -131,10 +131,20 @@ def main():
+                         "uses i*1000+42 (seeds ..+499 -> 500 scenes). Passing "
+                         "this switches the pipeline to the split protocol; "
+                         "omitting it keeps the legacy retry-failed-inits mode.")
++    p.add_argument("--explore-mode", choices=["fresh", "rescue"], default="fresh",
++                   help="explore protocol (user 2026-08-23): 'fresh' (default) = "
++                        "split protocol, explore rolls fresh scenes from "
++                        "--explore-seed; 'rescue' = SOE protocol, explore "
++                        "retries ONLY the failed eval inits (same scenes) "
++                        "--explore-try-times each. DP data = successful "
++                        "retries; dyn data = per failed init {successes, else "
++                        "first retry}. --explore-seed/--n-explore ignored.")
+     p.add_argument("--n-explore", type=int, default=500,
+                    help="split mode: number of explore scenes (default 500)")
+     p.add_argument("--explore-try-times", type=int, default=1,
+-                   help="split mode: rollouts per explore scene (default 1)")
++                   help="rollouts per explore scene in fresh mode / retries per "
++                        "failed eval init in rescue mode (default 1; rescue "
++                        "drivers pass 5)")
+     p.add_argument("--eval-only", action="store_true",
+                    help="split protocol but SKIP the explore phase: run the "
+                         "seed-fixed eval set once, report success_rate/jerk, "
+@@ -167,17 +177,24 @@ def main():
+     cfg.eval.seed = args.seed          # base seed for init scenes (pipeline reads it)
+     # split-protocol defaults may live in the config (cfg.explore.*); explicit
+     # CLI --explore-seed wins. Absent section -> legacy retry-failed mode.
++    # Rescue mode overrides all of this -- the config's explore section must
++    # NOT force split mode when the driver asked for the SOE rescue protocol.
+     _exp = getattr(cfg, "explore", None)
+-    if args.explore_seed is None and _exp is not None \
+-            and getattr(_exp, "base_seed_round1", None) is not None:
+-        args.explore_seed = int(_exp.base_seed_round1)
+-    if _exp is not None:
+-        if getattr(_exp, "n_scenes", None) is not None and args.n_explore == 500:
+-            args.n_explore = int(_exp.n_scenes)
+-        if getattr(_exp, "try_times", None) is not None \
+-                and args.explore_try_times == 1:
+-            args.explore_try_times = int(_exp.try_times)
+-    split_mode = args.explore_seed is not None or args.eval_only
++    if args.explore_mode == "rescue":
++        args.explore_seed = None
++    else:
++        if args.explore_seed is None and _exp is not None \
++                and getattr(_exp, "base_seed_round1", None) is not None:
++            args.explore_seed = int(_exp.base_seed_round1)
++        if _exp is not None:
++            if getattr(_exp, "n_scenes", None) is not None and args.n_explore == 500:
++                args.n_explore = int(_exp.n_scenes)
++            if getattr(_exp, "try_times", None) is not None \
++                    and args.explore_try_times == 1:
++                args.explore_try_times = int(_exp.try_times)
++    rescue_mode = args.explore_mode == "rescue"
++    split_mode = (not rescue_mode) and (args.explore_seed is not None
++                                        or args.eval_only)
+     eval_seed = args.eval_seed if args.eval_seed is not None else args.seed
+ 
+     guided = args.guide in ("dyn", "expert") and not args.success_only
+@@ -348,6 +365,7 @@ def main():
+             n_explore=args.n_explore,
+             explore_try_times=args.explore_try_times,
+             eval_only=args.eval_only,
++            explore_mode=args.explore_mode,
+         )
+         metrics = result["metrics"]
+ 
+@@ -467,12 +485,17 @@ def main():
+                     "explore_total": metrics["explore_total"],
+                 })
+             else:
++                # rescue (SOE) and legacy share the retry-failed-inits metric
++                # schema; only the data-selection rules differ (see pipeline).
+                 summary.update({
+-                    "protocol": "legacy",
++                    "protocol": "rescue" if rescue_mode else "legacy",
+                     "pass_at_5": metrics["pass_at_5"],
+                     "exploration_rescued": metrics["exploration_rescued"],
+-                    "n_baseline_trajs": int(cfg.eval.n_init_states),
+                 })
++                if rescue_mode:
++                    summary["explore_try_times"] = metrics["explore_try_times"]
++                else:
++                    summary["n_baseline_trajs"] = int(cfg.eval.n_init_states)
+             with open(json_path, "w") as f:
+                 json.dump(summary, f, indent=2)
+ 
+diff --git a/soe_scripts/round.sh b/soe_scripts/round.sh
+index 92eca90..a264205 100644
+--- a/soe_scripts/round.sh
++++ b/soe_scripts/round.sh
+@@ -59,13 +59,33 @@ DATA_ROOT=${DATA_ROOT:?set DATA_ROOT=<experiment dir, e.g. data/2026_8_21/CAN-ex
+ DYN_FREEZE_AFTER=${DYN_FREEZE_AFTER:-3}
+ SEED=42                       # eval phase: FIXED scene set every round (42..141)
+ NEXPLORE=${NEXPLORE:-100}
+-ETRIES=1
++# XMODE (user 2026-08-23): explore protocol -- both settings coexist and are
++# switchable by this one parameter.
++#   fresh (default, v3 split): explore = NEXPLORE FRESH scenes (seed
++#       NUM*1000+42) x ETRIES each; ALL explore trajs -> dyn data.
++#   soe (SOE protocol): explore = retry ONLY the failed eval inits (the SAME
++#       scenes/initial states as eval) x ETRIES each (default 5); DP data =
++#       successful retries; dyn data = per failed init {successful retries
++#       if any, else FIRST retry}. Fixed budgets: DP_EPOCHS_SOE=300,
++#       DYN_EPOCHS_SOE=100 (fresh mode keeps adaptive DP / config dyn).
++XMODE=${XMODE:-fresh}
++case "$XMODE" in fresh|soe) ;; *) echo "XMODE must be fresh or soe (got: $XMODE)"; exit 1 ;; esac
++if [ "$XMODE" = soe ]; then ETRIES=${ETRIES:-5}; else ETRIES=${ETRIES:-1}; fi
+ NENV=${NENV:-12}              # rollout concurrency (2026-08-22 user: 12 by
+                               # default -- fastest tier AND lowest render-
+                               # corruption rate; env creation overhead scales
+                               # with n_envs and dominates on 100-scene rounds)
+ NENV_RETRY=${NENV_RETRY:-6}   # render-corruption retry: halve the EGL surface
+-if [ "$A" = BASE ]; then ESEED=0; else ESEED=$((NUM * 1000 + 42)); fi
++if [ "$A" = BASE ]; then ESEED=0
++elif [ "$XMODE" = soe ]; then ESEED=$SEED        # explore targets the eval scene set's failed inits
++else ESEED=$((NUM * 1000 + 42)); fi
++if [ "$XMODE" = soe ]; then
++  EXPLORE_ARGS=(--explore-mode rescue --explore-try-times "$ETRIES")
++  EDESC="failed-of-eval(x$ETRIES)"
++else
++  EXPLORE_ARGS=(--explore-seed "$ESEED" --n-explore "$NEXPLORE" --explore-try-times "$ETRIES")
++  EDESC="$ESEED($NEXPLORE x$ETRIES)"
++fi
+ 
+ export MUJOCO_GL=egl
+ export TMPDIR=/tmp            # MUST be local (CPFS TMPDIR kills torch_shm_manager)
+@@ -149,7 +169,7 @@ if [ "$A" = BASE ]; then
+       dataloader.num_workers=8 dataloader.persistent_workers=true \
+       +logging.metric_prefix=DP/ \
+       logging.name=DP-s${TSEED}-round0 \
+-      logging.project=$WPROJ \
++      logging.project=\'"$WPROJ"\' \
+       hydra.run.dir="$TDP/DP-base" \
+       > "$TDP/DP-base/train.log" 2>&1
+     RC=$?
+@@ -164,7 +184,7 @@ if [ "$A" = BASE ]; then
+         dataloader.num_workers=0 \
+         +logging.metric_prefix=DP/ \
+         logging.name=DP-s${TSEED}-round0 \
+-        logging.project=$WPROJ \
++        logging.project=\'"$WPROJ"\' \
+         hydra.run.dir="$TDP/DP-base" \
+         > "$TDP/DP-base/train.log" 2>&1
+       RC=$?
+@@ -269,14 +289,14 @@ for ATTEMPT in 1 2; do
+     log "[1/3] SKIP_ROLLOUT=1: reusing existing $RDIR/all.hdf5 (validating it)"
+   else
+     rm -f "$RDIR/all.hdf5" "$RDIR/success.hdf5"; rm -rf "$RDIR/log"
+-    log "[1/3] rollout guide=$GUIDE try$ATTEMPT n_envs=$NE eval=$SEED(100) explore=$ESEED($NEXPLORE x$ETRIES) dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
++    log "[1/3] rollout guide=$GUIDE try$ATTEMPT n_envs=$NE xmode=$XMODE eval=$SEED(100) explore=$EDESC dp=$DPCKPT vib=${VIBCKPT:-none} -> $RDIR"
+     RUN env CUDA_VISIBLE_DEVICES=$GPU SCOUT_RENDER_GPU=$GPU $PY -m scout.eval.run_rollout \
+       --config configs/eval_${TASK}_exp1.yaml --task "$TASK" --exp-num "$NUM" \
+       --base-dp-ckpt "$DPCKPT" \
+       --core-hdf5 "$CORE" \
+       --guide "$GUIDE" --seed "$SEED" \
+-      --eval-seed "$SEED" --explore-seed "$ESEED" \
+-      --n-explore "$NEXPLORE" --explore-try-times "$ETRIES" \
++      --eval-seed "$SEED" \
++      ${EXPLORE_ARGS[@]+"${EXPLORE_ARGS[@]}"} \
+       --n-envs "$NE" \
+       ${EVALONLY[@]+"${EVALONLY[@]}"} \
+       ${VIBARGS[@]+"${VIBARGS[@]}"} \
+@@ -357,6 +377,11 @@ accum = os.path.join(rdir, "success_accum.hdf5")
+ info = merge_accumulated_hdf5(core_path, succs, accum)
+ print(f"[dp-accum] merged {info} -> {accum}")
+ PYEOF
++if [ "$XMODE" = soe ]; then
++  EP=${DP_EPOCHS_SOE:-300}
++  CKE=150                   # 300ep -> ckpts 149/299 (final epoch is saved)
++  log "[2/3] DP retrain: ${EP}ep (soe fixed budget) ckpt_every=$CKE seed=$TSEED ds=$RDIR/success_accum.hdf5 -> $OUTDP"
++else
+ EP=$($PY - "$RDIR/success_accum.hdf5" <<'PYEOF'
+ import sys, h5py
+ with h5py.File(sys.argv[1], "r") as f:
+@@ -372,6 +397,7 @@ if ! [[ "$EP" =~ ^[0-9]+$ ]]; then
+ fi
+ CKE=$(( EP < 200 ? EP : 200 ))
+ log "[2/3] DP retrain: ${EP}ep (adaptive, clamp 100..600) ckpt_every=$CKE seed=$TSEED ds=$RDIR/success_accum.hdf5 -> $OUTDP"
++fi
+ RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY train.py \
+   --config-path configs --config-name base_dp_${TASK}_image \
+   task.dataset_path="$RDIR/success_accum.hdf5" \
+@@ -382,7 +408,7 @@ RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="
+   dataloader.num_workers=8 dataloader.persistent_workers=true \
+   +logging.metric_prefix=DP/ \
+   logging.name=$WNAME \
+-  logging.project=$WPROJ \
++  logging.project=\'"$WPROJ"\' \
+   hydra.run.dir="$OUTDP" \
+   > "$DPLOG" 2>&1
+ RC=$?; T2=$(date +%s)
+@@ -399,7 +425,7 @@ if [ $RC -ne 0 ]; then
+     dataloader.num_workers=0 \
+     +logging.metric_prefix=DP/ \
+     logging.name=$WNAME \
+-    logging.project=$WPROJ \
++    logging.project=\'"$WPROJ"\' \
+     hydra.run.dir="$OUTDP" \
+     > "$DPLOG" 2>&1
+   RC=$?; T2=$(date +%s)
+@@ -415,9 +441,11 @@ if [ "$NUM" -gt "$DYN_FREEZE_AFTER" ]; then
+ else
+ CFG=$OUTDYN/config.yaml
+ NEWDP=$(newest_ckpt "$OUTDP")
+-$PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TSEED" "$WPROJ" "$TASK" "$CORE" <<'PYEOF'
++DYN_EPOCHS=0
++[ "$XMODE" = soe ] && DYN_EPOCHS=${DYN_EPOCHS_SOE:-100}
++$PY - "$CFG" "$RDIR" "$OUTDYN" "$OUTDP" "$A" "$NUM" "$TSEED" "$WPROJ" "$TASK" "$CORE" "$DYN_EPOCHS" <<'PYEOF'
+ import sys, yaml, glob, os, re
+-cfg_path, rdir, outdyn, outdp, a_tag, num, tseed, wproj, task, core_path = sys.argv[1:11]
++cfg_path, rdir, outdyn, outdp, a_tag, num, tseed, wproj, task, core_path, dyn_ep = sys.argv[1:12]
+ sys.path.insert(0, os.getcwd())
+ from scout.eval.hdf5_writer import merge_accumulated_hdf5
+ 
+@@ -442,6 +470,8 @@ if ck:
+     cfg["model"]["E_s"]["base_dp_ckpt"] = ck[-1]
+ cfg["seed"] = int(tseed)
+ cfg["cudnn_deterministic"] = True
++if int(dyn_ep) > 0:
++    cfg["num_epochs"] = int(dyn_ep)   # soe fixed budget (default 100)
+ cfg["save_dir"] = outdyn
+ cfg.setdefault("wandb", {})["name"] = f"{a_tag}-s{tseed}-round{num}"
+ cfg["wandb"]["project"] = wproj
+@@ -449,7 +479,7 @@ with open(cfg_path, "w") as f:
+     yaml.safe_dump(cfg, f, sort_keys=False)
+ print(f"[dyn-cfg] seed={tseed} ds={accum} es={ck[-1] if ck else None} -> {outdyn}")
+ PYEOF
+-log "[3/3] dyn retrain: seed=$TSEED ds=$RDIR/all_accum.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
++log "[3/3] dyn retrain: seed=$TSEED ep=${DYN_EPOCHS:-cfg} ds=$RDIR/all_accum.hdf5 es_base=${NEWDP:-base-config} -> $OUTDYN"
+ RUN env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 WANDB_RUN_ID="$RID" WANDB_RESUME=must $PY -m scout.train_vib \
+   --config "$CFG" \
+   > "$DYNLOG" 2>&1

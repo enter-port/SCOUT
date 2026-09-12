@@ -1,0 +1,37 @@
+ M scout/eval/rollout_pipeline.py
+ M scout/eval/rollout_vec.py
+ M scout/eval/run_rollout.py
+ M soe_scripts/round.sh
+?? configs/eval_can_e2.yaml
+?? configs/eval_can_e2fix01.yaml
+?? configs/eval_can_e2s01.yaml
+?? configs/eval_can_e3.yaml
+?? configs/eval_can_e3s01.yaml
+?? configs/eval_can_e4.yaml
+?? configs/eval_can_e5.yaml
+?? configs/eval_can_exp1.yaml
+?? configs/eval_square_e2.yaml
+?? configs/eval_square_e3.yaml
+?? configs/eval_square_e3s01.yaml
+?? configs/eval_square_e4.yaml
+?? configs/eval_transport_e2.yaml
+?? configs/vib_can_exp1.yaml
+?? configs/vib_can_image_e2.yaml
+?? configs/vib_can_image_e3.yaml
+?? configs/vib_can_image_e4.yaml
+?? configs/vib_can_image_e5.yaml
+?? configs/vib_square_image_e2.yaml
+?? configs/vib_square_image_e3.yaml
+?? configs/vib_square_image_e4.yaml
+?? configs/vib_transport_image_e2.yaml
+?? launch_retrain.py
+?? scout/eval/_smoke_rescue.py
+?? soe_scripts/e3_resume.sh
+?? soe_scripts/resume_chain.sh
+?? soe_scripts/resume_watch.sh
+?? soe_scripts/round2.sh
+?? soe_scripts/round_e2s01.sh
+?? soe_scripts/t0_transport.sh
+?? soe_scripts/t0_transport_resume.sh
+?? soe_scripts/verify_2333.sh
+?? soe_scripts/verify_envspeed.sh
