@@ -332,7 +332,9 @@ def cmd_n3(args):
     vib_cfg["dataset"]["zarr_path"] = core
     vib_cfg["dataset"]["num_workers"] = 0
     vib_cfg["dataset"]["feature_cache"] = False
-    vib_cfg["dataset"]["batch_size"] = args.batch_size
+    vib_cfg["batch_size"] = args.batch_size   # TOP-LEVEL: make_dataloader
+    # reads cfg.batch_size; the yaml default (256) must be overridden to pin
+    # the frozen-batch convention B=128 shared with n1/n2/probe lineage
     torch.manual_seed(0)
     loader, _ds = make_dataloader(EasyDict(vib_cfg))
     batch = next(iter(loader))
