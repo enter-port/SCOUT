@@ -229,6 +229,74 @@ def cmd_n1(args):
                      "rho >= rho_min -> keep calibrated (eta0, kappa0)")}
 
 
+def cmd_n2(args):
+    """Trust-proportional rescale (iteration-3 flow for the beat-placebo
+    goal): the SAME frozen-core-batch far-field retention rho as n1, but
+    instead of a hard gate, de-rate BOTH knobs proportionally to the
+    retained instrument quality:
+
+        eta_r = eta0 * rho,   kappa_r = kappa0 * rho
+
+    Rationale: a partially degraded cost instrument is still worth using at
+    de-rated force (ensemble-disagreement-weighted guidance analogue), and
+    kappa0*rho restores the cap at the base leash DISPLACEMENT under an
+    approximately rho-scaled surface (K_r ~= rho * K0 => K_r(delta*) =
+    rho*kappa0). Continuity: rho -> 0 degenerates to eta = 0 (placebo
+    fallback), rho = 1 keeps the calibrated point exactly.
+    """
+    import torch
+    import yaml
+    from easydict import EasyDict
+
+    sdr = args.seed_data_root
+    task_dir = os.path.join(sdr, args.task)
+    core = args.core_hdf5 or os.path.join(task_dir, "rollout", args.core_name)
+    for p in (core, args.base_vib, args.round_vib, args.dp_ckpt):
+        assert os.path.exists(p), f"missing {p}"
+
+    dev = torch.device("cuda")
+    from scout.train_vib import make_dataloader, _slice_transition
+    from dyn_model.datasets.img_transforms import get_eval_crop_transform_resnet
+
+    vib_cfg = yaml.safe_load(open(args.vib_config))
+    vib_cfg["dataset"]["zarr_path"] = core
+    vib_cfg["dataset"]["num_workers"] = 0
+    vib_cfg["dataset"]["feature_cache"] = False
+    vib_cfg["batch_size"] = args.batch_size
+    torch.manual_seed(0)
+    loader, _ds = make_dataloader(EasyDict(vib_cfg))
+    batch = next(iter(loader))
+    t_crop = get_eval_crop_transform_resnet(84, 76)
+    obs_t, a_t, _, _ = _slice_transition(batch, dev, t_crop)
+
+    from scout.eval.factories import load_cfg, make_scout_vib_factory
+    ecfg = load_cfg(args.eval_config)
+
+    def far(vib_ckpt):
+        ecfg.vib.ckpt_path = vib_ckpt
+        ecfg.vib.base_dp_ckpt = args.dp_ckpt
+        model = make_scout_vib_factory(ecfg, dev)(vib_ckpt)
+        model.eval()
+        with torch.no_grad():
+            s_bar = model.encode(obs_t)
+            mu0, lv0 = model.vib_enc(s_bar, a_t)
+            perm = torch.randperm(a_t.shape[0],
+                                  generator=torch.Generator().manual_seed(7)).to(dev)
+            mu_f, lv_f = model.vib_enc(s_bar, a_t[perm])
+            var, var0 = torch.exp(lv_f), torch.exp(lv0)
+            return float((0.5 * (((mu_f - mu0) ** 2 / var0)
+                                 + (var / var0) - 1.0
+                                 - (lv_f - lv0))).sum(1).mean())
+
+    far0 = far(args.base_vib)
+    farr = far(args.round_vib)
+    rho = farr / far0
+    return {"method": "n2", "far_base": far0, "far_round": farr,
+            "rho": rho, "eta": args.eta0 * rho,
+            "kappa": args.kappa0 * rho,
+            "rule": "eta=eta0*rho, kappa=kappa0*rho (trust-proportional)"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="method", required=True)
@@ -282,6 +350,21 @@ def main():
     p4.add_argument("--rho-min", type=float, default=0.5)
     p4.add_argument("--out", default=None)
 
+    p5 = sub.add_parser("n2")
+    p5.add_argument("--seed-data-root", required=True)
+    p5.add_argument("--base-vib", required=True)
+    p5.add_argument("--round-vib", required=True)
+    p5.add_argument("--dp-ckpt", required=True)
+    p5.add_argument("--vib-config", default="configs/vib_coffee_exp1.yaml")
+    p5.add_argument("--eval-config", default="configs/eval_coffee_entropy.yaml")
+    p5.add_argument("--task", default="coffee")
+    p5.add_argument("--core-name", default="coffee_core.hdf5")
+    p5.add_argument("--core-hdf5", default=None)
+    p5.add_argument("--batch-size", type=int, default=128)
+    p5.add_argument("--eta0", type=float, required=True)
+    p5.add_argument("--kappa0", type=float, required=True)
+    p5.add_argument("--out", default=None)
+
     args = ap.parse_args()
     if args.method == "m1":
         res = cmd_m1(args)
@@ -289,8 +372,10 @@ def main():
         res = cmd_m2(args)
     elif args.method == "m3":
         res = cmd_m3(args)
-    else:
+    elif args.method == "n1":
         res = cmd_n1(args)
+    else:
+        res = cmd_n2(args)
 
     print("[calib:%s] eta=%.6g kappa=%.6g" % (res["method"], res["eta"],
                                               res["kappa"]))
