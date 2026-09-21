@@ -147,15 +147,25 @@ def cmd_m3(args):
 
 
 def cmd_n1(args):
-    """Activity gate (iteration 2, after the three-method review): one clean
+    """Activity gate (iteration 2, after the three-method review): ONE clean
     no-grad forward of the FROZEN core batch through BOTH encoders (base dyn
-    + round dyn) gives the information budgets B0, Br = KL(q(z|s,a)||N(0,I)).
-    Retention rho = Br/B0. Below rho_min the VIB has re-optimized its
-    rate-distortion operating point (code rate halved => the cost functional
-    whose e^kappa tilt was calibrated at B0 is no longer the same instrument;
-    Goodhart: optimizing a degraded proxy subtracts value) => deploy ZERO
-    force: the guided sampler degenerates to the DP prior itself, which the
-    design already names as the trust region. Otherwise keep (eta0, kappa0).
+    + round dyn). Gate signal = FAR-FIELD (crossed-pair) KL retention:
+    for a fixed permutation (seed 7, same construct as the probe far-field
+    so numbers are comparable) compute KL(q(z|s_i,a_perm(i)) || q(z|s_i,a_i))
+    -- posteriors at two REAL data actions of the same state, no synthetic
+    displacement ladder, no gradients. This is the discrimination range of
+    the cost instrument over the reachable band; it is also the quantity the
+    user's 2026-09-21 fix proposal named for the gate ("远场判别塌 -> 退回").
+
+    rho = farKL_round / farKL_base. Below rho_min the instrument has lost
+    most of its calibrated dynamic range (measured regimes: base 1.0,
+    first-retrained dyn 0.19, round-5 dyn 0.33 -- healthy and collapsed
+    regimes separated by a wide gap; rho_min=0.5 is the log-midpoint of the
+    gap and is deliberately far from both measured values so the gate does
+    not depend on the batch convention). Goodhart reading: optimizing a
+    degraded proxy subtracts value, so deploy ZERO force -- the guided
+    sampler degenerates to the DP prior itself, which the design already
+    names as the trust region. Otherwise keep (eta0, kappa0).
     """
     import torch
     import yaml
@@ -185,23 +195,34 @@ def cmd_n1(args):
     from scout.eval.factories import load_cfg, make_scout_vib_factory
     ecfg = load_cfg(args.eval_config)
 
-    def budget(vib_ckpt):
+    def stats(vib_ckpt):
         ecfg.vib.ckpt_path = vib_ckpt
         ecfg.vib.base_dp_ckpt = args.dp_ckpt
         model = make_scout_vib_factory(ecfg, dev)(vib_ckpt)
         model.eval()
         with torch.no_grad():
             s_bar = model.encode(obs_t)
-            mu, lv = model.vib_enc(s_bar, a_t)
-        return float((0.5 * (mu ** 2 + torch.exp(lv) - 1.0 - lv)).sum(1).mean())
+            mu0, lv0 = model.vib_enc(s_bar, a_t)
+            budget = float((0.5 * (mu0 ** 2 + torch.exp(lv0) - 1.0
+                                   - lv0)).sum(1).mean())
+            perm = torch.randperm(a_t.shape[0],
+                                  generator=torch.Generator().manual_seed(7)).to(dev)
+            mu_f, lv_f = model.vib_enc(s_bar, a_t[perm])
+            var, var0 = torch.exp(lv_f), torch.exp(lv0)
+            far = float((0.5 * (((mu_f - mu0) ** 2 / var0)
+                                + (var / var0) - 1.0
+                                - (lv_f - lv0))).sum(1).mean())
+        return budget, far
 
-    b0 = budget(args.base_vib)
-    br = budget(args.round_vib)
-    rho = br / b0
+    b0, far0 = stats(args.base_vib)
+    br, farr = stats(args.round_vib)
+    rho = farr / far0
     gate_open = rho < args.rho_min
     eta = 0.0 if gate_open else args.eta0
-    return {"method": "n1", "budget_base": b0, "budget_round": br,
+    return {"method": "n1", "far_base": far0, "far_round": farr,
             "rho": rho, "rho_min": args.rho_min, "gate_open": gate_open,
+            "budget_base": b0, "budget_round": br,
+            "budget_retention": br / b0,
             "eta": eta, "kappa": args.kappa0,
             "rule": ("rho < rho_min -> eta=0 (fall back to the DP prior's "
                      "own retries)" if gate_open else
