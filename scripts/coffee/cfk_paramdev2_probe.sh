@@ -8,19 +8,24 @@
 # placebo json read from the server:
 #   r2: 9/15 -> need >=10   r3: 12/15 -> need >=13
 #   r4: 7/12 -> need >=8    r5: 8/11 -> need >=9
-# usage: bash scripts/coffee/cfk_paramdev2_probe.sh <GPU> <FLIGHT_ROUND> <ETA> <KAP>
+# usage: bash scripts/coffee/cfk_paramdev2_probe.sh <GPU> <FLIGHT_ROUND> <ETA> <KAP> [aty|base]
 set -u
 GPU=${1:?gpu}; R=${2:?flight_round}; ETA=${3:?eta}; KAP=${4:?kap}
+VIBMODE=${5:-aty}
 ROOT=/root/workspace/baojiachun/scout
 PY=/root/workspace/baojiachun/.venv_mg/bin/python
 CAMP=$ROOT/data/2026_9_20_coffee_mg_p1
 S=$CAMP/COFFEE-MG-p1-s23333
 PM1=$((R-1))
-OUT=$CAMP/PROBE_PARAMDEV_R2/flight_r${R}_e${ETA}_k${KAP}
+OUT=$CAMP/PROBE_PARAMDEV_R2/flight_r${R}_e${ETA}_k${KAP}${VIBMODE:+_$VIBMODE}
 mkdir -p "$OUT"
 cd "$ROOT" || exit 1
 DPCKPT=$S/coffee/train/DP/DP-DP-exp${PM1}/checkpoints/299.ckpt
-VIBC=$(ls -t $S/coffee/train/dyn/dyn-ATY-exp${PM1}/*/scout_vib.ckpt | head -1)
+if [ "$VIBMODE" = "base" ]; then
+  VIBC=$(ls -t $S/coffee/train/dyn/dyn-base/*/scout_vib.ckpt | head -1)
+else
+  VIBC=$(ls -t $S/coffee/train/dyn/dyn-ATY-exp${PM1}/*/scout_vib.ckpt | head -1)
+fi
 CORE=$S/coffee/rollout/coffee_core.hdf5
 FAILED=$S/coffee/rollout/DP-exp${R}/failed.json
 for f in "$DPCKPT" "$VIBC" "$CORE" "$FAILED"; do
