@@ -297,6 +297,89 @@ def cmd_n2(args):
             "rule": "eta=eta0*rho, kappa=kappa0*rho (trust-proportional)"}
 
 
+def cmd_n3(args):
+    """User-specified multiplicative recalibration (2026-09-22, replaces the
+    n1 gate in the p3 campaign): on the SAME frozen core batch and the SAME
+    fixed crossed-pair permutation (seed 7) as n1,
+
+        rho = farKL_round / farKL_base            -> kappa_r = kappa0 * rho
+        phi = meanabs|g|_round / meanabs|g|_base  -> eta_r   = eta0   * phi
+
+    The gradient is taken on the QUERY side (user-confirmed 2026-09-22):
+    per crossed pair, g_i = grad_a KL(q(z|s_i, a_perm(i)) || q(z|s_i, a_i))
+    with the reference posterior (mu0, lv0) detached -- identical structure
+    to the rollout-time guidance gradient grad_a KL(q(z|s,a) || q(z|s,a0)),
+    which is the quantity eta multiplies at rollout. meanabs = elementwise
+    |g| averaged over all rows x action dims (literal reading of the user's
+    spec); the per-row L2-norm mean is logged alongside for cross-checks.
+    Pure multiplication: no gate, no threshold, no clamp, no eta=0 branch.
+    """
+    import torch
+    import yaml
+    from easydict import EasyDict
+
+    sdr = args.seed_data_root
+    task_dir = os.path.join(sdr, args.task)
+    core = args.core_hdf5 or os.path.join(task_dir, "rollout", args.core_name)
+    for p in (core, args.base_vib, args.round_vib, args.dp_ckpt):
+        assert os.path.exists(p), f"missing {p}"
+
+    dev = torch.device("cuda")
+    from scout.train_vib import make_dataloader, _slice_transition
+    from dyn_model.datasets.img_transforms import get_eval_crop_transform_resnet
+
+    vib_cfg = yaml.safe_load(open(args.vib_config))
+    vib_cfg["dataset"]["zarr_path"] = core
+    vib_cfg["dataset"]["num_workers"] = 0
+    vib_cfg["dataset"]["feature_cache"] = False
+    vib_cfg["dataset"]["batch_size"] = args.batch_size
+    torch.manual_seed(0)
+    loader, _ds = make_dataloader(EasyDict(vib_cfg))
+    batch = next(iter(loader))
+    t_crop = get_eval_crop_transform_resnet(84, 76)
+    obs_t, a_t, _, _ = _slice_transition(batch, dev, t_crop)
+
+    from scout.eval.factories import load_cfg, make_scout_vib_factory
+    ecfg = load_cfg(args.eval_config)
+
+    def stats(vib_ckpt):
+        ecfg.vib.ckpt_path = vib_ckpt
+        ecfg.vib.base_dp_ckpt = args.dp_ckpt
+        model = make_scout_vib_factory(ecfg, dev)(vib_ckpt)
+        model.eval()
+        with torch.no_grad():
+            s_bar = model.encode(obs_t)
+            mu0, lv0 = model.vib_enc(s_bar, a_t)
+            perm = torch.randperm(a_t.shape[0],
+                                  generator=torch.Generator().manual_seed(7)).to(dev)
+            mu_f, lv_f = model.vib_enc(s_bar, a_t[perm])
+            var, var0 = torch.exp(lv_f), torch.exp(lv0)
+            far = float((0.5 * (((mu_f - mu0) ** 2 / var0)
+                                + (var / var0) - 1.0
+                                - (lv_f - lv0))).sum(1).mean())
+        mu0, lv0, var0 = mu0.detach(), lv0.detach(), var0.detach()
+        a_g = a_t[perm].clone().requires_grad_(True)
+        mu_g, lv_g = model.vib_enc(s_bar.detach(), a_g)
+        kl = (0.5 * (((mu_g - mu0) ** 2 / var0)
+                     + (torch.exp(lv_g) / var0) - 1.0
+                     - (lv_g - lv0))).sum(1)
+        g = torch.autograd.grad(kl.sum(), a_g)[0]
+        return far, float(g.abs().mean()), float(g.flatten(1).norm(dim=1).mean())
+
+    far0, mag0, rn0 = stats(args.base_vib)
+    farr, magr, rnr = stats(args.round_vib)
+    assert far0 > 0 and mag0 > 0, "degenerate base signal (far/mag == 0)"
+    rho = farr / far0
+    phi = magr / mag0
+    return {"method": "n3", "far_base": far0, "far_round": farr,
+            "rho": rho,
+            "magabs_base": mag0, "magabs_round": magr, "phi": phi,
+            "rownorm_base": rn0, "rownorm_round": rnr,
+            "eta": args.eta0 * phi, "kappa": args.kappa0 * rho,
+            "rule": ("eta=eta0*phi (phi=meanabs|grad|_round/base, query "
+                     "side), kappa=kappa0*rho (far-KL retention)")}
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="method", required=True)
@@ -365,6 +448,21 @@ def main():
     p5.add_argument("--kappa0", type=float, required=True)
     p5.add_argument("--out", default=None)
 
+    p6 = sub.add_parser("n3")
+    p6.add_argument("--seed-data-root", required=True)
+    p6.add_argument("--base-vib", required=True)
+    p6.add_argument("--round-vib", required=True)
+    p6.add_argument("--dp-ckpt", required=True)
+    p6.add_argument("--vib-config", default="configs/vib_coffee_exp1.yaml")
+    p6.add_argument("--eval-config", default="configs/eval_coffee_entropy.yaml")
+    p6.add_argument("--task", default="coffee")
+    p6.add_argument("--core-name", default="coffee_core.hdf5")
+    p6.add_argument("--core-hdf5", default=None)
+    p6.add_argument("--batch-size", type=int, default=128)
+    p6.add_argument("--eta0", type=float, required=True)
+    p6.add_argument("--kappa0", type=float, required=True)
+    p6.add_argument("--out", default=None)
+
     args = ap.parse_args()
     if args.method == "m1":
         res = cmd_m1(args)
@@ -374,8 +472,10 @@ def main():
         res = cmd_m3(args)
     elif args.method == "n1":
         res = cmd_n1(args)
-    else:
+    elif args.method == "n2":
         res = cmd_n2(args)
+    else:
+        res = cmd_n3(args)
 
     print("[calib:%s] eta=%.6g kappa=%.6g" % (res["method"], res["eta"],
                                               res["kappa"]))
