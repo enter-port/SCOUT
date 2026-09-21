@@ -17,26 +17,36 @@ for g in 0 1 2 3 4 5; do
   [ "$used" -lt 1000 ] || { echo "[cfk2] FATAL GPU$g busy (${used}MiB)"; exit 1; }
 done
 
-# --- pre-copy the base three-piece per seed (idempotent) ---
+# --- pre-copy the base three-piece per seed (idempotent; DP-base carries
+#     ONLY the newest ckpt + config/train.log -- the round script resolves
+#     inputs via newest_ckpt, and the intermediate 99-499 stay in p1) ---
 for SEED in 233 2333 23333; do
   S1=$SRC/COFFEE-MG-p1-s$SEED/coffee
   S2=$DST/COFFEE-MG-p2-s$SEED/coffee
-  for f in "$S1/rollout/coffee_core.hdf5"; do
-    [ -f "$f" ] || { echo "[cfk2] FATAL missing source $f"; exit 1; }
-  done
-  [ -n "$(ls -t $S1/train/DP/DP-base/checkpoints/*.ckpt 2>/dev/null | head -1)" ] \
-    || { echo "[cfk2] FATAL no DP-base ckpt for s$SEED"; exit 1; }
+  DPNEW=$(ls -t $S1/train/DP/DP-base/checkpoints/*.ckpt 2>/dev/null | head -1)
+  [ -n "$DPNEW" ] || { echo "[cfk2] FATAL no DP-base ckpt for s$SEED"; exit 1; }
   [ -n "$(ls -t $S1/train/dyn/dyn-base/*/scout_vib.ckpt 2>/dev/null | head -1)" ] \
     || { echo "[cfk2] FATAL no dyn-base ckpt for s$SEED"; exit 1; }
-  mkdir -p "$S2/rollout" "$S2/train/DP" "$S2/train/dyn"
+  [ -f "$S1/rollout/coffee_core.hdf5" ] || { echo "[cfk2] FATAL missing source core for s$SEED"; exit 1; }
+  mkdir -p "$S2/rollout" "$S2/train/DP/DP-base/checkpoints" "$S2/train/dyn"
   [ -f "$S2/rollout/coffee_core.hdf5" ] \
     || cp -L "$S1/rollout/coffee_core.hdf5" "$S2/rollout/coffee_core.hdf5"
-  [ -d "$S2/train/DP/DP-base" ] || cp -rL "$S1/train/DP/DP-base" "$S2/train/DP/DP-base"
+  [ -f "$S2/train/DP/DP-base/checkpoints/$(basename $DPNEW)" ] \
+    || cp -L "$DPNEW" "$S2/train/DP/DP-base/checkpoints/"
+  for aux in config.yaml train.log; do
+    [ -f "$S1/train/DP/DP-base/$aux" ] && { [ -f "$S2/train/DP/DP-base/$aux" ] \
+      || cp -L "$S1/train/DP/DP-base/$aux" "$S2/train/DP/DP-base/"; }
+  done
   [ -d "$S2/train/dyn/dyn-base" ] || cp -rL "$S1/train/dyn/dyn-base" "$S2/train/dyn/dyn-base"
   # seed the shared round.log so cfk2_chain.sh finds it (chains append)
-  [ -f "$S2/round.log" ] || echo "[$(date '+%F %T')] [cfk2] base three-piece copied from COFFEE-MG-p1-s$SEED (core + DP-base + dyn-base; no round0)" >> "$S2/round.log"
+  [ -f "$S2/round.log" ] || echo "[$(date '+%F %T')] [cfk2] base three-piece copied from COFFEE-MG-p1-s$SEED (core + DP-base $DPNEW + dyn-base; no round0)" >> "$S2/round.log"
   echo "[cfk2] s$SEED base ready: core=$(stat -c%s $S2/rollout/coffee_core.hdf5)B dp=$(ls -t $S2/train/DP/DP-base/checkpoints/*.ckpt | head -1 | xargs basename) vib=$(ls -t $S2/train/dyn/dyn-base/*/scout_vib.ckpt | head -1 | xargs basename)"
 done
+
+if [ "${COPY_ONLY:-0}" = 1 ]; then
+  echo "[cfk2] COPY_ONLY=1 -- base staged, not spawning"
+  exit 0
+fi
 
 # --- spawn 6 chains (tmux; GPU map: s233 G0/G1, s2333 G2/G3, s23333 G4/G5) ---
 g=0
