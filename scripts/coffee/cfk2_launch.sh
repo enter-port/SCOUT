@@ -6,6 +6,7 @@
 # dereference possible ckpt symlinks).
 # tmux sessions: cfk2_<arm>_s<seed> on 1022 GPU0-5.
 set -u
+set -o pipefail
 ROOT=/root/workspace/baojiachun/scout
 SRC=$ROOT/data/2026_9_20_coffee_mg_p1
 DST=$ROOT/data/2026_9_22_coffee_mg_p2
@@ -29,10 +30,14 @@ for SEED in 233 2333 23333; do
     || { echo "[cfk2] FATAL no dyn-base ckpt for s$SEED"; exit 1; }
   [ -f "$S1/rollout/coffee_core.hdf5" ] || { echo "[cfk2] FATAL missing source core for s$SEED"; exit 1; }
   mkdir -p "$S2/rollout" "$S2/train/DP/DP-base/checkpoints" "$S2/train/dyn"
-  [ -f "$S2/rollout/coffee_core.hdf5" ] \
-    || cp -L "$S1/rollout/coffee_core.hdf5" "$S2/rollout/coffee_core.hdf5"
-  [ -f "$S2/train/DP/DP-base/checkpoints/$(basename $DPNEW)" ] \
-    || cp -L "$DPNEW" "$S2/train/DP/DP-base/checkpoints/"
+  copy_chk(){  # copy with SIZE verification (a half-written leftover re-copies)
+    local srcf=$1 dstf=$2
+    if [ ! -f "$dstf" ] || [ "$(stat -c%s "$srcf")" != "$(stat -c%s "$dstf")" ]; then
+      cp -L "$srcf" "$dstf" || { echo "[cfk2] FATAL copy failed: $srcf"; exit 1; }
+    fi
+  }
+  copy_chk "$S1/rollout/coffee_core.hdf5" "$S2/rollout/coffee_core.hdf5"
+  copy_chk "$DPNEW" "$S2/train/DP/DP-base/checkpoints/$(basename $DPNEW)"
   for aux in config.yaml train.log; do
     [ -f "$S1/train/DP/DP-base/$aux" ] && { [ -f "$S2/train/DP/DP-base/$aux" ] \
       || cp -L "$S1/train/DP/DP-base/$aux" "$S2/train/DP/DP-base/"; }
