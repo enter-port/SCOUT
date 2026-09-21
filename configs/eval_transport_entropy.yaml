@@ -1,0 +1,52 @@
+seed: 42
+# eval_transport_entropy.yaml -- TRANSPORT-9-13-orbit chain config (2026-09-13).
+# Copy of eval_tool_hang_entropy.yaml with transport fields (horizon 700,
+# shouldercamera0/1 + robot0/1_eye_in_hand cameras -- no agentview,
+# base_dp_transport_image, dual-arm action_dim 20, proprio 18).
+# guidance_scale 1.0 = PROVISIONAL: the th95-family raw doses are NOT
+# calibrated for transport (VIB never trained on transport before), so the
+# round0 dose-response probe runs BEFORE round 1 and the final value is
+# pinned via CLI in tp13_start_arms.sh. Stale ckpt paths are ALWAYS
+# overridden by run_rollout CLI (--base-dp-ckpt / --vib-ckpt /
+# --core-hdf5); dataset.path follows --core-hdf5.
+base_dp:
+  initial_ckpt_path: /root/workspace/baojiachun/scout/data/2026_9_13_transport/TRANSPORT-s233/transport/train/DP/DP-base/checkpoints/599.ckpt
+  config_name: base_dp_transport_image
+  config_dir: configs
+vib:
+  ckpt_path: /root/workspace/baojiachun/scout/data/2026_9_13_transport/TRANSPORT-s233/transport/train/dyn/dyn-base/20260913-000000/scout_vib.ckpt
+  base_dp_ckpt: /root/workspace/baojiachun/scout/data/2026_9_13_transport/TRANSPORT-s233/transport/train/DP/DP-base/checkpoints/599.ckpt
+  view_names: [shouldercamera0_image, robot0_eye_in_hand_image, shouldercamera1_image, robot1_eye_in_hand_image]
+  proprio_dim: 18
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+dataset:
+  path: /root/workspace/baojiachun/scout/data/2026_9_13_transport/TRANSPORT-s233/transport/rollout/transport_core.hdf5
+  core_filter_key: core_20
+action_dim: 20
+eval:
+  n_init_states: 100
+  try_times: 5
+  horizon: 700
+  n_envs: 25
+  log_every: 10
+  view_names: [shouldercamera0_image, robot0_eye_in_hand_image, shouldercamera1_image, robot1_eye_in_hand_image]
+  proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos, robot1_eef_pos, robot1_eef_quat, robot1_gripper_qpos]
+exploration:
+  guidance_scale: 1.0             # PROVISIONAL -- transport dose set by the round0 probe; CLI --guidance-scale overrides
+  guidance_start_timestep: 50     # th95 口径 (tool_hang probe winner); can/square used 100
+self_improvement:
+  num_rounds: 8
+  scout_aug_mask: scout_aug
+  num_epochs: 1500
+wandb:
+  use_wandb: true
+  project: TRANSPORT-9-13-orbit-s233
+  tags: [formal, orbit]
+device: auto
+log_dir: logs/scout_eval_transport_image
+explore:
+  base_seed_round1: 1042
+  n_scenes: 100
+  try_times: 1

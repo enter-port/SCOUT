@@ -207,3 +207,19 @@
 - **orbit σ 轮程**:9-1/9-2 = 0.16×0.5^(r−1);TOOLHANG-9-5 = 0.05×0.5^(r−1)(toolhang 定标更小)。
 - **SOE 采样器**:can(8-24)eta=0;square(8-30)eta=1;SOE 训练单位 1000ep×100it ≠ SCOUT 300ep 全数据。
 - **r6 ckpt 语义**:r6 eval-only/eval-pk 用 exp5 ckpt,与「r6 full 会产出的 exp6」不同代;跨链比较统一按 r5 代 p@10 + r6 SR。
+- **tp15 json 键名陷阱**:explore json 的 `pass_at_5` 键名 legacy 写死,值实为 pass@ETRIES(tp15=pass@1);wandb 标签 09-15 起动态正确(explore/pass@{ETRIES})。
+
+## J. TRANSPORT-9-15-p1(s233 / s2333 / s23333)——transport 三臂 pass@1 重启(tp15)
+
+| 项 | 值 |
+|---|---|
+| 任务 | transport(双臂 20 维 action / 14 维 abs_actions,4 相机 84×84,max_steps=700,horizon 700) |
+| 臂 | ①DP `--guide off` ②ATY `--guide atypical --atypical-cap 2.5 --guidance-scale 0.5`(raw)③ORBIT 同 ATY 剂量 + `--guide orbit --orbit-lam 0.5 --orbit-delta 0.25 --orbit-sigma 0.05 --orbit-sigma-decay 0.5 --orbit-round $NUM --orbit-fb-clamp soft --orbit-noise-anneal 2`(raw,无 eta-dimless,= tp13 逐字);gst=50 走 config `eval_transport_entropy.yaml` |
+| ETRIES | **1(pass@1;09-15 用户令,自 tp13 的 pass@5 改)**;wandb 回灌标签已修=explore/pass@{ETRIES}(round_tp.sh:418 动态;旧 campaign 面板的 explore/pass@10 是 legacy bug 值实为 pass@5) |
+| 并发 | SHARD_P=8/臂 × env25;phase A EVALNENV=25 单体 |
+| 轮数 | 6 轮:r1–r5 full + r6 eval-pk(用户拍板 6 轮全跑);DYN_FREEZE_AFTER=6(每轮都训 dyn);DP retrain 300ep **b256** |
+| base 三件套 | 三 seed 全部拷贝自 2026_9_13_transport(同 seed 确定性等价;DP 599.ckpt + dyn-base 20260913-{190703,185832,190001};core=transport_core.hdf5 20 条 seeded split) |
+| 部署 | 1022(s233 GPU0/2/4 + s2333 GPU1/3/6)+ 1024(s23333 GPU0/2/4,共用 CPFS);tmux tp15_{dp,aty,orbit}_s{seed};09-15 18:42 起飞 |
+| 代码/数据 | repo `scripts/transport/`(round_tp.sh 标签修复 + 新 tp15_chain/start_arms/prep_base);DATA_ROOT=`data/2026_9_15_transport_p1/TRANSPORT-s{seed}`;wandb `TRANSPORT-9-15-p1-s{seed}` |
+| 前身 | tp13(TRANSPORT-9-13-orbit,pass@5)同协议跑至 r4 被令停:r4 SR 均值 ORBIT .863>DP .840>ATY .837;pass@5 全场饱和 .95–1.00(软失败地貌)⇒ 本代改 pass@1 恢复区分度 |
+| 结果 | 🏁09-16 17:49 完赛(23.1h,零 ABORT)。**r6 终值 SR/pass@1/救回**:s233 DP .80/.93/13 · ATY .80/.94/14 · ORBIT .80/.89/9;s2333 DP .78/.90/12 · ATY **.90/.95/5** · ORBIT .77/.89/12;s23333 DP .79/.90/11 · ATY .77/.87/10 · ORBIT **.89/.95/6**。**r6 三 seed 均值:ATY .823±.068 / ORBIT .820±.062 > DP .790±.010**(均值优势全部来自两处终轮爆发 s2333-ATY、s23333-ORBIT,其领先场景 17/17、18/18 全为 DP 链 6 轮从未解过的场景=真解锁;逐 seed 对 DP 2胜2负2平);六轮救回总量 ORBIT 223 ≈ DP 212 ≈ ATY 206;r1–r5 均值 SR DP 逐轮 ≥ 引导臂(ORBIT r2–r4 缺口 −.107/−.083/−.060 随 σ 减半单调收窄=σ 污染回灌签名)。机制定量分析=`experiments/2026_9_16_tp15_why_not_beat_dp.md`(eval 恒无引导→SR 差=数据差;r1 完美配对单次救回率 DP .56>ATY .54>ORBIT .45;硬核场景=0)。图=`experiments/2026_9_16_transport_p1_3seed_figs_summary/` |

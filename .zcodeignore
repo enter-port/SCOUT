@@ -1,0 +1,81 @@
+# ===== 本地 / 非本项目内容（按项目要求忽略）=====
+# 学长 SOE 基线代码（独立工作，不随本仓库发布）
+SOE/
+lpb/
+# 参考论文 PDF
+papers/
+# Claude Code 本地配置与项目指令
+CLAUDE.md
+.claude/
+# ZCode 本地指令文件(从 Claude Code memory 迁移,本地私有,不提交)
+AGENTS.md
+.zcode/
+# 本地 scratch(orbit 重构期临时脚本/diff,留盘不入库)
+.tmp_orb/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ===== 实验产物（日志 / 图表 / 汇总 md,本地保留,不进 git）=====
+# 注:已在库内的 experiments/scripts/ 与 experiment1.md 仍保持跟踪
+experiments/
+
+# ===== 数据 / 模型权重 / 大文件（不进 git）=====
+*.hdf5
+*.h5
+*.ckpt
+*.pth
+*.pt
+*.npz
+*.npy
+out/
+results/
+wandb/
+runs/
+data/
+data_backup/
+
+# ===== 编辑器 / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+site-packages/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）
