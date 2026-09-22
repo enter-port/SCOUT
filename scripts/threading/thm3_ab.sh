@@ -5,6 +5,9 @@
 #         (budget curve: 100ep=2.591, 300ep=9.553 already measured)
 #   A2L : dyn 300ep  E_s=DP-ATY-exp1(299) data=dedup73 all_accum
 #   A2H : dyn 600ep  same                 (dedup73@100ep=2.143 already measured)
+#   A3  : dyn 300ep  E_s=B2-retrained-DP  data=dedup73  (runs AFTER B2; the
+#         "new round-1 ckpt" pair for the kappa-recalibration stage; gate:
+#         |g|@0.25sigma >= 1.5 (user-set) -> stage 3)
 #   B1  : DP retrain 900ep b256 on dedup43 success_accum -> E_s -> core-only
 #         dyn 100ep -> probe    (step-count axis: ~48k steps vs base's 42k)
 #   B2  : DP retrain 600ep b64  on dedup43 success_accum -> E_s -> core-only
@@ -66,6 +69,20 @@ A1|A2L|A2H)
     $PY -m scout.train_vib --config "$CFG" > $EXP/train_${ARM}.log 2>&1
   RC=$?
   echo "[$ARM] dyn train rc=$RC $(date '+%F %T')"
+  [ $RC -ne 0 ] && { tail -8 $EXP/train_${ARM}.log; exit 1; }
+  VIB=$(newest_vib "$OUT")
+  ;;
+A3)
+  ES=$EXP/train_DP_B2/checkpoints/599.ckpt
+  [ -f "$ES" ] || { echo "[A3] FATAL missing B2 E_s ckpt $ES (run arm B2 first)"; exit 1; }
+  EPO=300; DS=$DEDUP73; OUT=$EXP/train_A3
+  CFG=$EXP/vib_${ARM}.yaml
+  mk_vib_cfg "$CFG" "$DS" "$ES" "$EPO" "$OUT"
+  echo "[A3] dyn train ${EPO}ep (E_s=B2-DP, data=dedup73) start $(date '+%F %T')"
+  env CUDA_VISIBLE_DEVICES=$GPU CUBLAS_WORKSPACE_CONFIG=:4096:8 timeout 7200 \
+    $PY -m scout.train_vib --config "$CFG" > $EXP/train_${ARM}.log 2>&1
+  RC=$?
+  echo "[A3] dyn train rc=$RC $(date '+%F %T')"
   [ $RC -ne 0 ] && { tail -8 $EXP/train_${ARM}.log; exit 1; }
   VIB=$(newest_vib "$OUT")
   ;;
