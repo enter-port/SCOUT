@@ -147,7 +147,66 @@ def main():
                              "exploration_rescued", "pass_at_5",
                              "collected_trajs", "n_all_trajs")})
 
+    _smoke_rescue_stop(cfg)
     _smoke_rescue_spool(cfg, result)
+
+
+def _smoke_rescue_stop(cfg):
+    """stop_on_first_success scenario (user 2026-09-23): same deterministic
+    NEEDS protocol, explore stops at each init's FIRST success -> DP data =
+    exactly ONE traj per rescued need; dyn data = those + need=7's first
+    retry; pass@5 UNCHANGED (first-success based either way)."""
+    ATTEMPTS.clear()          # replay the identical deterministic attempt stream
+    pipe = RolloutPipeline(
+        cfg=cfg, dp_factory=lambda ckpt: MockDP().eval(),
+        scout_vib_factory=None, env_factory=lambda: MockEnv(),
+        device=torch.device("cpu"), guided=False,
+    )
+    init_states = [np.array([n], dtype=np.float32) for n in NEEDS]
+    import scout.eval.rollout_pipeline as rp
+    orig_collect = rp.collect_initial_states
+    rp.collect_initial_states = lambda ef, n_init_states, base_seed=None: \
+        init_states[:int(n_init_states)]
+    try:
+        result = pipe.run("mock-ckpt", explore_mode="rescue",
+                          explore_try_times=5, stop_on_first_success=True)
+    finally:
+        rp.collect_initial_states = orig_collect
+
+    m = result["metrics"]
+    trajs, all_trajs = result["trajs"], result["all_trajs"]
+    assert m["baseline_solved"] == 1, m
+    assert m["n_failed"] == 5, m
+    assert m["exploration_rescued"] == 4, m
+    assert abs(m["pass_at_5"] - 5 / 6) < 1e-9, m          # unchanged vs default
+    assert m["stop_on_first_success"] is True, m
+    # DP data: ONE success per rescued need (2,3,4,5) -> 4 (default run: 14)
+    assert len(trajs) == 4, len(trajs)
+    assert m["collected_trajs"] == 4, m
+    # dyn data: those 4 + FIRST retry of the all-fail need=7 -> 5
+    assert len(all_trajs) == 5, len(all_trajs)
+    assert m["n_all_trajs"] == 5, m
+    # exactly one successful traj per solved init, and every kept traj is
+    # either that first success or a PRE-success retry / the all-fail first
+    dyn_only = [t for t in all_trajs if id(t) not in {id(x) for x in trajs}]
+    assert len(dyn_only) == 1, len(dyn_only)
+    start_attempt = float(dyn_only[0]["obs"][0]["robot0_eef_pos"][0, 0])
+    assert start_attempt == 2.0, (
+        f"all-failed init must contribute its FIRST retry (attempt 2), "
+        f"got attempt {start_attempt}")
+    for t in trajs:
+        assert t["success"], "stop mode: every DP-data traj is a success"
+    # the 4 kept dyn successes are at attempts == their need (first success):
+    # needs 2..5 each contribute their need-th attempt as the sole success.
+    succ_attempts = sorted(
+        float(t["obs"][0]["robot0_eef_pos"][0, 0]) for t in all_trajs
+        if t["success"])
+    assert succ_attempts == [2.0, 3.0, 4.0, 5.0], succ_attempts
+
+    print("[smoke_rescue] stop_on_first_success OK:",
+          {k: m[k] for k in ("baseline_solved", "n_failed",
+                             "exploration_rescued", "pass_at_5",
+                             "collected_trajs", "n_all_trajs")})
 
 
 def _smoke_rescue_spool(cfg, result_ref):

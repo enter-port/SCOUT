@@ -10,6 +10,8 @@ core hdf5, this runs the SOE rollout flow:
             ``--guide off`` : plain base-DP retry (``predict_action``; baseline)
           -> successful trajectories (for retrain data) + ``pass@5`` +
           ``avg_jerk`` (over EVERY exploration trajectory, success + failure).
+          ``--stop-on-first-success`` (user 2026-09-23): an init's retries
+          stop at its FIRST success (one successful traj per solved init).
   step 4  merge the successful trajectories with the core hdf5.
 
 Outputs (per the data convention, under ``--output-dir`` = data/{task}/rollout/;
@@ -282,6 +284,13 @@ def main():
                    help="rollouts per explore scene in fresh mode / retries per "
                         "failed eval init in rescue mode (default 1; rescue "
                         "drivers pass 5)")
+    p.add_argument("--stop-on-first-success", action="store_true",
+                   help="explore retries stop at an init's FIRST success (user "
+                        "2026-09-23): the init's remaining retries are not run "
+                        "and exactly ONE successful traj per solved init enters "
+                        "the data (default off = SOE pattern: all retries run, "
+                        "every success kept). pass@k unchanged (first-success "
+                        "based either way)")
     p.add_argument("--rescue-seed", type=int, default=None,
                    help="rescue mode only (errors otherwise): re-seed the "
                         "GLOBAL retry RNG with this AFTER the frozen scene set "
@@ -690,6 +699,7 @@ def main():
             rescue_seed=args.rescue_seed,
             scene_slice=scene_slice,
             traj_sink=None if spool is None else spool.on_traj,
+            stop_on_first_success=args.stop_on_first_success,
         )
         metrics = result["metrics"]
 

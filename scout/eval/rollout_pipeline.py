@@ -244,7 +244,8 @@ class RolloutPipeline:
             explore_mode: str = "fresh",
             rescue_seed: Optional[int] = None,
             scene_slice: Optional[tuple] = None,
-            traj_sink: Optional[Callable[[dict, int, int], None]] = None
+            traj_sink: Optional[Callable[[dict, int, int], None]] = None,
+            stop_on_first_success: bool = False
             ) -> dict:
         """Run SOE step 2 (eval) + step 3 (explore failed only).
 
@@ -273,6 +274,12 @@ class RolloutPipeline:
         set are locked in, decoupling the retry stream from the scene-set
         seed (fresh-seed confirmation vs split search on the same scenes).
 
+        ``stop_on_first_success`` (user 2026-09-23): explore retries stop at
+        an init's FIRST success -- later retries of that init are not run and
+        exactly one successful traj per solved init enters the data (default
+        False = SOE pattern: all retries run, every success kept). pass@k is
+        unaffected (it is defined off the first-success try either way).
+
         Returns ``{"metrics": {...},
                    "trajs":     [successful EXPLORATION trajs, with obs],  # DP
                    "all_trajs": [every traj of the round, with obs]}``.     # dyn
@@ -289,7 +296,8 @@ class RolloutPipeline:
                 dp_ckpt, vib_ckpt=vib_ckpt, on_progress=on_progress,
                 try_times=int(explore_try_times), eval_only=eval_only,
                 rescue_seed=rescue_seed, scene_slice=scene_slice,
-                traj_sink=traj_sink)
+                traj_sink=traj_sink,
+                stop_on_first_success=stop_on_first_success)
         if scene_slice is not None:
             raise ValueError(
                 "scene_slice is only implemented for explore_mode='rescue' "
@@ -304,7 +312,8 @@ class RolloutPipeline:
                 explore_seed=int(explore_seed) if explore_seed is not None else 0,
                 n_explore=int(n_explore) if n_explore is not None else 500,
                 explore_try_times=int(explore_try_times),
-                eval_only=eval_only, traj_sink=traj_sink)
+                eval_only=eval_only, traj_sink=traj_sink,
+                stop_on_first_success=stop_on_first_success)
         horizon = int(self.cfg.eval.horizon)
         try_times = int(getattr(self.cfg.eval, "try_times", 5))
         n_init = int(getattr(self.cfg.eval, "n_init_states", 100))
@@ -402,7 +411,8 @@ class RolloutPipeline:
                    explore_seed: int = 1042, n_explore: int = 500,
                    explore_try_times: int = 1,
                    eval_only: bool = False,
-                   traj_sink: Optional[Callable[[dict, int, int], None]] = None
+                   traj_sink: Optional[Callable[[dict, int, int], None]] = None,
+                   stop_on_first_success: bool = False
                    ) -> dict:
         """experiment2 split protocol (user 2026-08-17).
 
@@ -479,6 +489,7 @@ class RolloutPipeline:
             guided=self.guided,
             on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
             traj_sink=traj_sink,
+            stop_on_first_success=stop_on_first_success,
         )
         trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
         all_trajs: List[dict] = [t for e in expl for t in e.get("all_trajs", [])]
@@ -494,6 +505,7 @@ class RolloutPipeline:
             "explore_seed": explore_seed,
             "n_explore": n_explore,
             "explore_try_times": explore_try_times,
+            "stop_on_first_success": bool(stop_on_first_success),
             "explore_solved": explore_solved,
             "explore_total": n_explore,
             "avg_jerk": _jerk_all_explore_trajs(expl),
@@ -508,7 +520,8 @@ class RolloutPipeline:
                     try_times: int = 5, eval_only: bool = False,
                     rescue_seed: Optional[int] = None,
                     scene_slice: Optional[tuple] = None,
-                    traj_sink: Optional[Callable[[dict, int, int], None]] = None
+                    traj_sink: Optional[Callable[[dict, int, int], None]] = None,
+                    stop_on_first_success: bool = False
                     ) -> dict:
         """SOE rescue protocol (user 2026-08-23) -- explore == eval scenes.
 
@@ -518,7 +531,9 @@ class RolloutPipeline:
         explore: retry ONLY the failed eval inits, ``try_times`` each
                  (default 5), from the SAME initial states, guided or plain
                  per ``self.guided`` (SOE run.py:121-149 semantics).
-                 DP data  = every SUCCESSFUL retry (``trajs``).
+                 DP data  = every SUCCESSFUL retry (``trajs``); with
+                 ``stop_on_first_success`` (user 2026-09-23): only the FIRST
+                 successful retry -- the init's remaining retries are not run.
                  dyn data = per failed init: its successful retries if any,
                  else its FIRST retry (``all_trajs``) -- user rule: scenes
                  solved by exploration contribute their successes, all-failed
@@ -667,6 +682,7 @@ class RolloutPipeline:
             only_failed_of=first_results, guided=self.guided,
             on_progress=expl_cb, wandb_run=None, log_every=self.log_every,
             traj_sink=traj_sink,
+            stop_on_first_success=stop_on_first_success,
         )
         trajs: List[dict] = [t for e in expl for t in e["successful_trajs"]]
         all_trajs: List[dict] = []
@@ -703,6 +719,7 @@ class RolloutPipeline:
             "explore_solved": rescued,
             "explore_total": n_failed,
             "explore_try_times": try_times,
+            "stop_on_first_success": bool(stop_on_first_success),
             "rescue_seed": rescue_seed,
             "collected_trajs": len(trajs),
             "n_all_trajs": len(all_trajs),

@@ -540,16 +540,22 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                              guided: bool = True,
                              on_progress: Optional[Callable[[dict], None]] = None,
                              wandb_run=None, log_every: int = 10,
-                             traj_sink: Optional[Callable[[dict, int, int], None]] = None
+                             traj_sink: Optional[Callable[[dict, int, int], None]] = None,
+                             stop_on_first_success: bool = False
                              ) -> List[dict]:
     """Vectorized exploration: up to ``try_times`` tries per FAILED init state.
 
     Returns ``[{solved, n_tries, successful_trajs, all_trajs, baseline_solved}, ...]``
     in init-state order (same schema as :func:`rollout.evaluate_exploration``).
     Baseline-solved init states are skipped (passed through as solved in 0 tries)
-    unless ``only_failed_of`` is None. ALL ``try_times`` retries run (no early
-    stop) and EVERY successful rollout is kept (SOE pattern). ``record_obs=True``
-    so successful trajs feed the augmented-hdf5 write-back.
+    unless ``only_failed_of`` is None. Default (``stop_on_first_success=False``,
+    SOE pattern): ALL ``try_times`` retries run (no early stop) and EVERY
+    successful rollout is kept. ``stop_on_first_success=True`` (user 2026-09-23):
+    an init's FIRST success closes it -- its queued retries are purged (never
+    launch) and any of its retries already in flight finalize but are discarded
+    entirely (no sink, no data, no jerk), so exactly ONE successful traj per
+    solved init reaches the data. ``record_obs=True`` so successful trajs feed
+    the augmented-hdf5 write-back.
 
     ``traj_sink(traj, init_idx, try_idx)`` (2026-09-04 OOM fix, TrajSpool):
     when set, every FINALIZED trajectory is handed to the sink (in the raw,
@@ -594,8 +600,13 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
     done_tries: dict = {}
 
     def on_done(slot: _VecSlot):
-        nonlocal jerk_sum, jerk_n
+        nonlocal jerk_sum, jerk_n, _hb_total
         _init_state, init_idx, try_idx = slot.job
+        if stop_on_first_success and init_idx in first_success:
+            # init already closed by its FIRST success: this in-flight
+            # straggler (any try, success or failure) is discarded
+            # entirely -- no sink, no data, no jerk accounting.
+            return
         if traj_sink is not None:
             traj_sink(slot.traj, init_idx, try_idx)   # spool converts NOW
             stored = _lightweight_traj(slot.traj)
@@ -618,23 +629,34 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
                 first_success[init_idx] = try_idx + 1     # 1-based first-success try
             entry["solved"] = True
             entry["successful_trajs"].append(stored)     # keep ALL (SOE-style)
+            if stop_on_first_success:
+                # first success closes the init (user 2026-09-23): purge its
+                # still-queued retries so they never launch. Mutate the deque
+                # IN PLACE -- the runner holds this same object -- and keep the
+                # heartbeat denominator in sync.
+                for qi in range(len(job_queue) - 1, -1, -1):
+                    if job_queue[qi][1] == init_idx:
+                        del job_queue[qi]
+                        _hb_total -= 1
 
     def progress_cb(tick: int):
         nonlocal _hb_n
         # tries done = completed episodes; collected = successful ones.
         done = runner.completed
         collected = runner.successes
-        # init states fully done = all their try_times tries completed.
+        # init states fully done = all their try_times tries completed, or
+        # (stop mode) closed by their first success (retries purged/dropped).
         tries_per_init = int(try_times)
         init_done = 0
-        init_done_failed = 0          # failed inits whose try_times tries all ran
+        init_done_failed = 0          # failed inits whose retries are all done
         solved_failed = 0             # failed inits solved by exploration
         solved_fini = 0               # solved AND drained: live pass@10 numerator
         for i in range(n):
             if results[i]["baseline_solved"]:
                 init_done += 1
                 continue
-            fini_i = len(results[i]["all_trajs"]) >= tries_per_init
+            fini_i = (len(results[i]["all_trajs"]) >= tries_per_init
+                      or (stop_on_first_success and results[i]["solved"]))
             if fini_i:
                 init_done += 1
                 init_done_failed += 1
@@ -878,6 +900,35 @@ def _smoke_vec():
     print(f"[2] exploration vec: solved={[r['solved'] for r in expl_vec]} "
           f"collected={n_collected}")
     print(f"[2] exploration vec schema + guided batched z OK")
+
+    # ---- check 2b: stop_on_first_success invariants --------------------- #
+    guided_dp3 = MockGuidedDP()
+    expl_stop = evaluate_exploration_vec(
+        guided_dp3, lambda: MockEnv(seed=0), init_states, horizon=HORIZON,
+        try_times=3, n_envs=N_ENVS, n_action_steps=N_ACTION_STEPS, device=device,
+        only_failed_of=base_vec, stop_on_first_success=True,
+    )
+    for r in expl_stop:
+        if r["baseline_solved"]:
+            continue
+        if r["solved"]:
+            assert len(r["successful_trajs"]) == 1, \
+                "stop mode: exactly ONE successful traj per solved init"
+            assert r["n_tries"] <= 3, "stop mode: n_tries bounded by try_times"
+            assert (len(r["all_trajs"]) <= 3
+                    and sum(1 for t in r["all_trajs"]
+                            if t["success"]) == 1), \
+                "stop mode: no post-success straggler kept in all_trajs"
+        else:
+            assert len(r["all_trajs"]) == 3, \
+                "stop mode: all-failed init still runs all try_times retries"
+            assert r["first_traj"] is not None, "stop mode: first_traj kept"
+    n_stop = sum(len(r["successful_trajs"]) for r in expl_stop)
+    n_stop_solved = sum(1 for r in expl_stop if r["solved"]
+                        and not r["baseline_solved"])
+    assert n_stop == n_stop_solved, "stop mode: collected == solved count"
+    print(f"[2b] stop_on_first_success: solved={n_stop_solved} "
+          f"collected={n_stop} (== solved) OK")
 
     # ---- check 3: vec vs sequential exploration equality ---------------- #
     guided_dp2 = MockGuidedDP()
