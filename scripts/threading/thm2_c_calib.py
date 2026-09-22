@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """thm2_c_calib.py -- C-anchored kappa calibration (seed-233 round-1 ckpt).
 
-User-specified flow (2026-09-22), opposite direction to the R-anchored eta:
-  C_mean := step-averaged fraction of rows whose UNCAPTED KL >= kappa
-            (same forward pass as the R_mean probe; "row loss >= kappa").
+User-specified flow (2026-09-22/23), opposite direction to the R-anchored eta.
+C definition v2 (user 2026-09-23): C_mean := step-averaged MEAN UNCAPPED KL
+across rows -- i.e. the mean over all (guided step x row) of
+KL(q(z|s,a) || q(z|s,a^0)), the "跨步均值 KL". (v1 was the row cap-hit
+fraction, which measured κ-invariant on this ckpt and could not converge.)
+
   C_target is measured ONCE on the BASE ckpt (DP-base + dyn-base) at its own
-  calibrated dose eta_base and kappa=2.5 -- the user's rule "use base ckpt @
-  kappa=2.5 to compute C once, use it as target".
+  calibrated dose eta_base and kappa=2.5.
 
   (2a) probe (eta_i, kappa_{i-1}) -> C_mean_i;
   (2b) kappa_i' = kappa_{i-1} * C_mean_i / C_target;
@@ -79,8 +81,10 @@ def main():
         for k in list(view_names) + list(proprio_keys)}
 
     def measure_c(dp_ckpt, vib_ckpt, eta, kappa):
-        """One guided denoise on the frozen batch -> C_mean (row cap-hit
-        fraction). Same x_T draw every call (manual_seed(0))."""
+        """One guided denoise on the frozen batch -> C_mean (= mean over all
+        (step,row) of the UNCAPPED KL; the guidance cap itself still bites at
+        `kappa` -- it shapes the trajectory the KL is measured on). Same x_T
+        draw every call (manual_seed(0))."""
         cfg = load_cfg(args.eval_config)
         cfg.vib.ckpt_path = vib_ckpt
         cfg.vib.base_dp_ckpt = dp_ckpt
@@ -106,7 +110,7 @@ def main():
         def kb(trajectory, x0_hat, current_obs=None):
             kl, g = orig_kb(trajectory, x0_hat, current_obs)
             with torch.no_grad():
-                recs.append((kl.detach() >= kappa).float().mean().item())
+                recs.append(float(kl.detach().mean()))
             return kl, g
 
         planner._kl_backward = kb
@@ -139,7 +143,13 @@ def main():
             print(f"[C-calib] max-repeat reached, last kappa={kappa:.6f} "
                   f"(C_mean={C:.6f})")
             break
-        kappa = kappa * C / C_target
+        # ratio INVERTED (user-confirmed 2026-09-23): C (mean KL) is
+        # INCREASING in kappa, so "C below target = cap too tight = ENLARGE
+        # kappa" -> kappa' = kappa * C_target/C_mean. The literal v1 ratio
+        # kappa*C_mean/C_target was designed for the (decreasing) hit-rate
+        # metric and diverges for this one (2.5 -> 0.845 -> 0.110, C 3.35
+        # -> 1.29 -> 0.25, empirically confirmed).
+        kappa = kappa * C_target / C
         print(f"[C-calib]   -> kappa' = {kappa:.6f}")
 
     out = {
@@ -153,8 +163,8 @@ def main():
             (1 - args.band) * C_target <= hist[-1]["C_mean"]
             <= (1 + args.band) * C_target),
         "history": hist,
-        "rule": ("C_mean = step-avg frac rows with KL>=kappa; "
-                 "kappa' = kappa * C_mean/C_target; "
+        "rule": ("C_mean = mean over (step,row) of UNCAPPED KL (跨步均值KL); "
+                 "kappa' = kappa * C_target/C_mean (inverted); "
                  "C_target = base C @ kappa0"),
     }
     print(json.dumps(out, indent=1))
