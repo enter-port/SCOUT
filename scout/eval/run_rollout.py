@@ -880,6 +880,8 @@ def main():
                     summary["explore_try_times"] = metrics["explore_try_times"]
                     if args.rescue_seed is not None:
                         summary["rescue_seed"] = args.rescue_seed
+                    summary["stop_on_first_success"] = bool(
+                        metrics.get("stop_on_first_success", False))
                     # per-scene rescue record -- pooled pass@10 across arms and
                     # split search need scene identity; fingerprints from hdf5
                     # are the fallback, this is the primary (2026-08-31 gap:
