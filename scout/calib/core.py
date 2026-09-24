@@ -88,10 +88,7 @@ def load_model_pair(cfg, dp_ckpt, vib_ckpt):
     vib = make_scout_vib_factory(cfg, device)(str(vib_ckpt))
     vib.eval()
     views, proprio = list(cfg.eval.view_names), list(cfg.eval.proprio_keys)
-    adapt = make_obs_adapter(views, proprio)
-
-    def obs_adapter(values):
-        return adapt({key: value * 255.0 if key in views else value for key, value in values.items()})
+    obs_adapter = make_obs_adapter(views, proprio)
 
     return dp, vib, make_action_bridge(dp), obs_adapter
 

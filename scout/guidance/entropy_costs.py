@@ -55,11 +55,7 @@ from scout.guidance.planner import ScoutPlanner
 
 def _enc_forward(planner: ScoutPlanner, x0_hat: torch.Tensor) -> torch.Tensor:
     """bridge(x̂₀) -> flattened chunk -> raw action vector fed to the encoder."""
-    per_step = x0_hat.shape[-1]
-    chunk_dim = int(getattr(planner.scout_vib.vib_enc, "action_dim", per_step))
-    n_steps = chunk_dim // per_step
-    a = planner.bridge(x0_hat[:, :n_steps])
-    return a.reshape(x0_hat.shape[0], chunk_dim)
+    return planner.encode_action_chunk(x0_hat)
 
 
 def _kl_rows(mu: torch.Tensor, logvar: torch.Tensor,
@@ -542,6 +538,11 @@ class ComboCostPlanner(ScoutPlanner):
         self.att_weight = float(att_weight)
 
     # lifecycle calls fan out to the mechanism that consumes them
+    def set_action_window(self, start: int, steps: Optional[int]):
+        super().set_action_window(start, steps)
+        self._nov.set_action_window(start, steps)
+        self._att.set_action_window(start, steps)
+
     def set_row_context(self, init_ids: Sequence):
         self._nov.set_row_context(init_ids)
 

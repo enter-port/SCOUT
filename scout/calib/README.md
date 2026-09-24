@@ -33,7 +33,7 @@ KL 中位数也仍是有任务适用范围的经验方法。实证记录见
 
 ## 测量定义
 
-- **core batch**：demo 名字按字典序排列，步长 `max(1, 总帧数 // (B×4))`，取各 demo 的 `t=1,...,n-2`，直到 B 个观测。每个观测堆叠 `(t-1,t)` 两帧；默认 `B=128`。图像转 CHW 并除以 255，进入 VIB adapter 时还原尺度。
+- **core batch**：demo 名字按字典序排列，步长 `max(1, 总帧数 // (B×4))`，取各 demo 的 `t=1,...,n-2`，直到 B 个观测。每个观测堆叠 `(t-1,t)` 两帧；默认 `B=128`。图像转 CHW 并除以 255，以同一 `[0,1]` 尺度直接进入 VIB adapter，与 rollout 一致。
 - **R**：从 guidance 开始，逐步计算 `η × noise_scale × mean(abs(capped_gradient))`，再对步取均值，除以整个 core 的 `mean(abs(raw abs_actions))`。分母不是 noisy action；`R_noisy_mean` 只是额外诊断字段。默认目标区间 `[0.009,0.011]`。
 - **C**：guided 轨迹上所有步、所有样本的 **uncapped KL 均值**。旧 C 保留“每步先 Torch 均值，再对步取 NumPy 均值”的浮点归约顺序。`base_kappa` 固定 base 参考点，`kappa0` 只是当前轮起点。
 - 所有方法使用 `KLCostPlanner`、`eta_dimless=False`；每次 R/C 测量前 `torch.manual_seed(0)`，保持噪声配对。

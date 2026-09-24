@@ -8,14 +8,14 @@ reparam-sampled L2 (the earlier form) and NOT the mean-only gap:
 
     cost(x0_hat, s_bar_t, z) = mean_B [ -log q_θ(z | s̄_t, a_chunk) ]
                              = mean_B ½ Σ_i [ (z_i - μ_i)² / σ_i² + log σ_i² ]
-    a_chunk = bridge(x0_hat[:, :n_steps]).flatten()
+    a_chunk = bridge(x0_hat[:, start:start+n_steps]).flatten()
     (the ½·D·log 2π constant is dropped: no gradient, irrelevant for guidance)
 
 where ``x0_hat`` is the base DP's one-step clean-action estimate (the
 ``pred_original_sample`` of the diffusion scheduler step), ``s_bar_t = E_s(S_t)``
 is the encoded current observation (held fixed across the chunk), and ``z`` is
 the sampled skill latent (held fixed across the chunk). ``a_chunk`` is the
-flattened first ``n_steps`` per-step actions -- the SAME flattened fs-step chunk
+flattened executed ``n_steps`` per-step actions -- the SAME flattened fs-step chunk
 the VIB encoder was trained on (``train_vib._slice_transition``), so inference
 loads the trained weights (the encoder is a chunk-encoder, NOT per-step; building
 it per-step mismatches the saved Linear, 1168 vs 1098). The guidance gradient
@@ -46,6 +46,28 @@ import torch
 from scout.normalizer import ActionNormalizerBridge
 
 
+def encode_action_chunk(x0_hat, vib_enc, bridge, action_start=0, action_steps=None):
+    """Unnormalize and flatten the executed window for the trained VIB encoder.
+
+    Standalone chunks start at zero; the policy supplies n_obs_steps - 1 for
+    full DP horizons. Reject mismatched lengths instead of scoring a different
+    transition from the one that will execute.
+    """
+    if x0_hat.dim() != 3:
+        raise ValueError(f"x0_hat must be (B, T, per_step); got {tuple(x0_hat.shape)}")
+    batch, horizon, per_step = x0_hat.shape
+    chunk_dim = int(getattr(vib_enc, "action_dim", per_step))
+    if per_step < 1 or chunk_dim < 1 or chunk_dim % per_step:
+        raise ValueError(f"invalid VIB chunk dimension {chunk_dim} for per-step dimension {per_step}")
+    n_steps = chunk_dim // per_step
+    if action_steps is not None and n_steps != action_steps:
+        raise ValueError(f"VIB chunk length {n_steps} differs from DP execution length {action_steps}")
+    end = action_start + n_steps
+    if action_start < 0 or end > horizon:
+        raise ValueError(f"action window [{action_start}:{end}] exceeds horizon {horizon}")
+    return bridge(x0_hat[:, action_start:end]).reshape(batch, chunk_dim)
+
+
 def scout_cost(
     x0_hat: torch.Tensor,
     s_bar_t: torch.Tensor,
@@ -53,11 +75,13 @@ def scout_cost(
     vib_enc,
     bridge: ActionNormalizerBridge,
     reduction: str = "mean",
+    action_start: int = 0,
+    action_steps: int | None = None,
 ) -> torch.Tensor:
     """``-log q_θ(z | s_bar_t, a_chunk)`` reduced over batch -- scalar,
     differentiable in ``x0_hat`` (Gaussian NLL, closed form, no ε sampling).
 
-    ``a_chunk`` is the **flattened first ``n_steps`` per-step actions** of the
+    ``a_chunk`` is the **flattened executed ``n_steps`` per-step actions** of the
     DP's clean-action estimate ``x0_hat``, where ``n_steps =
     vib_enc.action_dim // per_step``. This matches ``train_vib._slice_transition``
     (the VIB encoder was trained on the flattened fs-step action chunk, NOT
@@ -78,6 +102,8 @@ def scout_cost(
                   (μ and σ) enters the NLL; neither is sampled here.
         bridge  : :class:`scout.normalizer.ActionNormalizerBridge` mapping
                   ``x0_hat`` (per-step) into the VIB action space.
+        action_start : first executed position in the full DP horizon.
+        action_steps : expected execution length; must match VIB training.
         reduction : "mean" (default; historical semantics -- monitoring metrics,
                   E2 consistency, diagnostics) or "sum" (the guided-injection
                   path: block-diagonal Jacobian => grad of the sum gives every
@@ -93,28 +119,7 @@ def scout_cost(
         preserves gradient; both the 1/σ²-weighted μ-channel and the σ-channel
         conduct it).
     """
-    if x0_hat.dim() != 3:
-        raise ValueError(
-            f"x0_hat must be (B, T, per_step); got {tuple(x0_hat.shape)}"
-        )
-    B, T, per_step = x0_hat.shape
-    chunk_dim = int(getattr(vib_enc, "action_dim", per_step))
-    if chunk_dim % per_step != 0:
-        raise ValueError(
-            f"vib_enc.action_dim={chunk_dim} not divisible by the per-step "
-            f"action dim {per_step} (encoder trained on a different chunking)."
-        )
-    n_steps = chunk_dim // per_step
-    if n_steps > T:
-        raise ValueError(
-            f"horizon T={T} shorter than the trained action chunk "
-            f"({chunk_dim} = {n_steps}x{per_step})."
-        )
-
-    # 1. bring the chunk into the VIB action space (unnormalize per-step), then
-    #    flatten to the exact vector the encoder was trained on.
-    a = bridge(x0_hat[:, :n_steps])                 # (B, n_steps, per_step)
-    a_flat = a.reshape(B, chunk_dim)                # (B, chunk_dim)
+    a_flat = encode_action_chunk(x0_hat, vib_enc, bridge, action_start, action_steps)
 
     # 2. Gaussian NLL of the fixed guidance target z under the encoder's
     #    q_θ(z|s̄_t, a_chunk) = N(μ, diag σ²):  ½ Σ_i [(z_i−μ_i)²·e^{−logvar_i}

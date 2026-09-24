@@ -83,7 +83,8 @@ def build_expert_z_bank(
     (s_bar_t, flattened fs-step chunk) pair VIB training used
     (``train_vib._slice_transition``), with obs preprocessed exactly like
     rollout-time inference -- :func:`scout.eval.rollout.make_obs_adapter`
-    (/255 + center crop on CHW, proprio concat in ``proprio_keys`` order) --
+    (explicit /255 for raw HDF5 images, then the shared center crop on CHW
+    and proprio concat in ``proprio_keys`` order) --
     so bank mu's live in the same space as the query mu's.
 
     Args:
@@ -109,6 +110,7 @@ def build_expert_z_bank(
     proprio_keys = list(proprio_keys)
     if aa_to_6d is None:
         aa_to_6d = _default_aa_to_6d
+    # HDF5 images below are raw uint8: explicitly scale them, unlike env obs.
     adapter = make_obs_adapter(view_names, proprio_keys,
                                img_scale=img_scale, crop_size=crop_size)
     vib_enc = scout_vib.vib_enc
@@ -212,14 +214,7 @@ class ScoutExpertPlanner(ScoutPlanner):
             raise ValueError(
                 f"x0_hat must be (B, T, per_step); got {tuple(x0_hat.shape)}")
         s_bar_t = self._resolve_s_bar_t(current_obs)
-        B, T, per_step = x0_hat.shape
-        chunk_dim = int(self.scout_vib.vib_enc.action_dim)
-        if chunk_dim % per_step != 0 or chunk_dim // per_step > T:
-            raise ValueError(
-                f"cannot slice a {chunk_dim}-dim chunk out of x0_hat "
-                f"{tuple(x0_hat.shape)}")
-        n_steps = chunk_dim // per_step
-        a_flat = self.bridge(x0_hat.detach()[:, :n_steps]).reshape(B, chunk_dim)
+        a_flat = self.encode_action_chunk(x0_hat.detach())
         mu_q, logvar_q = self.scout_vib.vib_enc(s_bar_t.detach(), a_flat)
         inv_var = torch.exp(-logvar_q)                       # (B, D)
 

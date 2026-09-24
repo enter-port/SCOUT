@@ -51,7 +51,7 @@ from scout.normalizer import ActionNormalizerBridge, UnnormalizeOnlyBridge
 def make_obs_adapter(
     view_names: Sequence[str],
     proprio_keys: Sequence[str],
-    img_scale: Optional[float] = 1.0 / 255.0,
+    img_scale: Optional[float] = 1.0,
     crop_size: Optional[int] = 76,
 ) -> Callable[[dict], dict]:
     """seam ①: LPB raw keyed ``obs_dict`` -> E_s format (scout_design.md §2).
@@ -64,10 +64,10 @@ def make_obs_adapter(
     LPB shape_meta; proprio keys are concatenated into a single ``(B,1,P)``.
 
     Preprocessing (must match VIB training inputs exactly):
-      - ``img_scale``: the env returns raw uint8-scale [0,255] images (robomimic
-        ``postprocess_visual_obs=False``), but E_s was trained on [0,1] images
-        (``RobomimicImageDynamicsModelDataset`` applies ``/255``) -- so divide
-        by 255 here.
+      - ``img_scale``: rollout and calibration provide float [0,1] images.
+        Robomimic's env factory uses ``postprocess_visual_obs=True`` and
+        already divides by 255. Keep that scale for E_s, matching training.
+        Callers reading raw uint8 HDF5 images must explicitly pass 1/255.
       - ``crop_size``: VIB training crops 84x84 -> 76x76 (random crop at train,
         center crop at val); inference uses the center crop to match the val /
         base-DP eval_fixed_crop transform. Applied only when the incoming

@@ -153,6 +153,13 @@ class ScoutPolicy(DiffusionUnetHybridImagePolicy):
                 )
             if self.guidance_start_timestep is None:
                 raise RuntimeError("guidance_start_timestep not set.")
+            # Full predictions include historical action positions. Match
+            # predict_action_dyn_guided's [To-1 : To-1+n_action_steps] slice.
+            # Defaults support standalone dummy samplers without a DP config.
+            self.scout_planner.set_action_window(
+                int(getattr(self, "n_obs_steps", 1)) - 1,
+                getattr(self, "n_action_steps", None),
+            )
 
         # expert mode (planner carrying a z-bank selects its own z* per chunk)
         # -- presence of the ``select_z`` hook is the mode flag.

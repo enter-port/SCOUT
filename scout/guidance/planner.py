@@ -41,7 +41,7 @@ from typing import Callable, Optional
 
 import torch
 
-from scout.guidance.cost import scout_cost
+from scout.guidance.cost import scout_cost, encode_action_chunk
 from scout.normalizer import ActionNormalizerBridge, IdentityBridge
 
 
@@ -92,6 +92,10 @@ class ScoutPlanner:
         self.bridge = bridge if bridge is not None else IdentityBridge()
         self.z = z
         self.obs_adapter = obs_adapter
+        # Standalone callers supply a chunk starting at the current state.
+        # ScoutPolicy sets the full-horizon execution window before denoising.
+        self.action_start = 0
+        self.action_steps = None
         # per-call caches (set by ScoutPolicy before the loop):
         self._cached_s_bar_t: Optional[torch.Tensor] = None
         self._cached_obs_id: Optional[int] = None
@@ -99,6 +103,17 @@ class ScoutPlanner:
     # ------------------------------------------------------------------ #
     # per-inference-call state (set by ScoutPolicy before the denoise loop)
     # ------------------------------------------------------------------ #
+    def set_action_window(self, start: int, steps: Optional[int]):
+        """Align the VIB action chunk with the policy's executed actions."""
+        if start < 0 or (steps is not None and steps < 1):
+            raise ValueError(f"invalid action window: start={start}, steps={steps}")
+        self.action_start = int(start)
+        self.action_steps = None if steps is None else int(steps)
+
+    def encode_action_chunk(self, x0_hat: torch.Tensor) -> torch.Tensor:
+        return encode_action_chunk(x0_hat, self.scout_vib.vib_enc, self.bridge,
+                                   self.action_start, self.action_steps)
+
     def set_z(self, z: Optional[torch.Tensor]):
         """Fix the skill latent for one inference call. ``(B, style_dim)`` or
         ``None`` (the policy samples fresh per call -- design §1)."""
@@ -184,6 +199,8 @@ class ScoutPlanner:
             vib_enc=self.scout_vib.vib_enc,
             bridge=self.bridge,
             reduction=reduction,
+            action_start=self.action_start,
+            action_steps=self.action_steps,
         )
 
     # ------------------------------------------------------------------ #

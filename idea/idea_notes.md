@@ -1,6 +1,6 @@
 # SCOUT 模型与训练流程笔记
 
-更新：2026-09-24。本文按当前 `scout/`、`scripts/atom/` 和标准链代码整理。
+更新：2026-09-25。本地输入契约修复分支；尚未进行修复版运行验证。本文按当前 `scout/`、`scripts/atom/` 和标准链代码整理。
 具体运行以 campaign 配置、生成的训练配置及 checkpoint 为准；历史计划见 [archive](archive/README.md)。
 默认预算示例来自 [threading 标准模板](../configs/threading/campaign.json)，不代表所有历史实验或任务的最优参数。
 
@@ -29,9 +29,14 @@ VIB 输入为转移 `(S_t, A[t:t+fs], S_{t+fs})`，`fs=dataset.frameskip`，常�
 反归一化，再送入 VIB。实际工厂使用 `make_action_bridge` / `UnnormalizeOnlyBridge`，
 不是假设两个模型的数值空间已经一致。
 
-需要区分两个索引：当前 `_enc_forward` 使用 `x0_hat[:, :fs]` 的前 fs 步；
-DP 最终执行的 chunk 按 `n_obs_steps - 1` 起始，常见配置是 `[1:9]`。
-两者当前不是同一个切片，不能写成已完成的执行窗口对齐。
+Policy 在 guided denoise 前将执行窗口传给 planner：起点为 `n_obs_steps - 1`，
+长度为 `n_action_steps`。所有 cost 与 anchor 共用该窗口，常见配置为 `[1:9]`；
+若 VIB 训练的 chunk 长度不匹配或窗口超出 horizon，则报错。
+旧实现的 `[0:8]` 实验属于修复前版本，不能与新实现混为同一条趋势。
+
+Rollout 和 core 标定均以 `[0,1]` CHW 图像进入 VIB adapter；不再对 env
+已归一化的图像重复除以 255，也不再在标定端乘 255 补偿。Expert bank 直接
+读取 uint8 HDF5，显式除以 255 后与它们共享中心 crop。修复版需重新标定 η、κ。
 
 实现：[train_vib.py](../scout/train_vib.py)、[robomimic_dset.py](../dyn_model/datasets/robomimic_dset.py)、
 [normalizer.py](../scout/normalizer.py)、[rollout.py](../scout/eval/rollout.py)、
