@@ -24,8 +24,16 @@ export ETRIES=${ETRIES:-5}   # pass@5 campaign (threading convention)
 export ETA0=${ETA0:-1.0}     # rcalib eta anchor for round 1
 export ATT_CAP=${ATT_CAP:-2.5}   # kappa anchor (carried over unchanged)
 export BETA=${BETA:-1.0e-5}  # VIB beta for every dyn training
-export BASE_ETA=${BASE_ETA:?set BASE_ETA (per-seed p2 rcalib anchor for kappa v2)}
-ROOT=/root/workspace/baojiachun/scout
+export CALIB_MODE=${CALIB_MODE:-rc}
+case "$CALIB_MODE" in rc|pr) ;; *) echo "CALIB_MODE must be rc or pr"; exit 1 ;; esac
+export CALIB_P=${CALIB_P:-6} CALIB_R=${CALIB_R:-0.01}
+export CALIB_BAND=${CALIB_BAND:-0.1} CALIB_KAPPA0=${CALIB_KAPPA0:-2.5}
+if [ "$ARM" = ATY ] && [ "$CALIB_MODE" = rc ]; then
+  export BASE_ETA=${BASE_ETA:?set BASE_ETA for CALIB_MODE=rc}
+else
+  export BASE_ETA=${BASE_ETA:-}
+fi
+ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 DATA_ROOT=${DATA_ROOT:-$ROOT/data/2026_9_23_threading_thm3/THREADING-THM3-s$SEED}
 WPROJ=${WPROJ:-THREADING-THM3-s$SEED}
 CONSOLE=$DATA_ROOT/chain_${ARM}.console.log

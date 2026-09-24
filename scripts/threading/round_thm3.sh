@@ -16,7 +16,8 @@
 #     (user order 2026-09-23 "如果重标定更好，则重启...用重标定 kappa"): C =
 #     step-averaged uncapped KL, kappa' = kappa * C_target / C_mean (inverted
 #     ratio, commit a6d004d method), C_target measured on the BASE pair at
-#     BASE_ETA (the base's own rcalib eta from the p2 campaign), kappa0 =
+#     BASE_ETA (the base's own rcalib eta from the p2 campaign) and fixed
+#     base_kappa=2.5. The round's initial kappa0 =
 #     previous round's kappa (kcal json -> rcalib json -> ATT_CAP fallback).
 #     Calib jsons: calib_rcalib_r$NUM.json (eta) + calib_kcal_r$NUM.json
 #     (kappa) at $RDIR level. kappa failure = round FATAL (same as eta).
@@ -38,7 +39,12 @@
 #         DP_EPOCHS_SOE=600 DYN_EPOCHS_SOE=300
 #         SHARD_P=8 SHARD_ENVS=25 EVALNENV=25 ETRIES=5 FLUSH_EVERY=100
 # Layout: $DATA_ROOT/threading/{rollout/,train/DP/,train/dyn/}.
+# CALIB_MODE=rc (legacy R then C) or pr (joint eta*kappa and R).
+# PR is an explicit experimental option; base evidence: can/threading/coffee.
+# CALIB_P=6 CALIB_R=0.01 CALIB_BAND=0.1 CALIB_KAPPA0=2.5.
 set -u
+CALIB_MODE=${CALIB_MODE:-rc}
+case "$CALIB_MODE" in rc|pr) ;; *) echo "CALIB_MODE must be rc or pr"; exit 1 ;; esac
 
 TASK=${1:?usage: round_thm3.sh <task> <BASE|ATY|ORBIT|DP> <num> [mode]}
 A=${2:?usage: round_thm3.sh <task> <BASE|ATY|ORBIT|DP> <num> [mode]}
@@ -241,7 +247,8 @@ WNAME=${WNAME_BASE}-round${NUM}
 
 for f in configs/eval_${TASK}_entropy.yaml configs/vib_${TASK}_exp1.yaml \
          configs/base_dp_${TASK}_image.yaml scripts/infra/shard_rollout.sh \
-         scripts/coffee/cfk_rcalib.py; do
+         scout/calib/eta_r.py scout/calib/kappa_c.py scout/calib/core.py \
+         scout/calib/joint_pr.py scout/calib/search.py scripts/calibration/calibrate_pr.sh; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
 [ -n "$(newest_ckpt "$TDP/DP-base")" ] || { echo "no DP-base ckpt (run: round_thm3.sh $TASK BASE 0)"; exit 1; }
@@ -281,7 +288,7 @@ fi
 if [ "$A" = ATY ]; then
   ETA_PREV=$ETA0
   KAP_PREV=$ATT_CAP
-  if [ "$NUM" -gt 1 ]; then
+  if [ "$CALIB_MODE" = rc ] && [ "$NUM" -gt 1 ]; then
     PREVJ=$(dirname "$RDIR")/ATY-exp$((NUM-1))/calib_rcalib_r$((NUM-1)).json
     PREVK=$(dirname "$RDIR")/ATY-exp$((NUM-1))/calib_kcal_r$((NUM-1)).json
     if [ -f "$PREVJ" ]; then
@@ -297,11 +304,14 @@ if [ "$A" = ATY ]; then
       log "[calib-rcalib] round=$NUM WARN no prev calib json ($PREVJ) -- falling back to ETA0/ATT_CAP"
     fi
   fi
-  if [ "${DRY_RUN:-0}" = 1 ]; then
+  if [ "$CALIB_MODE" = pr ]; then
+    source scripts/calibration/calibrate_pr.sh || exit 1
+    scout_calibrate_pr || exit 1
+  elif [ "${DRY_RUN:-0}" = 1 ]; then
     log "[calib-rcalib] DRY_RUN: planned rcalib (dp=$DPCKPT vib=$VIBCKPT eta_prev=$ETA_PREV kappa_prev=$KAP_PREV); ATY_SCALE/ATT_CAP stay $ATY_SCALE/$ATT_CAP"
   else
     CALIBJ=$RDIR/calib_rcalib_r${NUM}.json
-    env CUDA_VISIBLE_DEVICES=$GPU $PY scripts/coffee/cfk_rcalib.py \
+    env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.calib.eta_r \
       --eval-config configs/eval_${TASK}_entropy.yaml \
       --dp-ckpt "$DPCKPT" \
       --vib-ckpt "$VIBCKPT" \
@@ -319,11 +329,12 @@ if [ "$A" = ATY ]; then
     # AFTER the eta rcalib so C is measured at the eta this round carries.
     # C = step-averaged uncapped KL on the frozen core batch; kappa' =
     # kappa * C_target/C_mean (inverted ratio); C_target on the BASE pair at
-    # BASE_ETA (per-seed p2 anchor); kappa0 = kappa_prev. Non-arrival within
+    # BASE_ETA (per-seed p2 anchor) and base_kappa=2.5; the round's initial
+    # kappa0 = kappa_prev. Non-arrival within
     # max-repeat takes the LAST value (rcalib convention).
     [ -n "${BASE_ETA:-}" ] || { log "[calib-kcal] FATAL BASE_ETA not set (per-seed p2 anchor)"; exit 1; }
     KCALJ=$RDIR/calib_kcal_r${NUM}.json
-    env CUDA_VISIBLE_DEVICES=$GPU $PY scripts/threading/thm2_c_calib.py \
+    env CUDA_VISIBLE_DEVICES=$GPU $PY -m scout.calib.kappa_c \
       --eval-config configs/eval_${TASK}_entropy.yaml \
       --core-hdf5 "$CORE" \
       --base-dp-ckpt "$(newest_ckpt "$TDP/DP-base")" \
@@ -331,7 +342,7 @@ if [ "$A" = ATY ]; then
       --base-eta "$BASE_ETA" \
       --round-dp-ckpt "$DPCKPT" --round-vib-ckpt "$VIBCKPT" \
       --round-eta "$ATY_SCALE" \
-      --kappa0 "$KAP_PREV" \
+      --base-kappa 2.5 --kappa0 "$KAP_PREV" \
       --out "$KCALJ" > "$RDIR/kcal.stdout" 2>&1
     RC=$?
     [ $RC -ne 0 ] && { log "[calib-kcal] FATAL rc=$RC -- see $RDIR/kcal.stdout"; exit 1; }
