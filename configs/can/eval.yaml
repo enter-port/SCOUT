@@ -8,8 +8,8 @@ seed: 42
 # template source and follows --core-hdf5 (run_rollout.py:197).
 base_dp:
   initial_ckpt_path: /root/workspace/baojiachun/scout/data/experiment2/can/train/DP/DP-base/checkpoints/580.ckpt
-  config_name: base_dp_can_image
-  config_dir: configs
+  config_name: base_dp
+  config_dir: configs/can
 vib:
   ckpt_path: /root/workspace/baojiachun/scout/data/experiment2/can/train/dyn/dyn-base/scout_vib.ckpt
   base_dp_ckpt: /root/workspace/baojiachun/scout/data/experiment2/can/train/DP/DP-base/checkpoints/580.ckpt

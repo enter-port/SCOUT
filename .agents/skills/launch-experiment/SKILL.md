@@ -30,6 +30,10 @@ description: 启动、记录、监控并收账一条 SCOUT 实验链。用户提
 
 用一句话复述 `TASK / 分类 / seed / 轮数 / 臂 / guidance / 剂量 / pass@K / workers / batch / GPU / base`；有歧义就停下询问。`pass_at_5` 是历史键名，K 以 `explore_try_times` 为准。
 
+使用问答功能时一次只发一个问题，等该题的实际回复；不要把同一请求里的第二题当成用户已看见或已确认。DP 与 dyn 分别确认 base/重训 epoch、batch、worker、优化器（lr、betas、weight decay）、调度器和 warmup、checkpoint、验证比例，以及 EMA/AMP 或 beta/free_bits/failure_weight 等实际生效值；只确认 batch 不等于确认整套训练超参。
+
+服务器代码更新前先核对 `git status`、上游改动和本地改动的重叠路径。若实验归档使用目录软链接，整树 `git stash` 可能因已跟踪文件位于软链接下失败；只暂存真正冲突的已跟踪路径，保留未跟踪登记数据，`pull --ff-only` 后恢复并核对冲突与工作树。在线 W&B 用正式训练的同一 Python 环境验证认证；不得把“包已安装”当成“已登录”。引导用户在服务器本地登录，不索取或回显 API key。此服务器没有可用的 SFTP subsystem，本地上传使用 `scp -O -P 1022`，上传后检查文件内容和 Linux 行尾。
+
 先只读核实：
 
 ```bash
@@ -71,9 +75,13 @@ grep -nE 'DATA_ROOT|WPROJ|ETRIES|SHARD_P|guidance|explore-try|batch|eval-pk' scr
 
 逐项核对新 ID/W&B project、guidance、剂量、ETRIES、workers、`--n-envs`、checkpoint、batch 和末轮 eval-pk。ETRIES=1 只能称 pass@1。启动前做一次只读 review：变体 diff、base 完整性、链幂等、round0 门禁、资源隔离、引号和 set -u；P0/P1 先修，P2 写笔记。
 
+对 Hydra DP 入口，dry-run 只打印命令，不会解析配置。启动前用同一解释器执行实际 DP 命令的 `--cfg job` 预检，确认顶层含 `task`，且 `task.dataset_path`、seed、训练预算、W&B 等覆盖生效。`configs/<task>/base_dp.yaml` 要作为 `--config-path configs/<task> --config-name base_dp` 加载，不能作为 `--config-path configs --config-name <task>/base_dp` 加载成嵌套配置。
+
 ## 4. 启动和同步
 
 用户确认参数后才启动 launch wrapper。确认 round0 成功、tmux 出现、round1 写入 START；然后将状态设为 `running`，笔记写启动时间、session、脚本、GPU、base 和实际参数。启动失败保留源文件，状态设为 `failed`，不要删除记录重来。
+
+失败启动沿用同一实验 ID 重试时，旧的 `failed` 状态文件可能仍在。启动 supervisor 前先给本次 attempt 写入新的 pending/running 标记，并核对新 base 进程的状态与 epoch 日志；supervisor 只读取本次 attempt 的状态。旧 attempt 和原始错误保留，不据旧状态判定新启动失败。
 
 每轮 TOTAL 后同步：
 

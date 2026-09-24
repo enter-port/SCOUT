@@ -8,8 +8,8 @@ seed: 42
 # --core-hdf5 (run_rollout.py:197).
 base_dp:
   initial_ckpt_path: /root/workspace/baojiachun/scout/data/2026_8_14/experiment1/square/train/DP/DP-base/checkpoints/580.ckpt
-  config_name: base_dp_square_image
-  config_dir: configs
+  config_name: base_dp
+  config_dir: configs/square
 vib:
   ckpt_path: /root/workspace/baojiachun/scout/data/2026_8_14/experiment3/square/train/dyn/dyn-SCOUT-exp4/20260819-201418/scout_vib.ckpt
   base_dp_ckpt: /root/workspace/baojiachun/scout/data/2026_8_14/experiment1/square/train/DP/DP-base/checkpoints/580.ckpt

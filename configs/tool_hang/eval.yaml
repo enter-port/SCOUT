@@ -9,8 +9,8 @@ seed: 42
 # --core-hdf5); dataset.path follows --core-hdf5.
 base_dp:
   initial_ckpt_path: /root/workspace/baojiachun/scout-orbit/data/2026_9_1_toolhang/TOOLHANG-s233/tool_hang/train/DP/DP-base/checkpoints/599.ckpt
-  config_name: base_dp_tool_hang_image
-  config_dir: configs
+  config_name: base_dp
+  config_dir: configs/tool_hang
 vib:
   ckpt_path: /root/workspace/baojiachun/scout-orbit/data/2026_9_1_toolhang/TOOLHANG-s233/tool_hang/train/dyn/dyn-base/20260901-000000/scout_vib.ckpt
   base_dp_ckpt: /root/workspace/baojiachun/scout-orbit/data/2026_9_1_toolhang/TOOLHANG-s233/tool_hang/train/DP/DP-base/checkpoints/599.ckpt

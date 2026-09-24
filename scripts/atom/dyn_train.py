@@ -25,9 +25,9 @@ def train(ctx, out, dp, trajectories=(), name="dyn-base", base=False, options=No
             config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         else:
             print(f"DRY_RUN: dyn config dataset={data} encoder={dp} options={opts} -> {config_path}")
-            ctx.module("scout.train_vib", ["--config", config_path], work / "train.log",
-                       extra_env=({"WANDB_RUN_ID": resume_run_id, "WANDB_RESUME": "must"}
-                                  if resume_run_id and ctx.wandb != "disabled" else None))
+        ctx.module("scout.train_vib", ["--config", config_path], work / "train.log",
+                   extra_env=({"WANDB_RUN_ID": resume_run_id, "WANDB_RESUME": "must"}
+                              if resume_run_id and ctx.wandb != "disabled" else None))
         ckpt = checkpoint(work, "*/scout_vib.ckpt", ctx.dry)
         return {"dyn": ckpt, "dataset": data, "artifacts": [ckpt, data]}
 

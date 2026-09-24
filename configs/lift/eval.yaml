@@ -15,8 +15,8 @@ base_dp:
   initial_ckpt_path: /root/workspace/baojiachun/scout/data/lift/train/DP/DP-base/checkpoints/580.ckpt          # E0 output: logs/<ts>/checkpoints/latest.ckpt
   # LPB training entry used by `default_retrain_fn` each round (round overrides
   # dataset_path / num_epochs / log_dir on top of this base config).
-  config_name: base_dp_lift_image
-  config_dir: configs
+  config_name: base_dp
+  config_dir: configs/lift
 
 vib:
   ckpt_path: /root/workspace/baojiachun/scout/data/lift/train/dyn/dyn-base/scout_vib.ckpt                  # train_vib.py run_root/beta_<best>/scout_vib.ckpt

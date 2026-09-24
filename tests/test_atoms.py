@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.atom import campaign
-from scripts.atom import calib, dp_train, eval_explore, grid_search
+from scripts.atom import calib, dp_train, dyn_train, eval_explore, grid_search
 from scripts.atom.common import Context, ROOT, dataset, write_json
 
 
@@ -26,6 +26,7 @@ class AtomTests(unittest.TestCase):
         self.assertTrue((ROOT / "train.py").is_file())
 
     def test_every_task_uses_the_four_file_standard_layout(self):
+        import yaml
         expected = {"can", "coffee", "coffee_prep", "lift", "square", "threading",
                     "tool_hang", "transport"}
         task_dirs = {p.name for p in (ROOT / "configs").iterdir() if p.is_dir()}
@@ -41,6 +42,11 @@ class AtomTests(unittest.TestCase):
             self.assertEqual(config["eval_config"], f"configs/{task}/eval.yaml")
             self.assertEqual(config["round_plan"][-1],
                              {"rounds": [6], "calib": {"mode": "none"}, "train": False})
+            eval_config = yaml.safe_load((directory / "eval.yaml").read_text(encoding="utf-8"))
+            base_dp = eval_config["base_dp"]
+            policy_config = ROOT / base_dp["config_dir"] / (base_dp["config_name"] + ".yaml")
+            self.assertEqual(policy_config, directory / "base_dp.yaml")
+            self.assertTrue(policy_config.is_file())
 
     def test_complete_dry_run_does_not_write(self):
         with tempfile.TemporaryDirectory() as d, redirect_stdout(io.StringIO()):
@@ -158,9 +164,36 @@ class AtomTests(unittest.TestCase):
             with patch.object(ctx, "run") as command:
                 dp_train.train(ctx, ctx.root / "dp", [])
             args = list(map(str, command.call_args.args[0]))
+            self.assertEqual(args[args.index("--config-path") + 1], "configs/can")
+            self.assertEqual(args[args.index("--config-name") + 1], "base_dp")
             self.assertIn("task.train_filter_key=scout_aug", args)
             self.assertIn("task.dataset.seed=233", args)
             self.assertIn("training.resume=False", args)
+
+    def test_dyn_real_run_launches_training_and_records_checkpoint(self):
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            ctx = Context(self.config(root))
+            dp = str(root / "dp.ckpt")
+            Path(dp).touch()
+
+            def train_process(cmd, log, extra_env=None):
+                self.assertEqual(cmd[:3], [ctx.py, "-m", "scout.train_vib"])
+                config_path = Path(cmd[cmd.index("--config") + 1])
+                config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                self.assertEqual(config["dataset"]["zarr_path"], str(ctx.core))
+                self.assertEqual(config["model"]["E_s"]["base_dp_ckpt"], dp)
+                self.assertEqual(config["num_epochs"], 2)
+                checkpoint = Path(config["save_dir"]) / "run" / "scout_vib.ckpt"
+                checkpoint.parent.mkdir()
+                checkpoint.touch()
+
+            with patch.object(ctx, "run", side_effect=train_process) as command:
+                result = dyn_train.train(ctx, root / "dyn", dp, base=True, options={"epochs": 2})
+            command.assert_called_once()
+            self.assertTrue(Path(result["dyn"]).is_file())
+            self.assertTrue((root / "dyn" / "done.json").is_file())
 
     def test_rollout_guided_eval_frozen_rescue_and_sharding(self):
         with tempfile.TemporaryDirectory() as d:

@@ -17,8 +17,8 @@ seed: 42
 # dataset.path follows --core-hdf5.
 base_dp:
   initial_ckpt_path: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/train/DP/DP-base/checkpoints/599.ckpt
-  config_name: base_dp_coffee_prep_image
-  config_dir: configs
+  config_name: base_dp
+  config_dir: configs/coffee_prep
 vib:
   ckpt_path: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/train/dyn/dyn-base/20260920-000000/scout_vib.ckpt
   base_dp_ckpt: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/train/DP/DP-base/checkpoints/599.ckpt

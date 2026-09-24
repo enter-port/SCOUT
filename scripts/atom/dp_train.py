@@ -21,7 +21,11 @@ def train(ctx, out, successes=(), name="DP-base", base=False, options=None,
             dp_config = dp_config[:-5]
         if dp_config.startswith("configs/"):
             dp_config = dp_config[len("configs/"):]
-        args = [ctx.py, ROOT / "train.py", "--config-path", "configs", "--config-name",
+        config_path = "configs"
+        if "/" in dp_config:
+            folder, dp_config = dp_config.rsplit("/", 1)
+            config_path = f"configs/{folder}"
+        args = [ctx.py, ROOT / "train.py", "--config-path", config_path, "--config-name",
                 dp_config,
                 f"task.dataset_path={data}", f"training.seed={ctx.seed}",
                 f"task.dataset.seed={ctx.seed}", "training.resume=False", "training.rollout_every=0",
