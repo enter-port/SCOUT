@@ -1,0 +1,58 @@
+seed: 42
+# eval_coffee_prep_entropy.yaml -- COFFEEPREP-MG-p1 chain config (2026-09-20).
+# COPY of eval_threading_entropy.yaml made single-arm for the MimicGen
+# coffee_preparation_d0 task (horizon 800, agentview + robot0_eye_in_hand
+# cameras, base_dp_coffee_prep_image, action_dim 10, proprio 9). MimicGen
+# pool: data/robomimic/coffee_prep/mg/coffee_preparation_d0.hdf5 (1000 demos,
+# obs pre-rendered 84x84, env_name Coffee_Prep_D0, OSC_POSE control_delta
+# True -> env factory flips to absolute).
+# Delta vs the threading template: horizon 400 -> 800 (mimicgen
+# DATASET_REGISTRY coffee_preparation_d0); eval.try_times stays 1 (phase-A
+# eval only needs the FIRST-try SR + frozen failed set; pass@ETRIES comes
+# from the phase-B sharded rescue).
+# exploration.guidance_scale 1.0 = PROVISIONAL: the coffee_prep dose is set
+# by the round0 grid (ckp_grid_driver.sh, pass@5 criterion, seed 233) and
+# pinned via CLI in ckp_start_arms.sh. Stale ckpt paths are ALWAYS overridden
+# by run_rollout CLI (--base-dp-ckpt / --vib-ckpt / --core-hdf5);
+# dataset.path follows --core-hdf5.
+base_dp:
+  initial_ckpt_path: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/train/DP/DP-base/checkpoints/599.ckpt
+  config_name: base_dp_coffee_prep_image
+  config_dir: configs
+vib:
+  ckpt_path: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/train/dyn/dyn-base/20260920-000000/scout_vib.ckpt
+  base_dp_ckpt: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/train/DP/DP-base/checkpoints/599.ckpt
+  view_names: [agentview_image, robot0_eye_in_hand_image]
+  proprio_dim: 9
+  proprio_emb_dim: 64
+  style_dim: 16
+  hidden_dim: 128
+dataset:
+  path: /root/workspace/baojiachun/scout/data/2026_9_19_coffeeprep_mg_p1/COFFEEPREP-MG-p1-s233/coffee_prep/rollout/coffee_prep_core.hdf5
+  core_filter_key: core_20
+action_dim: 10
+eval:
+  n_init_states: 100
+  try_times: 1
+  horizon: 800
+  n_envs: 25
+  log_every: 10
+  view_names: [agentview_image, robot0_eye_in_hand_image]
+  proprio_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+exploration:
+  guidance_scale: 1.0             # PROVISIONAL -- coffee_prep dose set by the round0 grid; CLI --guidance-scale overrides
+  guidance_start_timestep: 50     # th95/tp15/threading 口径
+self_improvement:
+  num_rounds: 8
+  scout_aug_mask: scout_aug
+  num_epochs: 1500
+wandb:
+  use_wandb: true
+  project: COFFEEPREP-MG-p1-s233
+  tags: [formal]
+device: auto
+log_dir: logs/scout_eval_coffee_prep_image
+explore:
+  base_seed_round1: 1042
+  n_scenes: 100
+  try_times: 1

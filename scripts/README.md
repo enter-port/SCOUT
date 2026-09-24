@@ -3,11 +3,24 @@
 当前训练只保留 `scripts/atom/` 中的原子操作，由根目录 `train.py` 根据 campaign 配置编排。
 旧的 task-specific round、launch、probe 和 shell chain 不再作为执行入口。
 
-## 标准 threading 配置
+## 标准 task 配置
 
 ```bash
-python train.py --config configs/campaign_threading_p6_klmedian.json --dry-run
-python train.py --config configs/campaign_threading_p6_klmedian.json
+python train.py --config configs/threading/campaign.json --dry-run
+python train.py --config configs/threading/campaign.json
+
+`configs/` 按 task 分目录，每个目录固定包含四个文件：
+
+```text
+configs/<task>/campaign.json   # 训练流程和每轮标定策略
+configs/<task>/base_dp.yaml    # base/round DP 的 Hydra 模板
+configs/<task>/dyn.yaml        # dyn/VIB 模板
+configs/<task>/eval.yaml       # eval + explore 模板
+```
+
+当前目录包括 `can`、`coffee`、`coffee_prep`、`lift`、`square`、`threading`、
+`tool_hang` 和 `transport`。只需把 campaign 的 `core_hdf5`、`gpu` 和输出目录改成实际值，
+再从仓库根目录执行 `train.py --config configs/<task>/campaign.json`。
 ```
 
 配置要求输入已经完成 split、绝对动作转换的 core-only HDF5。运行阶段由 atom 产生并传递产物：
@@ -39,7 +52,7 @@ round 6: 使用 round 5 dose → eval+explore
 
 ## threading 与最新 round_thm3 的非标定口径
 
-标准配置逐项复用 `round_thm3.sh` 的非标定设置：
+threading 标准配置逐项复用历史 `round_thm3.sh` 的非标定设置：
 
 - base DP 600 epoch、batch 64、8 DataLoader workers、checkpoint 每 100 epoch；
 - 每轮 DP 600 epoch、batch 64、8 workers、checkpoint 每 300 epoch；

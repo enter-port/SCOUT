@@ -5,7 +5,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 IDENTITY_KEYS = ("task", "dp_ckpt", "vib_ckpt", "core_hdf5")
-TASKS = ("can", "square", "coffee", "threading", "tool_hang")
+TASKS = ("can", "coffee", "coffee_prep", "lift", "square", "threading", "tool_hang", "transport")
 
 
 def check_gpu(gpu, uuid):

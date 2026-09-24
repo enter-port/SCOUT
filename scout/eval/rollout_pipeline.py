@@ -61,7 +61,7 @@ class RolloutPipeline:
     """SOE step-2 -> step-3 rollout orchestrator (vec engine).
 
     Args:
-        cfg        : loaded eval config (configs/eval_<task>.yaml). Reads
+        cfg        : loaded eval config (configs/<task>/eval.yaml). Reads
                      ``cfg.eval.{horizon, try_times, n_init_states, n_envs,
                      log_every, view_names, proprio_keys}`` and
                      ``cfg.exploration.{guidance_scale,

@@ -12,7 +12,7 @@ def train(ctx, out, dp, trajectories=(), name="dyn-base", base=False, options=No
         opts = ctx.training_options("dyn", base=base, overrides=options)
         if not ctx.dry:
             import yaml
-            cfg = yaml.safe_load(ctx.path(ctx.c.get("dyn_config", f"configs/vib_{ctx.task}_exp1.yaml")).read_text())
+            cfg = yaml.safe_load(ctx.path(ctx.c.get("dyn_config", f"configs/{ctx.task}/dyn.yaml")).read_text())
             cfg["dataset"].update(zarr_path=data, feature_cache=True)
             cfg["model"]["E_s"]["base_dp_ckpt"] = dp
             cfg.update(seed=ctx.seed, cudnn_deterministic=True, save_dir=str(work),

@@ -1,7 +1,7 @@
 """E0 base Diffusion Policy training -- thin pointer to the LPB ``train.py``.
 
 **Entry point**: the repo-root ``train.py`` (hydra + ``TrainDiffusionUnetHybridWorkspace``)
-plus an LPB-format yaml in ``configs/`` (default ``configs/base_dp_lift_image.yaml``).
+plus an LPB-format yaml in ``configs/`` (default ``configs/lift/base_dp.yaml``).
 The base DP is the LPB ``DiffusionUnetHybridImagePolicy`` -- the same class
 :class:`scout.guidance.policy.ScoutPolicy` subclasses at inference. Training is
 **not** reimplemented here; LPB's workspace already owns the AdamW + cosine-LR +

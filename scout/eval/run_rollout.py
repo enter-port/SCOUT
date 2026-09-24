@@ -70,7 +70,7 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     # ---- inputs ----
-    p.add_argument("--config", required=True, help="configs/eval_<task>.yaml")
+    p.add_argument("--config", required=True, help="configs/<task>/eval.yaml")
     p.add_argument("--task", required=True, help="lift | can | square | transport")
     p.add_argument("--base-dp-ckpt", required=True, help="base DP ckpt to roll out")
     p.add_argument("--vib-ckpt", default=None,

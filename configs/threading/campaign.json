@@ -1,0 +1,94 @@
+{
+  "version": 2,
+  "task": "threading",
+  "seed": 233,
+  "gpu": 0,
+  "output_dir": "data/standard_threading_p6_klmedian_s233",
+  "core_hdf5": "data/robomimic/threading/mg/threading_d0_core20_s233.hdf5",
+  "arms": [
+    "ATY"
+  ],
+  "rounds": 6,
+  "wandb_mode": "offline",
+  "wandb_project": "THREADING-standard-p6-klmedian-s233",
+  "dp_config": "threading/base_dp",
+  "dyn_config": "configs/threading/dyn.yaml",
+  "eval_config": "configs/threading/eval.yaml",
+  "dp": {
+    "base_epochs": 600,
+    "base_checkpoint_every": 100,
+    "epochs": 600,
+    "checkpoint_every": 300,
+    "batch_size": 64,
+    "workers": 8
+  },
+  "dyn": {
+    "base_epochs": 300,
+    "epochs": 300,
+    "batch_size": 256,
+    "steps_per_epoch": 100,
+    "beta": 1e-05
+  },
+  "dose": {
+    "eta": 1.0,
+    "kappa": 2.5
+  },
+  "grid": {
+    "enabled": false
+  },
+  "calib": {
+    "target_r": 0.01,
+    "band": 0.1,
+    "potential": 6.0,
+    "samples": 8,
+    "initial_kappa": 2.5
+  },
+  "round_plan": [
+    {
+      "rounds": [
+        1
+      ],
+      "calib": {
+        "mode": "pr",
+        "potential": 6.0,
+        "target_r": 0.01,
+        "band": 0.1
+      },
+      "train": true
+    },
+    {
+      "rounds": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "calib": {
+        "mode": "dp_kl",
+        "target_r": 0.01,
+        "samples": 8
+      },
+      "train": true
+    },
+    {
+      "rounds": [
+        6
+      ],
+      "calib": {
+        "mode": "none"
+      },
+      "train": false
+    }
+  ],
+  "rollout": {
+    "scenes": 100,
+    "seed": 42,
+    "pass_k": 5,
+    "workers": 8,
+    "eval_envs": 25,
+    "envs_per_worker": 25,
+    "flush_every": 100,
+    "stop_on_first_success": true
+  },
+  "dyn_freeze_after": 6
+}

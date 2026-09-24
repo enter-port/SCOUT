@@ -11,5 +11,5 @@
 - `eval/`：固定场景 eval、rescue explore、shard merge 和 HDF5 数据选择；
 - `train_vib.py`：dyn/VIB 训练入口。
 
-标准 threading 流程见 [campaign 配置](../configs/campaign_threading_p6_klmedian.json) 和
+标准 threading 流程见 [campaign 配置](../configs/threading/campaign.json) 和
 [atom 说明](../scripts/README.md)。

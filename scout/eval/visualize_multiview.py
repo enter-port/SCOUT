@@ -16,7 +16,7 @@ No policy / no GPU model work -- pure re-rendering of saved paths.
 Usage (server, from the repo root):
 
     MUJOCO_GL=egl python -m scout.eval.visualize_multiview \
-        --config configs/eval_can_entropy.yaml \
+        --config configs/can/eval.yaml \
         --core-hdf5 <...>/rollout/can_core.hdf5 --seed 42 \
         --paths-dir data/vis_first_chunk/can_s233_round4
 """

@@ -23,7 +23,7 @@ itself -- yielding exactly the final DP_{n} retrain on all accumulated rollouts.
 
 Server usage (venv active, wandb env sourced, cwd = repo root):
   .venv/bin/python -m scout.eval.run_round \\
-      --config configs/eval_square.yaml --task square \\
+      --config configs/square/eval.yaml --task square \\
       --base-dp-ckpt <.../580.ckpt> \\
       --vib-ckpt    <.../scout_vib.ckpt> \\
       --core-hdf5   <.../image_v141_abs_core20.hdf5> \\
@@ -116,7 +116,7 @@ def make_round_retrain_fn(log_root: str, wandb_name: str,
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="configs/eval_<task>.yaml")
+    p.add_argument("--config", required=True, help="configs/<task>/eval.yaml")
     p.add_argument("--task", required=True, help="lift | can | square (wandb name)")
     p.add_argument("--base-dp-ckpt", required=True, help="E0 base DP ckpt (= DP0)")
     p.add_argument("--vib-ckpt", required=True,

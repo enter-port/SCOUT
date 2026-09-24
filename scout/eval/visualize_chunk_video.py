@@ -30,7 +30,7 @@ functions consumed by :mod:`scout.eval.visualize_arms_video` (the 3-arm
 Usage (server, from the repo root; GPU must be idle):
 
     MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=2 python -m scout.eval.visualize_chunk_video \
-        --config configs/eval_can_entropy.yaml --task can \
+        --config configs/can/eval.yaml --task can \
         --base-dp-ckpt <DP-SCOUT-exp4>/checkpoints/299.ckpt \
         --vib-ckpt    <dyn-SCOUT-exp4>/<ts>/scout_vib.ckpt \
         --core-hdf5   <...>/rollout/can_core.hdf5 \
@@ -39,7 +39,7 @@ Usage (server, from the repo root; GPU must be idle):
 
     # tool_hang orbit arm (TH9-5-s233 round5-final ckpts, r6-eval params):
     MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=1 python -m scout.eval.visualize_chunk_video \
-        --config configs/eval_tool_hang_entropy.yaml --task tool_hang \
+        --config configs/tool_hang/eval.yaml --task tool_hang \
         --base-dp-ckpt <DP-ORBIT-exp5>/checkpoints/299.ckpt \
         --vib-ckpt    <dyn-ORBIT-exp5>/<ts>/scout_vib.ckpt \
         --core-hdf5   <...>/rollout/tool_hang_core.hdf5 \

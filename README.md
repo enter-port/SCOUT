@@ -6,11 +6,12 @@ SCOUT 用 VIB 动力学编码器在 Diffusion Policy 去噪过程中提供 atypi
 ## 当前标准入口
 
 当前唯一的训练编排入口是根目录 `train.py`，原子操作位于 `scripts/atom/`。
-标准 threading 配置为 [campaign_threading_p6_klmedian.json](configs/campaign_threading_p6_klmedian.json)。
+每个 task 都有一个独立配置目录；例如 threading 的标准配置为
+[configs/threading/campaign.json](configs/threading/campaign.json)。
 
 ```bash
-python train.py --config configs/campaign_threading_p6_klmedian.json --dry-run
-python train.py --config configs/campaign_threading_p6_klmedian.json
+python train.py --config configs/threading/campaign.json --dry-run
+python train.py --config configs/threading/campaign.json
 ```
 
 配置需要一个已经完成 split 和绝对动作转换的 core-only HDF5。运行顺序为：
@@ -44,7 +45,7 @@ DP batch 64、8 个 DataLoader workers；dyn 300 epoch、batch 256、100 steps/e
 ```text
 train.py             campaign 配置入口；无 --config 时保留 DP Hydra backend
 scripts/atom/        base、grid、calib、eval+explore、DP、dyn 原子操作
-configs/             threading 标准 campaign 与其 DP/dyn/eval backend 配置
+configs/<task>/      每个 task 的 campaign、base DP、dyn、eval 四件标准配置
 scout/model/         状态编码器、VIB encoder、动力学 decoder
 scout/guidance/      ScoutPolicy、KL/ORBIT guidance
 scout/calib/         P6、KL median、R/C 标定算法
@@ -57,5 +58,5 @@ idea/                当前模型笔记和历史归档
 
 ```bash
 python -m unittest discover -s tests -v
-python train.py --config configs/campaign_threading_p6_klmedian.json --dry-run
+python train.py --config configs/threading/campaign.json --dry-run
 ```

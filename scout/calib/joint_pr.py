@@ -76,7 +76,7 @@ def calibrate(args):
     from scout.guidance.entropy_costs import KLCostPlanner
 
     cfg, obs, scale = prepare_core(
-        args.eval_config or ROOT / f"configs/eval_{task}_entropy.yaml", metadata["core_hdf5"])
+        args.eval_config or ROOT / f"configs/{task}/eval.yaml", metadata["core_hdf5"])
     gst = int(cfg.exploration.get("guidance_start_timestep", 50))
     dp, vib, bridge, obs_adapter = load_model_pair(cfg, metadata["dp_ckpt"], metadata["vib_ckpt"])
 
@@ -165,7 +165,7 @@ def calibrate(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, help="research directory with checkpoint metadata")
-    parser.add_argument("--task", choices=["can", "square", "coffee", "threading", "tool_hang"])
+    parser.add_argument("--task", choices=["can", "coffee", "coffee_prep", "lift", "square", "threading", "tool_hang", "transport"])
     parser.add_argument("--dp-ckpt", type=Path)
     parser.add_argument("--vib-ckpt", type=Path)
     parser.add_argument("--core-hdf5", type=Path)

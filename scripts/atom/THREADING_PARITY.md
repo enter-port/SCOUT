@@ -1,7 +1,7 @@
 # threading 标准链 parity 记录
 
 对照基线：Git 当前历史中的 `scripts/threading/round_thm3.sh`。比较对象：
-`configs/campaign_threading_p6_klmedian.json` 加 `scripts/atom/` 执行器。
+`configs/threading/campaign.json` 加 `scripts/atom/` 执行器。
 
 以下非标定行为逐项一致：
 

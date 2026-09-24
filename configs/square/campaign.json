@@ -1,17 +1,19 @@
 {
   "version": 2,
-  "task": "threading",
+  "task": "square",
   "seed": 233,
   "gpu": 0,
-  "output_dir": "data/standard_threading_p6_klmedian_s233",
-  "core_hdf5": "data/robomimic/threading/mg/threading_d0_core20_s233.hdf5",
-  "arms": ["ATY"],
+  "output_dir": "data/standard_square_p6_klmedian_s233",
+  "core_hdf5": "data/robomimic/square/ph/image_v141_abs_core20.hdf5",
+  "arms": [
+    "ATY"
+  ],
   "rounds": 6,
   "wandb_mode": "offline",
-  "wandb_project": "THREADING-standard-p6-klmedian-s233",
-  "dp_config": "base_dp_threading_image",
-  "dyn_config": "configs/vib_threading_exp1.yaml",
-  "eval_config": "configs/eval_threading_entropy.yaml",
+  "wandb_project": "SQUARE-standard-p6-klmedian-s233",
+  "dp_config": "square/base_dp",
+  "dyn_config": "configs/square/dyn.yaml",
+  "eval_config": "configs/square/eval.yaml",
   "dp": {
     "base_epochs": 600,
     "base_checkpoint_every": 100,
@@ -25,7 +27,7 @@
     "epochs": 300,
     "batch_size": 256,
     "steps_per_epoch": 100,
-    "beta": 0.00001
+    "beta": 1e-05
   },
   "dose": {
     "eta": 1.0,
@@ -43,7 +45,9 @@
   },
   "round_plan": [
     {
-      "rounds": [1],
+      "rounds": [
+        1
+      ],
       "calib": {
         "mode": "pr",
         "potential": 6.0,
@@ -53,7 +57,12 @@
       "train": true
     },
     {
-      "rounds": [2, 3, 4, 5],
+      "rounds": [
+        2,
+        3,
+        4,
+        5
+      ],
       "calib": {
         "mode": "dp_kl",
         "target_r": 0.01,
@@ -62,7 +71,9 @@
       "train": true
     },
     {
-      "rounds": [6],
+      "rounds": [
+        6
+      ],
       "calib": {
         "mode": "none"
       },

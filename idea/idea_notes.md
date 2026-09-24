@@ -2,7 +2,7 @@
 
 更新：2026-09-24。本文按当前 `scout/`、`scripts/atom/` 和标准链代码整理。
 具体运行以 campaign 配置、生成的训练配置及 checkpoint 为准；历史计划见 [archive](archive/README.md)。
-默认预算示例来自 [标准模板](../configs/campaign_threading_p6_klmedian.json)，不代表所有历史实验或任务的最优参数。
+默认预算示例来自 [threading 标准模板](../configs/threading/campaign.json)，不代表所有历史实验或任务的最优参数。
 
 ## 1. 当前方法与边界
 

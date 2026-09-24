@@ -13,8 +13,16 @@ def train(ctx, out, successes=(), name="DP-base", base=False, options=None,
         epochs = int(cfg.get("epochs", 600))
         workers = int(cfg.get("workers", 8))
         bs = int(cfg.get("batch_size", 64))
+        # Hydra resolves nested config names relative to --config-path.  The
+        # standard layout stores each task's DP template in configs/<task>/.
+        # Keep accepting the historical flat name for callers with old JSON.
+        dp_config = str(ctx.c.get("dp_config", f"{ctx.task}/base_dp"))
+        if dp_config.endswith(".yaml"):
+            dp_config = dp_config[:-5]
+        if dp_config.startswith("configs/"):
+            dp_config = dp_config[len("configs/"):]
         args = [ctx.py, ROOT / "train.py", "--config-path", "configs", "--config-name",
-                ctx.c.get("dp_config", f"base_dp_{ctx.task}_image"),
+                dp_config,
                 f"task.dataset_path={data}", f"training.seed={ctx.seed}",
                 f"task.dataset.seed={ctx.seed}", "training.resume=False", "training.rollout_every=0",
                 "training.sample_every=100", "training.cudnn_benchmark=false",

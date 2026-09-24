@@ -226,7 +226,7 @@ def calibrate(args):
         if models is None:
             check_gpu(args.gpu, args.gpu_uuid)
             cfg, obs, scale = prepare_core(
-                args.eval_config or ROOT / f"configs/eval_{metadata['task']}_entropy.yaml",
+                args.eval_config or ROOT / f"configs/{metadata['task']}/eval.yaml",
                 metadata["core_hdf5"])
             gst = int(cfg.exploration.get("guidance_start_timestep", 50))
             models = (*load_model_pair(cfg, metadata["dp_ckpt"], metadata["vib_ckpt"]), obs, gst, scale)

@@ -14,7 +14,7 @@ the full self-improvement loop (eval -> guided rollout -> retrain).
 
 Server usage (venv active, wandb env sourced, cwd = repo root):
   .venv/bin/python -m scout.eval.run_eval \\
-      --config configs/eval_square.yaml --task square \\
+      --config configs/square/eval.yaml --task square \\
       --base-dp-ckpt <.../580.ckpt> \\
       --core-hdf5   <.../image_v141_abs_core20.hdf5> \\
       --cuda-visible-devices 0
@@ -54,7 +54,7 @@ def _to_plain(d: Any) -> Any:
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="configs/eval_<task>.yaml")
+    p.add_argument("--config", required=True, help="configs/<task>/eval.yaml")
     p.add_argument("--task", required=True, help="lift | can | square (wandb name)")
     p.add_argument("--base-dp-ckpt", required=True,
                    help="base DP ckpt to evaluate")

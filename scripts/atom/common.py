@@ -40,14 +40,14 @@ class Context:
         self.c = dict(config)
         self.dry = dry_run
         self.task = self.c["task"]
-        if self.task not in {"can", "square", "tool_hang", "transport", "threading", "coffee", "coffee_prep"}:
+        if self.task not in {"can", "coffee", "coffee_prep", "lift", "square", "threading", "tool_hang", "transport"}:
             raise ValueError(f"unsupported task: {self.task}")
         self.seed = int(self.c.get("seed", 233))
         self.gpu = str(self.c["gpu"])
         self.py = self.c.get("python", sys.executable)
         self.root = self.path(self.c["output_dir"])
         self.core = self.path(self.c["core_hdf5"])
-        self.eval_config = self.path(self.c.get("eval_config", f"configs/eval_{self.task}_entropy.yaml"))
+        self.eval_config = self.path(self.c.get("eval_config", f"configs/{self.task}/eval.yaml"))
         self.project = self.c.get("wandb_project", self.root.name)
         self.wandb = self.c.get("wandb_mode", "disabled")
         if self.wandb not in {"disabled", "offline", "online"}:

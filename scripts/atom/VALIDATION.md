@@ -42,7 +42,7 @@ dyn encoder checkpoint 来源、RC 退出码和最后一轮没有 dp/dyn 训练�
 ```bash
 PY=/root/workspace/baojiachun/.venv_mg/bin/python
 "$PY" -m scripts.atom.base_train --config validation/base.json
-python train.py --config configs/campaign_threading_p6_klmedian.json --dry-run
+python train.py --config configs/threading/campaign.json --dry-run
 bash validation/calib_smoke.sh
 "$PY" validation/audit.py
 "$PY" validation/resume_check.py

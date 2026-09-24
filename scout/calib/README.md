@@ -77,7 +77,7 @@ mkdir -p "$OUT_DIR"
 
 ```bash
 CUDA_VISIBLE_DEVICES="$GPU" "$PY" -m scout.calib.eta_r \
-  --eval-config "configs/eval_${TASK}_entropy.yaml" \
+  --eval-config "configs/${TASK}/eval.yaml" \
   --dp-ckpt "$DP_CKPT" --vib-ckpt "$DYN_CKPT" --core-hdf5 "$CORE" \
   --eta-prev 2 --kappa-prev 2.5 \
   --target 0.01 --band-lo 0.009 --band-hi 0.011 --max-repeat 2 \
@@ -96,7 +96,7 @@ BASE_DYN=/path/to/base_scout_vib.ckpt
 BASE_ETA=2                  # 换成该 base 的实际 η
 ROUND_ETA=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["eta"])' "$OUT_DIR/eta.json")
 CUDA_VISIBLE_DEVICES="$GPU" "$PY" -m scout.calib.kappa_c \
-  --eval-config "configs/eval_${TASK}_entropy.yaml" --core-hdf5 "$CORE" \
+  --eval-config "configs/${TASK}/eval.yaml" --core-hdf5 "$CORE" \
   --base-dp-ckpt "$BASE_DP" --base-vib-ckpt "$BASE_DYN" \
   --base-eta "$BASE_ETA" --base-kappa 2.5 \
   --round-dp-ckpt "$DP_CKPT" --round-vib-ckpt "$DYN_CKPT" \
@@ -114,7 +114,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PY" -m scout.calib.kappa_c \
 
 ```bash
 "$PY" -m scout.calib.joint_pr \
-  --task "$TASK" --eval-config "configs/eval_${TASK}_entropy.yaml" \
+  --task "$TASK" --eval-config "configs/${TASK}/eval.yaml" \
   --dp-ckpt "$DP_CKPT" --vib-ckpt "$DYN_CKPT" --core-hdf5 "$CORE" \
   --potential-cap 6 --target-r 0.01 --band 0.1 --initial-kappa 2.5 \
   --gpu "$GPU" --gpu-uuid "$GPU_UUID" --out "$OUT_DIR/p6.json"
@@ -132,7 +132,7 @@ P6 同时给出 η/κ；将这对参数直接用于 rollout。
 
 ```bash
 "$PY" -m scout.calib.dp_kl \
-  --task "$TASK" --eval-config "configs/eval_${TASK}_entropy.yaml" \
+  --task "$TASK" --eval-config "configs/${TASK}/eval.yaml" \
   --dp-ckpt "$DP_CKPT" --vib-ckpt "$DYN_CKPT" --core-hdf5 "$CORE" \
   --eta-initial 2 --samples 8 --target-r 0.01 \
   --gpu "$GPU" --gpu-uuid "$GPU_UUID" --out "$OUT_DIR/kl_median.json"
@@ -161,7 +161,7 @@ P6/中位数入口拒绝覆盖已有 `--out`；中位数直接模式也拒绝复
 
 标定由 [`scripts/atom/calib.py`](../../scripts/atom/calib.py) 调用，配置入口是根目录
 [`train.py`](../../train.py)。标准 threading 配置见
-[`configs/campaign_threading_p6_klmedian.json`](../../configs/campaign_threading_p6_klmedian.json)。
+[`configs/threading/campaign.json`](../../configs/threading/campaign.json)。
 
 round 1 使用 `mode: pr`，即 P6 联合求解 `eta*kappa=6` 并使 R 接近 0.01；
 round 2-5 使用 `mode: dp_kl`，先由独立 DP posterior 的 KL 中位数确定 κ，再将 η 调到 R=0.01；

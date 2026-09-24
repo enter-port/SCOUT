@@ -52,7 +52,7 @@ class EvalPipeline:
     Parameters
     ----------
     cfg : EasyDict
-        Eval config (``configs/eval_<task>.yaml``). Reads ``cfg.eval.horizon``,
+        Eval config (``configs/<task>/eval.yaml``). Reads ``cfg.eval.horizon``,
         ``cfg.eval.n_init_states`` (default 100), ``cfg.eval.try_times``
         (default 5), ``cfg.eval.n_envs`` (default 50), ``cfg.eval.log_every``.
     dp_factory : callable

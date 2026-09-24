@@ -23,7 +23,7 @@ share a stale bank. Banks are loaded with ``mmap_mode='r'`` (zero-copy page
 cache; server has ~870 GB RAM).
 
 CLI:
-    python -m scout.feat_cache --config configs/vib_can_image_fast.yaml          # build only
+    python -m scout.feat_cache --config configs/can/dyn.yaml          # build only
     python -m scout.feat_cache --config ... --verify 8                           # bank vs live E_s
     python -m scout.feat_cache --smoke                                           # hermetic CPU check
 """

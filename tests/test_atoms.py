@@ -1,6 +1,7 @@
 """Orchestration invariants; no CUDA/model dependency."""
 from contextlib import redirect_stdout
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -23,6 +24,23 @@ class AtomTests(unittest.TestCase):
 
     def test_repository_resolution(self):
         self.assertTrue((ROOT / "train.py").is_file())
+
+    def test_every_task_uses_the_four_file_standard_layout(self):
+        expected = {"can", "coffee", "coffee_prep", "lift", "square", "threading",
+                    "tool_hang", "transport"}
+        task_dirs = {p.name for p in (ROOT / "configs").iterdir() if p.is_dir()}
+        self.assertEqual(task_dirs, expected)
+        for task in sorted(expected):
+            directory = ROOT / "configs" / task
+            self.assertEqual({p.name for p in directory.iterdir() if p.is_file()},
+                             {"campaign.json", "base_dp.yaml", "dyn.yaml", "eval.yaml"})
+            config = json.loads((directory / "campaign.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["task"], task)
+            self.assertEqual(config["dp_config"], f"{task}/base_dp")
+            self.assertEqual(config["dyn_config"], f"configs/{task}/dyn.yaml")
+            self.assertEqual(config["eval_config"], f"configs/{task}/eval.yaml")
+            self.assertEqual(config["round_plan"][-1],
+                             {"rounds": [6], "calib": {"mode": "none"}, "train": False})
 
     def test_complete_dry_run_does_not_write(self):
         with tempfile.TemporaryDirectory() as d, redirect_stdout(io.StringIO()):

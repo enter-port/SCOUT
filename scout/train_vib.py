@@ -16,7 +16,7 @@ base-DP ResNet inside E_s has ``requires_grad=False`` -- single-chain, single
 ``proprio_embed`` update.
 
 Usage (real run, needs pytorch3d/robomimic + a base-DP ckpt -- training env):
-    python -m scout.train_vib --config configs/vib_lift_image.yaml
+    python -m scout.train_vib --config configs/lift/dyn.yaml
 
 For an environment-agnostic forward/backward smoke test (no dataset, no ckpt):
     python -m scout.train_vib --dummy

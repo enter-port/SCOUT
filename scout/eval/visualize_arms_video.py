@@ -25,7 +25,7 @@ Usage (server, repo root; GPU must be idle; TH9-5-s233 round5 ckpts,
 r6-eval parameter era):
 
     MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=1 python -m scout.eval.visualize_arms_video \
-        --config configs/eval_tool_hang_entropy.yaml --task tool_hang \
+        --config configs/tool_hang/eval.yaml --task tool_hang \
         --core-hdf5  <TOOLHANG-s233>/tool_hang/rollout/tool_hang_core.hdf5 \
         --dp-ckpt    <...>/train/DP/DP-DP-exp5/checkpoints/299.ckpt \
         --aty-ckpt   <...>/train/DP/DP-ATY-exp5/checkpoints/299.ckpt \
