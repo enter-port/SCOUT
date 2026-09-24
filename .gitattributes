@@ -1,0 +1,2 @@
+# Shell entry points execute on Linux even when edited from Windows.
+*.sh text eol=lf

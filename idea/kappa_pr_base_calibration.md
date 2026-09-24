@@ -29,4 +29,4 @@ R分母为core原始abs_actions平均绝对值，不是noisy action。
 证据目录：`experiments/2026_09_24_kappa_calibration/`，其中`RESULTS.md`、
 `METHODS.md`、`snapshot/potential_base_mapping.json`及各arm的summary保存完整记录。
 算法、直接用法和调用结构见 [`scout/calib/README.md`](../scout/calib/README.md)；
-研究编排见 [`scripts/calibration/README.md`](../scripts/calibration/README.md)。
+当前标定算法见 [`scout/calib/README.md`](../scout/calib/README.md)。

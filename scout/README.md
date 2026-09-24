@@ -1,33 +1,15 @@
-# SCOUT
+# scout 模块
 
-Implementation of **classifier-guided exploration via a VIB latent dynamics model**:
-a frozen base Diffusion Policy provides the action score at test time, while a
-separately-trained VIB model supplies the skill encoder `q_φ(z | s̄, a)` whose
-posterior movement is used as the **entropy cost**
-`-min(KL(q_φ(z|s̄,a) ‖ q_φ(z|s̄,a⁰)), κ)` (candidate action vs the DP's own
-unguided intent `a⁰`, capped at κ nats) injected into the DP denoising loop.
-Derivation: [`idea/entropy_cost.md`](../idea/entropy_cost.md). The earlier
-Gaussian-NLL cost with a prior-sampled target z (v0) is kept in
-`scout/guidance/cost.py` (`--guide dyn` / `expert`).
+这里包含 SCOUT 的模型、guidance、标定、rollout 和训练实现。当前标准训练由根目录
+`train.py` 读取 campaign 配置并调用 `scripts/atom/` 中的原子操作。
 
-Current experiments: robomimic `can` (LPB-aligned image pipeline).
+核心目录：
 
-- Authoritative design: [`idea/scout_design.md`](../idea/scout_design.md)
-- Entropy cost derivation: [`idea/entropy_cost.md`](../idea/entropy_cost.md)
-- Implementation plan: [`idea/scout_impl_plan.md`](../idea/scout_impl_plan.md)
-- Experiment spec: [`idea/stage1_plan.md`](../idea/stage1_plan.md)
+- `model/`：状态编码器、VIB encoder 和动力学 decoder；
+- `guidance/`：KL cost、atypical 和 ORBIT guidance；
+- `calib/`：P6、KL median、R/C 等剂量标定；
+- `eval/`：固定场景 eval、rescue explore、shard merge 和 HDF5 数据选择；
+- `train_vib.py`：dyn/VIB 训练入口。
 
-## Layout
-
-```
-scout/
-  data/    # TransitionSource interface + ReplayBuffer + robomimic low_dim backend
-  model/   # EncoderMLP (SOE port); StateEncoder (E_s, LPB-style) / VIB / ScoutVIB
-configs/   # YAML configs (Phase 2+)
-```
-
-## Status
-
-Stage 1 implemented (see root `README.md`); the formal entropy-cost experiment
-(can, 3 seeds × DP/SCOUT arms, `--guide atypical`) has been running since
-2026-08-24.
+标准 threading 流程见 [campaign 配置](../configs/campaign_threading_p6_klmedian.json) 和
+[atom 说明](../scripts/README.md)。

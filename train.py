@@ -5,6 +5,15 @@ python train.py --config-name=train_diffusion_lowdim_workspace
 """
 
 import sys
+
+# Campaign entry point.  The legacy Hydra path remains available for the DP
+# backend because scripts.atom.dp_train invokes it with --config-path rather
+# than --config.
+if "--config" in sys.argv:
+    from scripts.atom.campaign import main as campaign_main
+    campaign_main()
+    raise SystemExit
+
 # use line-buffering for both stdout and stderr
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)

@@ -13,7 +13,7 @@
 #
 # MUST run under /root/workspace/baojiachun/.venv_mg (mimicgen installed; the
 # robomimic env hook imports it). round-0 splits core_20 via
-# scripts/analysis/split_core.py (thread_prep_data.sh); rounds >=1 reuse this
+# the preprocessed core; rounds >=1 reuse this
 # config with `task.dataset_path` overridden to the round's augmented hdf5.
 
 name: base_dp_threading_image

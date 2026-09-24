@@ -258,27 +258,19 @@ class EntryPointTests(unittest.TestCase):
                 self.assertTrue(Path(result["median_reference"]).is_file())
                 self.assertTrue(Path(result["calibration_path"]).with_suffix(".npz").is_file())
 
-    def test_new_and_legacy_cli_help_without_model_dependencies(self):
+    def test_calibration_cli_help_without_model_dependencies(self):
         entries = [["-m", f"scout.calib.{name}"] for name in ("eta_r", "kappa_c", "joint_pr", "dp_kl")]
-        entries += [[name] for name in ("scripts/coffee/cfk_rcalib.py", "scripts/threading/thm2_c_calib.py",
-                    "scripts/calibration/kappa_pcalib.py", "scripts/calibration/kappa_diversity_eval.py",
-                    "scripts/calibration/kappa_diagnostics.py")]
         for entry in entries:
             with self.subTest(entry=entry):
                 result = subprocess.run([sys.executable, *entry, "--help"], cwd=ROOT, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("usage:", result.stdout)
 
-    def test_legacy_imports_use_the_migrated_implementation(self):
-        from scripts.calibration.kappa_search import solve_kappa as old_search
-        from scout.calib.search import solve_kappa
-        from scripts.calibration.kappa_pcalib import calibrate
-        from scripts.coffee.cfk_rcalib import main as old_eta
-        from scripts.threading.thm2_c_calib import main as old_c
-        self.assertIs(old_search, solve_kappa)
-        self.assertIs(calibrate, joint_pr.calibrate)
-        self.assertIs(old_eta, eta_r.main)
-        self.assertIs(old_c, kappa_c.main)
+    def test_calibration_modules_are_current_implementations(self):
+        self.assertTrue(callable(joint_pr.calibrate))
+        self.assertTrue(callable(dp_kl.calibrate))
+        self.assertTrue(callable(eta_r.main))
+        self.assertTrue(callable(kappa_c.main))
 
 
 if __name__ == "__main__":
