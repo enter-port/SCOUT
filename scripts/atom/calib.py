@@ -48,6 +48,11 @@ def calibrate(ctx, out, dp, dyn, previous, base=None, mode=None, options=None):
                            "--base-kappa", base["kappa"], "--round-dp-ckpt", dp,
                            "--round-vib-ckpt", dyn, "--round-eta", result["eta"],
                            "--kappa0", previous["kappa"], "--band", band,
+                           "--solver", cfg.get("c_solver", "ratio"),
+                           "--max-probes", cfg.get("c_max_probes", 12),
+                           "--kappa-min", cfg.get("c_kappa_min", 1e-3),
+                           "--kappa-max", cfg.get("c_kappa_max", 100.),
+                           "--require-converged",
                            "--batch-size", cfg.get("batch_size", 128), "--out", result_path], work / "kappa.log")
         else:
             gpu_uuid = ("<gpu-uuid>" if ctx.dry else subprocess.check_output(

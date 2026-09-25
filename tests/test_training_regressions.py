@@ -91,6 +91,18 @@ class TrainingRegressions(unittest.TestCase):
             self.assertEqual({Path(p).name for p in result["artifacts"]}, {"eta.json", "kappa.json"})
             self.assertTrue((root / "calib/done.json").exists())
 
+    def test_rc_forwards_explicit_bracket_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = self.context(Path(d), calib={"c_solver": "bracket", "c_max_probes": 12})
+            ctx.dry = True
+            with patch.object(ctx, "module") as call:
+                calib.calibrate(ctx, ctx.root, "dp", "dyn", {"eta": 1, "kappa": 2.5},
+                                base={"dp": "b", "dyn": "v", "eta": 1, "kappa": 2.5}, mode="rc")
+            args = call.call_args.args[1]
+            self.assertEqual(args[args.index("--solver") + 1], "bracket")
+            self.assertEqual(args[args.index("--max-probes") + 1], 12)
+            self.assertIn("--require-converged", args)
+
     def test_dp_never_calibrates_and_stages_share_round_identity(self):
         for arms in (["DP"], ["DP", "ATY"]):
             with self.subTest(arms=arms), tempfile.TemporaryDirectory() as d:
