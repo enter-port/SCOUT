@@ -1,7 +1,7 @@
 """Unguided evaluation, freeze failed scenes, then sharded rescue and merge."""
 from pathlib import Path
 
-from .common import Context, finish, parser, read_json
+from .common import Context, finish, parser, read_json, round_name
 
 
 def run(ctx, out, dp, dyn=None, arm="ATY", round_num=1, dose=None, frozen=None,
@@ -46,7 +46,7 @@ def run(ctx, out, dp, dyn=None, arm="ATY", round_num=1, dose=None, frozen=None,
     def evaluate(work):
         failed, metrics = work / "failed.json", work / "eval.json"
         wb = (["--no-wandb"] if ctx.wandb == "disabled" else
-              ["--wandb-minimal", "--wandb-project", ctx.project, "--wandb-name", f"{arm}-round{round_num}"])
+              ["--wandb-minimal", "--wandb-project", ctx.project, "--wandb-name", round_name(arm, round_num)])
         # The threading round driver evaluates with the same guide/dose as
         # rescue.  --eval-only still performs exactly one attempt per fixed
         # scene and only freezes the failures for phase B.
@@ -89,9 +89,22 @@ def run(ctx, out, dp, dyn=None, arm="ATY", round_num=1, dose=None, frozen=None,
                           wandb_run_id=evaluation.get("wandb_run_id"))
         return result
 
-    return ctx.stage(Path(out) / "explore", {"dp": dp, "dyn": dyn, "arm": arm,
+    result = ctx.stage(Path(out) / "explore", {"dp": dp, "dyn": dyn, "arm": arm,
                      "round": round_num, "dose": dose, "options": options or {},
                      "evaluation": evaluation}, explore)
+    # Publish only after every shard has merged and passed validation. A separate
+    # receipt lets upload retries reuse the completed rollout without rerunning it.
+    run_id = result.get("wandb_run_id")
+    if ctx.wandb != "disabled" and run_id:
+        def publish(work):
+            ctx.module("scripts.atom.log_explore", ["--metrics", result["metrics"],
+                       "--project", ctx.project, "--run-id", run_id,
+                       "--name", round_name(arm, round_num), "--mode", ctx.wandb,
+                       "--dir", work], work / "wandb.log")
+            return {"run_id": run_id, "artifacts": [result["metrics"]]}
+        ctx.stage(Path(out) / "explore_wandb", {"metrics": result["metrics"],
+                  "run_id": run_id, "name": round_name(arm, round_num)}, publish)
+    return result
 
 
 def main():

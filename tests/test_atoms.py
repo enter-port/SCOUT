@@ -116,7 +116,7 @@ class AtomTests(unittest.TestCase):
             self.assertEqual(len(dyn_inputs), 5)
             self.assertEqual(dp_inputs[4], [f"ATY/s{i}" for i in range(1, 6)])
             self.assertEqual(dp_inputs[5], ["DP/s1"])
-            self.assertEqual(dyn_inputs[-1], ("ATY-round5-DP", [f"ATY/a{i}" for i in range(1, 6)]))
+            self.assertEqual(dyn_inputs[-1], ("SCOUT-aty-round5", [f"ATY/a{i}" for i in range(1, 6)]))
 
     def test_round_plan_uses_p6_then_kl_median_and_final_eval_only(self):
         with tempfile.TemporaryDirectory() as d:

@@ -5,6 +5,15 @@ import subprocess
 from .common import Context, finish, parser, read_json
 
 
+def _require_measurement(result, key, target, band):
+    value = float(result[key])
+    if not result.get("converged"):
+        raise ValueError(f"calibration {key} did not converge")
+    if (not math.isfinite(target) or target <= 0 or not math.isfinite(value)
+            or abs(value / target - 1) > band + 1e-12):
+        raise ValueError(f"calibration {key} is outside the target band")
+
+
 def calibrate(ctx, out, dp, dyn, previous, base=None, mode=None, options=None):
     cfg = dict(ctx.c.get("calib", {}))
     if options:
@@ -30,6 +39,8 @@ def calibrate(ctx, out, dp, dyn, previous, base=None, mode=None, options=None):
                        "--batch-size", cfg.get("batch_size", 128), "--out", eta_path], work / "eta.log")
             result_path = eta_path
             result = dict(previous) if ctx.dry else read_json(eta_path)
+            if not ctx.dry:
+                _require_measurement(result, "R_mean", target, band)
             if mode == "rc":
                 result_path = work / "kappa.json"
                 ctx.module("scout.calib.kappa_c", common + ["--base-dp-ckpt", base["dp"],
@@ -51,6 +62,8 @@ def calibrate(ctx, out, dp, dyn, previous, base=None, mode=None, options=None):
             ctx.module("scout.calib.joint_pr" if mode == "pr" else "scout.calib.dp_kl",
                        args, work / "calib.log")
         result = dict(previous) if ctx.dry else read_json(result_path)
+        if mode == "rc" and not ctx.dry:
+            _require_measurement(result, "C_mean", float(result["C_target"]), band)
         if not all(math.isfinite(float(result[k])) and float(result[k]) > 0 for k in ("eta", "kappa")):
             raise ValueError("calibration returned a nonpositive/nonfinite dose")
         if mode in {"pr", "dp_kl"} and not ctx.dry and not result.get("R_converged"):
@@ -64,7 +77,7 @@ def calibrate(ctx, out, dp, dyn, previous, base=None, mode=None, options=None):
             if mode == "pr" and abs(result["eta"] * result["kappa"] / float(cfg.get("potential", 6)) - 1) > band + 1e-12:
                 raise ValueError("calibration eta*kappa is outside the potential band")
         return {"eta": result["eta"], "kappa": result["kappa"], "json": str(result_path),
-                "artifacts": [str(result_path)]}
+                "artifacts": ([str(eta_path)] if mode == "rc" else []) + [str(result_path)]}
 
     return ctx.stage(out, {"dp": dp, "dyn": dyn, "previous": previous, "base": base,
                            "mode": mode, "options": options or {}}, action)

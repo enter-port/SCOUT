@@ -803,7 +803,7 @@ def main():
                             wandb_run.log({
                                 "explore/pass@10": metrics["pass_at_5"],
                                 "explore_init_done": metrics["n_failed"]})
-                    else:
+                    elif not args.eval_only:
                         wandb_run.log({"rollout/pass@5": metrics["pass_at_5"],
                                        "rollout/avg_jerk": metrics["avg_jerk"],
                                        "explore_init_done": metrics["n_failed"]})

@@ -20,6 +20,10 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def round_name(arm, number):
+    return f"{'SCOUT-aty' if arm == 'ATY' else arm}-round{number}"
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

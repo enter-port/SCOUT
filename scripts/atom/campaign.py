@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import base_train, calib, dp_train, dyn_train, eval_explore, grid_search
-from .common import Context, finish, lock, parser, write_json
+from .common import Context, finish, lock, parser, round_name, write_json
 
 
 def _round_spec(ctx, number):
@@ -62,6 +62,8 @@ def run(ctx):
             calib_spec = dict(ctx.c.get("calib", {}))
             calib_spec.update(spec.get("calib", {}))
             mode = calib_spec.pop("mode", "none")
+            if arm == "DP":
+                mode = "none"
 
             # A round's dose is produced here and passed directly to the
             # rollout atom.  Round 6 can set mode=none and therefore carries
@@ -86,15 +88,16 @@ def run(ctx):
                 continue
 
             resume_id = result.get("wandb_run_id")
+            name = round_name(arm, number)
             dp_options = spec.get("dp", {})
             dp_result = dp_train.train(ctx, rdir / "dp", successes,
-                                       f"{arm}-round{number}-DP", options=dp_options,
+                                       name, options=dp_options,
                                        resume_run_id=resume_id)
             pair["dp"] = dp_result["dp"]
             dyn_options = spec.get("dyn", {})
             if arm != "DP" and number <= int(ctx.c.get("dyn_freeze_after", rounds)):
                 dyn_result = dyn_train.train(ctx, rdir / "dyn", pair["dp"], trajectories,
-                                             f"{arm}-round{number}-dyn", options=dyn_options,
+                                             name, options=dyn_options,
                                              resume_run_id=resume_id)
                 pair["dyn"] = dyn_result["dyn"]
 

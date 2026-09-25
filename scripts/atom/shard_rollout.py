@@ -1,6 +1,7 @@
 """Run scene-sharded rescue workers and merge their outputs."""
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,9 @@ def main(argv=None):
     workers = int(argv[0])
     out_json, out_success, out_all, core = map(Path, argv[1:5])
     args = argv[6:]
+    output_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    output_parser.add_argument("--output-dir")
+    output_options, _ = output_parser.parse_known_args(args)
     if workers < 1:
         raise SystemExit("workers must be positive")
     for path in (out_json, out_success, out_all):
@@ -61,12 +65,15 @@ def main(argv=None):
                      *[out_json.parent / f"shard{i}.stdout" for i in range(workers)]]:
             if path.exists():
                 path.unlink()
-        for index in range(workers):
-            for suffix in (f"-shard{index}of{workers}",):
-                for directory in (out_success.parent, out_all.parent):
-                    candidate = directory / (directory.name + suffix)
-                    if candidate.exists() and candidate.is_dir():
-                        shutil.rmtree(candidate)
+        if output_options.output_dir:
+            # run_rollout appends the tag to --output-dir, creating siblings,
+            # independently of where --output-success/--output-all point.
+            directory = Path(output_options.output_dir)
+            for index in range(workers):
+                candidate = Path(str(directory) + f"-shard{index}of{workers}")
+                if (not candidate.is_symlink() and candidate.is_dir()
+                        and candidate.resolve().parent == directory.resolve().parent):
+                    shutil.rmtree(candidate)
     print(f"[shard_rollout] merged -> {out_json} {out_success} {out_all}", flush=True)
 
 
