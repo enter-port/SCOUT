@@ -56,6 +56,19 @@ def choose_trigger(pairs, threshold):
     return seed if gaps[seed] >= threshold else False
 
 
+def entered_round2_training(cfg):
+    dp = Path(cfg['output_dir']) / 'rounds/ATY/round-2/dp'
+    if (dp / 'done.json').exists():
+        return True
+    for path in dp.glob('attempt-*/train.log'):
+        # CLI initialization alone is insufficient: require the actual epoch loop.
+        with path.open('rb') as f:
+            f.seek(max(0, path.stat().st_size - 65536))
+            if b'Training epoch' in f.read():
+                return True
+    return False
+
+
 def stop_job(manifest_path, name, state, audit):
     """Stop a verified independent job tree, never its tmux/supervisor group."""
     import psutil
@@ -378,8 +391,8 @@ def check(root):
             progressed = []
             for seed in manifest['settings']['seeds']:
                 cfg = read_json(manifest['jobs'][f's{seed}-aty']['config'])
-                dp = Path(cfg['output_dir']) / 'rounds/ATY/round-2/dp'
-                progressed.append(any(p.stat().st_size > 0 for p in dp.glob('attempt-*/train.log')))
+                progressed.append(health[f's{seed}-aty'] in ('running', 'completed') and
+                                  entered_round2_training(cfg))
             if all(progressed):
                 state.update(state='monitor_complete', enabled=False)
                 write_json(policy_path, state); event = 'all three ATY entered round2 retraining; monitoring complete'

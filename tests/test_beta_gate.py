@@ -49,6 +49,15 @@ class BetaGateTests(unittest.TestCase):
             spawn('module', [], Path(d)/'log')
             self.assertTrue(p.call_args.kwargs['start_new_session'])
 
+    def test_monitor_does_not_finish_on_training_initialization(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)/'rounds/ATY/round-2/dp/attempt-x/train.log'
+            p.parent.mkdir(parents=True)
+            p.write_text('wandb initialized; loading config')
+            self.assertFalse(beta_gate.entered_round2_training({'output_dir': d}))
+            p.write_text('Training epoch 0: 1/100 loss=.1')
+            self.assertTrue(beta_gate.entered_round2_training({'output_dir': d}))
+
     def test_unrelated_pid_is_not_live_job(self):
         import os
         self.assertFalse(process_matches(os.getpid(), 'unrelated.module'))
