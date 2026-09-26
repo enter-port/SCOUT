@@ -313,10 +313,15 @@ def begin_search(manifest, state, pairs):
     r = reg.find(record['uid']); reg.update(r['uid'], {'manual_status': 'running'}, reg.revision(r))
 
 
-def check(root):
+def check(root, due_only=False):
     manifest = read_json(root / 'manifest.json'); policy_path = root / 'monitor_policy.json'
     with lock(root / '.monitor.lock'):
         state = read_json(policy_path)
+        previous = read_optional(root / 'monitor_latest.json')
+        if previous and (state['state'] == 'monitor_complete' or (due_only and
+                time.time() - previous.get('checked_at', 0) < state['interval_minutes'] * 60 - 5)):
+            result = dict(previous, skipped=True, event=None)
+            print(__import__('json').dumps(result)); return result
         health = {}
         for name, spec in manifest['jobs'].items():
             s = read_optional(root / f'status/{name}.json')
@@ -396,7 +401,7 @@ def check(root):
             if all(progressed):
                 state.update(state='monitor_complete', enabled=False)
                 write_json(policy_path, state); event = 'all three ATY entered round2 retraining; monitoring complete'
-        result = dict(experiment_uid=manifest['experiment_uid'], state=state['state'], jobs=health,
+        result = dict(experiment_uid=manifest['experiment_uid'], state=state['state'], jobs=health, checked_at=time.time(),
                       interval_minutes=state['interval_minutes'], monitor_complete=state['state'] == 'monitor_complete', event=event)
         write_json(root / 'monitor_latest.json', result)
         print(__import__('json').dumps(result))
@@ -407,10 +412,12 @@ def main():
     p = argparse.ArgumentParser(__doc__)
     p.add_argument('action', choices=['check', 'search', 'candidate', 'shard'])
     p.add_argument('--root', type=Path); p.add_argument('--config', type=Path); p.add_argument('--slot', type=int)
+    p.add_argument('--due-only', action='store_true')
     a = p.parse_args()
     if a.action in ('check', 'search'):
         if not a.root: p.error('--root required')
-        (check if a.action == 'check' else search)(a.root.resolve())
+        if a.action == 'check': check(a.root.resolve(), due_only=a.due_only)
+        else: search(a.root.resolve())
     else:
         if not a.config: p.error('--config required')
         if a.action == 'candidate': candidate(a.config.resolve())
