@@ -98,7 +98,8 @@ def _acts_to_storage(acts: np.ndarray, rot) -> np.ndarray:
 
 def _stack_obs(obs_list, k: str, ep_len: int) -> np.ndarray:
     """obs_list[:ep_len] per-frame last-frame conversion -> (T, ...) stacked."""
-    return np.stack([_to_storage(k, _last_frame(o[k]))
+    from scout.eval.observation_storage import StorageObservation
+    return np.stack([o[k] if isinstance(o, StorageObservation) else _to_storage(k, _last_frame(o[k]))
                      for o in obs_list[:ep_len]], axis=0)
 
 

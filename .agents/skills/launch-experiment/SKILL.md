@@ -83,6 +83,14 @@ grep -nE 'DATA_ROOT|WPROJ|ETRIES|SHARD_P|guidance|explore-try|batch|eval-pk' scr
 
 失败启动沿用同一实验 ID 重试时，旧的 `failed` 状态文件可能仍在。启动 supervisor 前先给本次 attempt 写入新的 pending/running 标记，并核对新 base 进程的状态与 epoch 日志；supervisor 只读取本次 attempt 的状态。旧 attempt 和原始错误保留，不据旧状态判定新启动失败。
 
+接管已运行的调度器时，本服务器 `/root/workspace` 与 `/mnt/workspace` 可指向同一目录。比对 `/proc/<pid>/cmdline` 中的 config/manifest 路径须先解析软链接，不能只做字符串匹配。切换前验证新调度器能识别所有健康候选并占用其 GPU 槽位，记录 PID、创建时间和配置摘要；切换后复查这些进程和配置仍一致，避免误判失联后提前启动排队候选。
+
+停止 tmux 内的 supervisor 前，必须检查受保护任务的 SID、PGID 与控制终端：仅向父 PID 发 SIGTERM 也可能因 pane 关闭触发 SIGHUP，连带结束健康子任务。若 DP 与待停控制器共享会话/进程组，保留控制器或只暂停其调度，不退出 pane。新 job 用独立会话（`start_new_session=True` 或 `setsid`）启动；切换后核验原 DP PID、创建时间和计算子进程仍在。恢复不完整 eval 时复用该轮已存在的 W&B ID，保留旧 attempt，不能新建同名副本。
+
+该服务器的容器可能不支持 `pidfd_open`，`psutil.wait_procs` 会在已发出停止信号后抛出 `OSError(22)`。停止验收应按 PID 创建时间与非 zombie 状态轮询，不能把等待接口失败当作未停止而重复扩大 kill 范围。W&B 删除后用新 `wandb.Api` 查询并允许短暂索引延迟；旧 API 缓存中的 run 不能作为删除失败的证据。
+
+标准多 seed 启动入口为 `python -m scripts.launch_campaign`，共享 base 后各臂独立会话运行。仅用户明确授权 beta 条件切换时使用 `scripts.atom.beta_gate check`；阈值、候选和流程存于正式目录 `monitor_policy.json`。辅助标定必须独立登记、禁用 W&B，不把不完整分片当完整结果。优化存储内存需验证 HDF5 数据值、动作、重试、场景分片和 worker/env 数不变，不能靠减少并发环境或丢弃正式训练轨迹替代。
+
 每轮 TOTAL 后同步：
 
 ```bash

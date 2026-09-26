@@ -203,7 +203,8 @@ class _VecRunner:
                  on_done: Optional[Callable[[_VecSlot], None]] = None,
                  progress_cb: Optional[Callable[[int], None]] = None,
                  wandb_run=None, log_every: int = 10,
-                 job_gate: Optional[Callable[[tuple], bool]] = None):
+                 job_gate: Optional[Callable[[tuple], bool]] = None,
+                 compact_obs: bool = False):
         self.dp = dp
         self.n_action_steps = int(n_action_steps)
         self.horizon = int(horizon)
@@ -214,6 +215,7 @@ class _VecRunner:
         self.wandb_run = wandb_run
         self.log_every = max(1, int(log_every))
         self.job_gate = job_gate
+        self.compact_obs = compact_obs
 
         # one env per slot (independent MuJoCo sim)
         self.envs = [env_factory() for _ in range(n_envs)]
@@ -331,8 +333,13 @@ class _VecRunner:
             # states[i] = the state BEFORE step i (matches rollout_episode).
             s.states.append(copy.deepcopy(s.current_state_dict))
             if s.record_obs:
-                s.obs_list.append(copy.deepcopy(s.current_obs))
-                s.next_obs_list.append(copy.deepcopy(next_obs))
+                if self.compact_obs:
+                    from scout.eval.observation_storage import storage_snapshot
+                    s.obs_list.append(storage_snapshot(s.current_obs))
+                    s.next_obs_list.append(storage_snapshot(next_obs))
+                else:
+                    s.obs_list.append(copy.deepcopy(s.current_obs))
+                    s.next_obs_list.append(copy.deepcopy(next_obs))
             s.success = success
             s.t += 1
             s.step_i += 1
@@ -372,6 +379,12 @@ class _VecRunner:
                 planner.on_try_done(slot.job[1], slot.exec_codes)
         if self.on_done is not None:
             self.on_done(slot)
+        if self.compact_obs:
+            # The spool has consumed this episode. Idle slots must not retain it.
+            slot.traj = None
+            slot.obs_list = []
+            slot.next_obs_list = []
+            slot.states = []
 
     # -- main loop --------------------------------------------------------- #
     def run(self, job_queue: Deque[tuple], record_obs: bool):
@@ -690,13 +703,16 @@ def evaluate_exploration_vec(dp, env_factory: Callable[[], Any],
         dp, env_factory, n_envs, n_action_steps, horizon, device,
         guided=guided, on_done=on_done, progress_cb=progress_cb,
         wandb_run=wandb_run, log_every=log_every,
+        compact_obs=bool(getattr(getattr(traj_sink, '__self__', traj_sink),
+                                 'accepts_compact_obs', False)),
         job_gate=(lambda job: job[2] == 0
                   or done_tries.get(job[1], -1) >= job[2] - 1)
         if (guided and hasattr(dp, "scout_planner")
            and hasattr(dp.scout_planner, "on_try_done")) else None,
     )
     try:
-        runner.run(job_queue, record_obs=True)
+        runner.run(job_queue, record_obs=not bool(getattr(
+            getattr(traj_sink, '__self__', traj_sink), 'metrics_only', False)))
     finally:
         runner.close()
 

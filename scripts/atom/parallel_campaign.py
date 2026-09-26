@@ -27,8 +27,9 @@ def active(state, name, manifest_path):
         return False
     try:
         cmdline = Path(f"/proc/{int(state['pid'])}/cmdline").read_bytes().split(b"\0")
+        paths = [Path(os.fsdecode(x)).resolve() for x in cmdline if x.startswith(b"/")]
         return (b"scripts.atom.parallel_campaign" in cmdline
-                and str(manifest_path).encode() in cmdline and name.encode() in cmdline)
+                and Path(manifest_path).resolve() in paths and name.encode() in cmdline)
     except (OSError, KeyError, ValueError):
         return False
 
@@ -66,7 +67,7 @@ def launch_and_wait(manifest_path, manifest, names):
             processes[name] = subprocess.Popen(
                 [sys.executable, "-u", "-m", "scripts.atom.parallel_campaign",
                  "job", "--manifest", str(manifest_path), "--name", name],
-                cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
+                cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
     while True:
         states = {}
         for name in names:
@@ -78,6 +79,9 @@ def launch_and_wait(manifest_path, manifest, names):
                 continue
             if state.get("status") == "completed":
                 states[name] = "completed"
+            elif state.get("status") == "paused":
+                # The beta gate owns this job until it restarts the same name.
+                states[name] = "running"
             elif active(state, name, manifest_path):
                 states[name] = "running"
             else:

@@ -36,6 +36,7 @@ def calibrate(ctx, out, dp, dyn, previous, base=None, mode=None, options=None):
             ctx.module("scout.calib.eta_r", common + pair + ["--eta-prev", previous["eta"],
                        "--kappa-prev", previous["kappa"], "--target", target,
                        "--band-lo", target * (1 - band), "--band-hi", target * (1 + band),
+                       "--max-repeat", cfg.get("r_max_repeat", 2),
                        "--batch-size", cfg.get("batch_size", 128), "--out", eta_path], work / "eta.log")
             result_path = eta_path
             result = dict(previous) if ctx.dry else read_json(eta_path)

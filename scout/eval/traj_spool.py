@@ -73,6 +73,8 @@ class TrajSpool:
         buffer size in kept trajectories before a staging flush (user: 100).
     """
 
+    accepts_compact_obs = True
+
     def __init__(self, core_path: str, success_path: str, all_path: str,
                  core_filter_key: str = "train",
                  aug_mask_key: str = "scout_aug", rule: str = "rescue",
